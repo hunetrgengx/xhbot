@@ -6,11 +6,6 @@ __pycache__/
 *.swp
 *.swo
 
-# 环境配置（含敏感信息）
-.env
-.env.*
-!.env.example
-
 # 运行时数据
 *.db
 *.sqlite
