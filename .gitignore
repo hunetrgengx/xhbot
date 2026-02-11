@@ -1,0 +1,35 @@
+# IDE
+.vs/
+__pycache__/
+*.pyc
+.idea/
+*.swp
+*.swo
+
+# 环境配置（含敏感信息）
+.env
+.env.*
+!.env.example
+
+# 运行时数据
+*.db
+*.sqlite
+*.sqlite3
+*.session
+*.session-journal
+*.jsonl
+data/
+
+# 排除预设/示例外的 json（bytecler 的运行时 json）
+/bytecler/spam_keywords.json
+/bytecler/verified_users.json
+/bytecler/verification_failures.json
+/bytecler/verification_blacklist.json
+/bytecler/bio_calls.jsonl
+/bytecler/restricted_users.jsonl
+/bytecler/user.txt
+/bytecler/message_records/
+/bytecler/storage/
+
+# 保留 config 下的 json 示例
+!**/config/*.example.*
