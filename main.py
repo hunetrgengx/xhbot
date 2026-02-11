@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger('main')
 
 
-# 线程名 -> logger 名称映射，用于 stderr 输出时带上正确前缀1
+# 线程名 -> logger 名称映射，用于 stderr 输出时带上正确前缀
 _THREAD_TO_LOGGER = {
     "XhChatThread": "xhchat.print",
     "MainThread": "bytecler.print",  # 主线程运行 bytecler 时
