@@ -38,8 +38,8 @@ if str(_xhbot_root) not in sys.path:
 
 # 线程名 -> logger 名称映射，用于 stderr 输出时带上正确前缀
 _THREAD_TO_LOGGER = {
-    "XhChatThread": "xhchat.print",
-    "MainThread": "bytecler.print",  # 主线程运行 bytecler 时
+    "ByteclerThread": "bytecler.print",
+    "MainThread": "xhchat.print",  # 主线程运行 xhchat（run_polling 需主线程）
 }
 
 
@@ -182,7 +182,11 @@ def run_xhchat():
 
 
 def main():
-    """主函数：同时启动两个机器人"""
+    """主函数：同时启动两个机器人
+    
+    python-telegram-bot 的 run_polling 必须在主线程运行（信号处理限制），
+    因此 xhchat 跑主线程，bytecler（asyncio）跑子线程。
+    """
     logger.info("=" * 60)
     logger.info("正在启动双机器人系统...")
     logger.info("=" * 60)
@@ -201,28 +205,26 @@ def main():
     
     logger.info("文件检查通过，开始启动机器人...")
     
-    # 在单独线程中运行 xhchat（因为它使用同步的 run_polling）
-    xhchat_thread = threading.Thread(
-        target=run_xhchat,
-        name="XhChatThread",
+    # bytecler 用 asyncio，可在子线程运行
+    bytecler_thread = threading.Thread(
+        target=run_bytecler,
+        name="ByteclerThread",
         daemon=True
     )
-    xhchat_thread.start()
+    bytecler_thread.start()
     
-    # 等待一下，让 xhchat 先启动
-    logger.info("等待 XhChat 机器人初始化...")
+    logger.info("等待 Bytecler 机器人初始化...")
     time.sleep(2)
     
-    # 检查 xhchat 线程是否还在运行
-    if not xhchat_thread.is_alive():
-        logger.error("XhChat 机器人启动失败，线程已退出")
+    if not bytecler_thread.is_alive():
+        logger.error("Bytecler 机器人启动失败，线程已退出")
         sys.exit(1)
     
-    logger.info("XhChat 机器人已启动，现在启动 Bytecler 机器人...")
+    logger.info("Bytecler 已启动，现在启动 XhChat 机器人（主线程）...")
     
-    # 在主线程中运行 bytecler（因为它使用 asyncio）
+    # xhchat 的 run_polling 必须在主线程（set_wakeup_fd / 信号处理）
     try:
-        run_bytecler()
+        run_xhchat()
     except KeyboardInterrupt:
         logger.info("收到停止信号 (Ctrl+C)，正在关闭...")
     except Exception as e:
