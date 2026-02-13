@@ -51,7 +51,7 @@ KIMI_MODEL = os.getenv("MODEL_NAME", "moonshot-v1-128k")
 # 小助理 bot 的 @用户名（用于检测小助理提到霜刃时回复）
 XHCHAT_BOT_USERNAME = (os.getenv("XHCHAT_BOT_USERNAME") or os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.messages import SetTypingRequest
@@ -448,6 +448,31 @@ def _sync_lottery_to_verified(full: bool = False) -> tuple[bool, int, str]:
             new_count += 1
         if jt and jt > max_join_time:
             max_join_time = jt
+    # 写入前再次读取文件，合并期间新增的用户（避免覆盖验证通过的用户）
+    if VERIFIED_USERS_PATH.exists():
+        try:
+            with open(VERIFIED_USERS_PATH, "r", encoding="utf-8") as f:
+                fresh = json.load(f)
+            for u in fresh.get("users") or []:
+                uid = int(u) if isinstance(u, (int, str)) and str(u).isdigit() else None
+                if uid is not None and uid not in users_set:
+                    users_set.add(uid)
+                    raw_d = dict(fresh.get("details", {}) or {})
+                    raw_j = dict(fresh.get("join_times", {}) or {})
+                    k = str(uid)
+                    v = raw_d.get(k) or raw_d.get(str(uid))
+                    if isinstance(v, dict):
+                        details[uid] = {
+                            "user_id": uid,
+                            "username": v.get("username"),
+                            "full_name": v.get("full_name") or "用户",
+                            "join_time": raw_j.get(k) or raw_j.get(str(uid)),
+                            "verify_time": v.get("verify_time"),
+                        }
+                    if raw_j.get(k) or raw_j.get(str(uid)):
+                        join_times_out[uid] = raw_j.get(k) or raw_j.get(str(uid))
+        except Exception:
+            pass
     data_out = {
         "users": list(users_set),
         "details": {str(uid): v for uid, v in details.items()},
@@ -1223,12 +1248,92 @@ async def main():
             await event.reply("Bytecler 群消息监控机器人\n发送 /help 查看完整指令")
 
     _MSG_LINK_RE = re.compile(
-        r"https://t\.me/([a-zA-Z0-9_]+)/(\d+)"
+        r"https?://t\.me/c/(\d+)/(\d+)|https?://t\.me/([a-zA-Z0-9_]+)/(\d+)"
     )
+
+    async def _simulate_verification(client, msg, chat_id: str) -> str:
+        """根据消息模拟霜刃的验证流程，返回验证过程描述"""
+        lines = []
+        sender = getattr(msg, "sender", None)
+        if not sender:
+            return "无法获取发送者"
+        uid = getattr(sender, "id", None)
+        if uid is None:
+            return "无法获取用户 ID"
+        text = (msg.text or msg.message or "").strip()
+        first_name = getattr(sender, "first_name", None) or ""
+        last_name = getattr(sender, "last_name", None) or ""
+        full_name = (first_name + " " + last_name).strip() or "用户"
+        username = getattr(sender, "username", None)
+
+        lines.append(f"【消息链接验证】")
+        lines.append(f"用户: {full_name} (@{username or '无'}) ID:{uid}")
+        lines.append(f"群: {chat_id}")
+        lines.append(f"消息: {text[:80]}{'...' if len(text) > 80 else ''}")
+        lines.append("")
+
+        if not _chat_allowed(chat_id):
+            lines.append("→ 该群不在监控范围内，跳过")
+            return "\n".join(lines)
+
+        if uid in verified_users:
+            lines.append("→ 白名单用户，直接通过")
+            return "\n".join(lines)
+
+        lines.append("→ 非白名单，进入验证流程：")
+        msg_type = get_message_type(msg)
+        lines.append(f"  1. 消息类型: {msg_type}")
+
+        if msg_type == "webpage" and len(text) <= 10:
+            lines.append("  2. 判定: 网页+短文本 → 人机验证（广告）")
+            return "\n".join(lines)
+
+        reply_to = getattr(msg, "reply_to", None)
+        if reply_to:
+            reply_peer = getattr(reply_to, "reply_to_peer_id", None)
+            if reply_peer is not None:
+                try:
+                    if isinstance(reply_peer, PeerChannel):
+                        reply_chat_id = str(-1000000000000 - reply_peer.channel_id)
+                    elif isinstance(reply_peer, PeerChat):
+                        reply_chat_id = str(-reply_peer.chat_id)
+                    else:
+                        reply_chat_id = None
+                    if reply_chat_id and reply_chat_id != str(chat_id):
+                        lines.append("  2. 判定: 引用非本群消息 → 人机验证（引用）")
+                        return "\n".join(lines)
+                except Exception:
+                    pass
+
+        text_matched = _check_spam(text, "", "", None)
+        if text_matched:
+            lines.append(f"  2. 判定: 文本关键词命中「{text_matched}」→ 人机验证（文本）")
+            return "\n".join(lines)
+
+        name_matched = _check_spam_name_bio(first_name, last_name, None)
+        if name_matched:
+            lines.append(f"  2. 判定: 昵称关键词命中「{name_matched}」→ 人机验证（昵称）")
+            return "\n".join(lines)
+
+        if uid in verification_blacklist:
+            lines.append("  2. 判定: 黑名单用户 → 人机验证（黑名单）")
+            return "\n".join(lines)
+
+        bio = await _get_sender_bio_cached(client, uid)
+        bio_matched = _check_spam_name_bio("", "", bio)
+        if bio_matched:
+            lines.append(f"  2. 判定: 简介关键词命中「{bio_matched}」→ 人机验证（简介）")
+            return "\n".join(lines)
+        if _bio_needs_verification(bio):
+            lines.append("  2. 判定: 简介含链接 → 人机验证（简介）")
+            return "\n".join(lines)
+
+        lines.append("  2. 全部通过 → 加入白名单")
+        return "\n".join(lines)
 
     @client.on(events.NewMessage)
     async def on_private_msg_link(event):
-        """私聊中输入 https://t.me/用户名/消息ID 格式链接，霜刃解析并回复 JSON（text 截取前 100 字符）"""
+        """私聊中输入群消息链接（如 https://t.me/xxx/123 或 t.me/c/ channelid/123），返回霜刃的验证过程"""
         if not event.is_private or not event.sender:
             return
         text = (event.message.text or event.message.message or "").strip()
@@ -1238,41 +1343,71 @@ async def main():
         if not m:
             return
         try:
-            entity = m.group(1)
-            msg_id = int(m.group(2))
+            if m.group(1) is not None:
+                channel_id = int(m.group(1))
+                msg_id = int(m.group(2))
+                entity = -1000000000000 - channel_id
+            else:
+                entity = m.group(3)
+                msg_id = int(m.group(4))
             msg = await event.client.get_messages(entity, ids=msg_id)
             if not msg:
                 await event.reply("无法获取该消息（可能已删除或无权访问）")
                 return
+            msg = msg[0] if isinstance(msg, list) else msg
+            chat_id = str(getattr(msg, "chat_id", None) or entity)
+            out = await _simulate_verification(event.client, msg, chat_id)
+            cb_data = f"vjson:{getattr(msg, 'chat_id', entity)}:{msg.id}"[:64]
+            await event.reply(out, buttons=[[Button.inline("查看原始 JSON", cb_data.encode())]])
+        except Exception as e:
+            await event.reply(f"解析失败: {e}")
+
+    @client.on(events.CallbackQuery)
+    async def on_verify_json_callback(event):
+        """点击「查看原始 JSON」按钮，返回消息的 JSON"""
+        data = event.data
+        if not isinstance(data, bytes) or not data.startswith(b"vjson:"):
+            return
+        try:
+            parts = data.decode().split(":", 2)
+            if len(parts) != 3:
+                return
+            _, chat_id_str, msg_id_str = parts
+            entity = int(chat_id_str)
+            msg_id = int(msg_id_str)
+            msg = await event.client.get_messages(entity, ids=msg_id)
+            if not msg:
+                await event.answer("无法获取该消息", alert=True)
+                return
+            msg = msg[0] if isinstance(msg, list) else msg
             msg_dict = msg.to_dict()
             for key in ("message", "text"):
                 if key in msg_dict and isinstance(msg_dict[key], str) and len(msg_dict[key]) > 100:
                     msg_dict[key] = msg_dict[key][:100] + "..."
-
             def _drop_none(obj):
                 if obj is None or isinstance(obj, bytes):
                     return None
                 if isinstance(obj, dict):
-                    return {k: v for k, v in ((k, _drop_none(v)) for k, v in obj.items())
-                            if v is not None}
+                    return {k: v for k, v in ((k, _drop_none(v)) for k, v in obj.items()) if v is not None}
                 if isinstance(obj, list):
                     return [x for x in (_drop_none(item) for item in obj) if x is not None]
                 return obj
-
             def _json_default(o):
                 if isinstance(o, datetime):
                     return o.isoformat()
                 if isinstance(o, bytes):
                     return f"<bytes len={len(o)}>"
                 raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
-
             msg_dict = _drop_none(msg_dict)
             out = json.dumps(msg_dict, ensure_ascii=False, indent=2, default=_json_default)
             if len(out) > 4000:
                 out = out[:4000] + "\n\n... (已截断)"
-            await event.reply(out)
+            await event.answer()
+            peer = getattr(event, "chat_id", None) or getattr(event, "sender_id", None)
+            if peer is not None:
+                await event.client.send_message(peer, out)
         except Exception as e:
-            await event.reply(f"解析失败: {e}")
+            await event.answer(f"解析失败: {e}", alert=True)
 
     @client.on(events.NewMessage(pattern=r"^/help"))
     async def cmd_help(event):
@@ -1286,6 +1421,7 @@ async def main():
 • /cancel — 取消当前操作
 • /reload — 从文件重载关键词
 • /verified_stats — 导出用户统计
+• 发送群消息链接 — 返回该消息的验证过程（如 https://t.me/xxx/123）
 
 关键词格式：子串匹配直接输入；精确匹配用 / 前缀，如 / 加微信
 """
