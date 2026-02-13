@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bytecler - Telegram 群消息监控与垃圾过滤机器人
+Bytecler - Telegram 群消息监控与垃圾过滤机器人1
 
 功能：广告检测、垃圾关键词过滤、人机验证（简介含 tg/@ 的用户）、私聊管理关键词
 """
