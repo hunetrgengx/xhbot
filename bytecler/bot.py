@@ -89,7 +89,7 @@ UNBAN_BOT_USERNAME = os.getenv("UNBAN_BOT_USERNAME", "@XHNPBOT")
 VERBOSE = os.getenv("TG_VERBOSE", "").lower() in ("1", "true", "yes")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
-# 抽奖白名单同步
+# 抽奖白名单同步（服务器路径，通过 LOTTERY_DB_PATH 环境变量配置）
 LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 SYNC_LOTTERY_CHECKPOINT_PATH = _path("sync_lottery_checkpoint.json")
 SYNC_LOTTERY_HOUR = int(os.getenv("SYNC_LOTTERY_HOUR", "20"))  # UTC 20:00 = 北京凌晨 4:00
@@ -383,7 +383,7 @@ def _sync_lottery_to_verified(full: bool = False) -> tuple[bool, int, str]:
             pass
     try:
         uri = Path(LOTTERY_DB_PATH).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
         cur = conn.execute(
             "SELECT user_id, username, full_name, join_time FROM user_participations WHERE join_time > ? ORDER BY join_time",
             (last_sync,),
@@ -391,7 +391,11 @@ def _sync_lottery_to_verified(full: bool = False) -> tuple[bool, int, str]:
         rows = cur.fetchall()
         conn.close()
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return False, 0, str(e)
+    if not rows:
+        print(f"[抽奖同步] 数据库查询到 0 条记录 (last_sync={last_sync})，请确认表 user_participations 及 join_time 字段")
     users_set = set()
     details = {}
     join_times_out = {}
@@ -450,11 +454,15 @@ def _sync_lottery_to_verified(full: bool = False) -> tuple[bool, int, str]:
         "join_times": {str(uid): t for uid, t in join_times_out.items()},
     }
     try:
-        fd, tmp = tempfile.mkstemp(dir=VERIFIED_USERS_PATH.parent, prefix="verified_users.", suffix=".json")
+        write_dir = Path(VERIFIED_USERS_PATH).resolve().parent
+        fd, tmp = tempfile.mkstemp(dir=write_dir, prefix="verified_users.", suffix=".json")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data_out, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, VERIFIED_USERS_PATH)
+        os.replace(tmp, str(Path(VERIFIED_USERS_PATH).resolve()))
     except Exception as e:
+        import traceback
+        print(f"[抽奖同步] 写入白名单失败 path={Path(VERIFIED_USERS_PATH).resolve()}")
+        traceback.print_exc()
         return False, 0, str(e)
     try:
         with open(SYNC_LOTTERY_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
@@ -903,16 +911,37 @@ async def main():
     _load_verification_failures()
     _load_verification_blacklist()
 
-    # 启动时全量对比抽奖数据库，增量写入白名单
+    # 启动时全量对比抽奖数据库，增量写入白名单，并在群中发通知
     try:
-        success, new_count, err = await asyncio.to_thread(_sync_lottery_to_verified, True)
-        if success:
-            _load_verified_users()
-            print(f"[抽奖同步] 启动全量同步完成，新增 {new_count} 人")
+        db_path = Path(LOTTERY_DB_PATH)
+        db_exists = db_path.exists() if db_path.is_absolute() else (Path.cwd() / db_path).exists()
+        print(f"[抽奖同步] LOTTERY_DB_PATH={LOTTERY_DB_PATH} exists={db_exists} cwd={Path.cwd()}")
+        if not db_exists:
+            print(f"[抽奖同步] 数据库文件不存在，跳过同步。可设置环境变量 LOTTERY_DB_PATH 指定路径")
+            _sync_startup_msg = "任务失败，立即撤退"
         else:
-            print(f"[抽奖同步] 启动全量同步失败: {err}")
+            success, new_count, err = await asyncio.to_thread(_sync_lottery_to_verified, True)
+            if success:
+                _load_verified_users()
+                print(f"[抽奖同步] 启动全量同步完成，新增 {new_count} 人")
+                _sync_startup_msg = "任务执行完毕"
+            else:
+                print(f"[抽奖同步] 启动全量同步失败: {err}")
+                _sync_startup_msg = "任务失败，立即撤退"
+        for gid in TARGET_GROUP_IDS:
+            try:
+                await client.send_message(int(gid), _sync_startup_msg)
+            except Exception as e:
+                print(f"[抽奖同步] 群{gid} 发送失败: {e}")
     except Exception as e:
+        import traceback
         print(f"[抽奖同步] 启动全量同步异常: {e}")
+        traceback.print_exc()
+        for gid in TARGET_GROUP_IDS:
+            try:
+                await client.send_message(int(gid), "任务失败，立即撤退")
+            except Exception:
+                pass
 
     # 设置快捷命令（输入框左侧 / 菜单）
     await client(SetBotCommandsRequest(
