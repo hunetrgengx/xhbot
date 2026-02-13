@@ -30,3 +30,4 @@ bytecler/verification_blacklist.json
 bytecler/bio_calls.jsonl
 bytecler/spam_keywords.json
 bytecler/verified_users.*.json
+/tongbu.py
