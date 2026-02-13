@@ -11,7 +11,9 @@ import json
 import os
 import random
 import re
+import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +89,10 @@ UNBAN_BOT_USERNAME = os.getenv("UNBAN_BOT_USERNAME", "@XHNPBOT")
 VERBOSE = os.getenv("TG_VERBOSE", "").lower() in ("1", "true", "yes")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
+# 抽奖白名单同步
+LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
+SYNC_LOTTERY_CHECKPOINT_PATH = _path("sync_lottery_checkpoint.json")
+SYNC_LOTTERY_HOUR = int(os.getenv("SYNC_LOTTERY_HOUR", "20"))  # UTC 20:00 = 北京凌晨 4:00
 # 垃圾关键词：三个字段各自独立配置
 # {"text": {"exact": [], "match": [], "_ac": automaton, "_regex": []}, "name": {...}, "bio": {...}}
 # _ac: Aho-Corasick 自动机（用于 match 子串）；_regex: 预编译正则列表
@@ -358,6 +364,104 @@ def _save_verified_users():
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"保存已验证用户失败: {e}")
+
+
+def _sync_lottery_to_verified(full: bool = False) -> tuple[bool, int, str]:
+    """
+    从抽奖数据库同步到霜刃白名单。
+    full=True 时全量对比数据库并增量写入白名单；full=False 时按 checkpoint 增量同步。
+    只读打开源数据库，不写入、不阻塞、不损坏源库；当日失败可接受，漏数据问题不大。
+    返回 (success, new_count, error_msg)
+    """
+    last_sync = "1970-01-01T00:00:00Z"
+    if not full and SYNC_LOTTERY_CHECKPOINT_PATH.exists():
+        try:
+            with open(SYNC_LOTTERY_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            last_sync = str(cfg.get("last_sync_time", last_sync))
+        except Exception:
+            pass
+    try:
+        uri = Path(LOTTERY_DB_PATH).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        cur = conn.execute(
+            "SELECT user_id, username, full_name, join_time FROM user_participations WHERE join_time > ? ORDER BY join_time",
+            (last_sync,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        return False, 0, str(e)
+    users_set = set()
+    details = {}
+    join_times_out = {}
+    if VERIFIED_USERS_PATH.exists():
+        try:
+            with open(VERIFIED_USERS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for u in data.get("users") or []:
+                uid = int(u) if isinstance(u, (int, str)) and str(u).isdigit() else None
+                if uid is not None:
+                    users_set.add(uid)
+            raw_details = dict(data.get("details", {}) or {})
+            raw_join = dict(data.get("join_times", {}) or {})
+            for k, v in raw_details.items():
+                uid = int(k) if (isinstance(k, str) and k.isdigit()) else (int(k.split(":", 1)[1]) if ":" in str(k) else None)
+                if uid is not None and isinstance(v, dict):
+                    details[uid] = {
+                        "user_id": uid,
+                        "username": v.get("username"),
+                        "full_name": v.get("full_name") or "用户",
+                        "join_time": raw_join.get(k) or raw_join.get(str(uid)),
+                        "verify_time": v.get("verify_time"),
+                    }
+            for k, t in raw_join.items():
+                uid = int(k) if (isinstance(k, str) and k.isdigit()) else (int(k.split(":", 1)[1]) if ":" in str(k) else None)
+                if uid is not None and t:
+                    join_times_out[uid] = t
+        except Exception as e:
+            return False, 0, str(e)
+    new_count = 0
+    max_join_time = last_sync
+    for row in rows:
+        uid = int(row[0]) if row[0] is not None else None
+        if uid is None:
+            continue
+        username = row[1] if row[1] else None
+        full_name = (row[2] or "").strip() or "用户"
+        jt = (row[3] or "").strip() if row[3] else None
+        if uid not in users_set:
+            users_set.add(uid)
+            details[uid] = {
+                "user_id": uid,
+                "username": username,
+                "full_name": full_name,
+                "join_time": jt,
+                "verify_time": None,
+            }
+            if jt:
+                join_times_out[uid] = jt
+            new_count += 1
+        if jt and jt > max_join_time:
+            max_join_time = jt
+    data_out = {
+        "users": list(users_set),
+        "details": {str(uid): v for uid, v in details.items()},
+        "join_times": {str(uid): t for uid, t in join_times_out.items()},
+    }
+    try:
+        fd, tmp = tempfile.mkstemp(dir=VERIFIED_USERS_PATH.parent, prefix="verified_users.", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data_out, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, VERIFIED_USERS_PATH)
+    except Exception as e:
+        return False, 0, str(e)
+    try:
+        with open(SYNC_LOTTERY_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+            json.dump({"last_sync_time": max_join_time}, f, ensure_ascii=False)
+    except Exception:
+        pass
+    return True, new_count, ""
 
 
 def _add_verified_user(
@@ -799,6 +903,17 @@ async def main():
     _load_verification_failures()
     _load_verification_blacklist()
 
+    # 启动时全量对比抽奖数据库，增量写入白名单
+    try:
+        success, new_count, err = await asyncio.to_thread(_sync_lottery_to_verified, True)
+        if success:
+            _load_verified_users()
+            print(f"[抽奖同步] 启动全量同步完成，新增 {new_count} 人")
+        else:
+            print(f"[抽奖同步] 启动全量同步失败: {err}")
+    except Exception as e:
+        print(f"[抽奖同步] 启动全量同步异常: {e}")
+
     # 设置快捷命令（输入框左侧 / 菜单）
     await client(SetBotCommandsRequest(
         scope=BotCommandScopeDefault(),
@@ -817,9 +932,12 @@ async def main():
     ))
 
     def _add_to_blacklist_and_save(user_id: int):
-        """将用户加入黑名单并保存"""
+        """将用户加入黑名单并保存，同时从白名单移除（避免黑白名单同时存在）"""
         verification_blacklist.add(user_id)
         _save_verification_blacklist()
+        verified_users.discard(user_id)
+        verified_users_details.pop(user_id, None)
+        _save_verified_users()
 
     # 监控：管理员限制或封禁用户时，将用户加入黑名单
     @client.on(events.Raw)
@@ -1357,8 +1475,43 @@ async def main():
             except Exception as e:
                 print(f"[frost_reply_poller] {e}")
 
+    _sync_last_run_date = [None]  # [date_str] 避免同一天多次执行
+
+    async def sync_lottery_scheduler():
+        """每日凌晨 SYNC_LOTTERY_HOUR 点执行抽奖白名单同步，并在群中发通知"""
+        while True:
+            await asyncio.sleep(60)
+            now = datetime.now()
+            if now.hour != SYNC_LOTTERY_HOUR:
+                continue
+            today = now.strftime("%Y-%m-%d")
+            if _sync_last_run_date[0] == today:
+                continue
+            _sync_last_run_date[0] = today
+            try:
+                success, new_count, err = await asyncio.to_thread(_sync_lottery_to_verified)
+                if success:
+                    _load_verified_users()
+                    msg = "任务执行完毕"
+                else:
+                    msg = "任务失败，立即撤退"
+                print(f"[抽奖同步] success={success} new={new_count} err={err}")
+                for gid in TARGET_GROUP_IDS:
+                    try:
+                        await client.send_message(int(gid), msg)
+                    except Exception as e:
+                        print(f"[抽奖同步] 群{gid} 发送失败: {e}")
+            except Exception as e:
+                print(f"[抽奖同步] 异常: {e}")
+                for gid in TARGET_GROUP_IDS:
+                    try:
+                        await client.send_message(int(gid), "任务失败，立即撤退")
+                    except Exception:
+                        pass
+
     asyncio.create_task(periodic_heartbeat())
     asyncio.create_task(frost_reply_poller())
+    asyncio.create_task(sync_lottery_scheduler())
     print("机器人已启动，等待消息...")
     print("提示: 若收不到消息，请在 @BotFather 对机器人执行 /setprivacy 选择 Disable 关闭隐私模式")
     await client.run_until_disconnected()

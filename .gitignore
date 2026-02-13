@@ -21,3 +21,12 @@ handoff_frost_reply.jsonl
 
 # 保留 config 下的 json 示例
 !**/config/*.example.*
+
+# bytecler 部署后变动数据（非代码/配置）
+bytecler/verified_users.json
+bytecler/sync_lottery_checkpoint.json
+bytecler/verification_failures.json
+bytecler/verification_blacklist.json
+bytecler/bio_calls.jsonl
+bytecler/spam_keywords.json
+bytecler/verified_users.*.json
