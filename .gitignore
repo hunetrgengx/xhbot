@@ -7,6 +7,10 @@ __pycache__/
 *.swo
 
 # 运行时数据
+handoff_pending.json
+handoff_pending.jsonl
+handoff_frost_reply.json
+handoff_frost_reply.jsonl
 *.db
 *.sqlite
 *.sqlite3

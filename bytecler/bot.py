@@ -17,6 +17,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+try:
+    import ahocorasick
+    AHOCORASICK_AVAILABLE = True
+except ImportError:
+    AHOCORASICK_AVAILABLE = False
+
 # 路径：Windows 用绝对路径，Ubuntu 用相对路径（以 bytecler 目录为基准）
 _BYTECLER_DIR = Path(__file__).resolve().parent if sys.platform == "win32" else None
 
@@ -28,15 +34,29 @@ def _path(name: str) -> Path:
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    # 尝试加载 xhchat 的 .env 以获取 OPENAI_API_KEY（bytecler 未配置时使用）
+    _xhchat_env = Path(__file__).resolve().parent.parent / "xhchat" / ".env"
+    if _xhchat_env.exists():
+        load_dotenv(dotenv_path=_xhchat_env, override=False)
 except ImportError:
     pass
+
+# AI (KIMI) - 使用 xhchat 的 token
+KIMI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+KIMI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.moonshot.cn/v1")
+KIMI_MODEL = os.getenv("MODEL_NAME", "moonshot-v1-128k")
+
+# 小助理 bot 的 @用户名（用于检测小助理提到霜刃时回复）
+XHCHAT_BOT_USERNAME = (os.getenv("XHCHAT_BOT_USERNAME") or os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import SendMessageTypingAction
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
-from telethon.tl.types import PeerChannel
+from telethon.tl.types import PeerChannel, PeerChat
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
@@ -45,6 +65,8 @@ from telethon.tl.types import (
     MessageMediaPoll,
     MessageMediaWebPage,
     MessageMediaDice,
+    UpdateChannelParticipant,
+    ChannelParticipantBanned,
 )
 
 # 配置
@@ -56,7 +78,7 @@ VERIFIED_USERS_PATH = _path("verified_users.json")
 VERIFICATION_FAILURES_PATH = _path("verification_failures.json")
 VERIFICATION_BLACKLIST_PATH = _path("verification_blacklist.json")  # 曾 5 次失败或验证超时被限制的用户
 BIO_CALLS_LOG_PATH = _path("bio_calls.jsonl")  # 每次调用 bio 接口后追加一条记录
-VERIFY_TIMEOUT = 60  # 验证码有效期（秒）
+VERIFY_TIMEOUT = 90  # 验证码有效期（秒）
 VERIFY_MSG_DELETE_AFTER = 30  # 验证相关消息保留多久后自动删除（秒）
 VERIFY_FAIL_THRESHOLD = 5  # 验证失败次数阈值，达到则限制
 VERIFY_FAILURES_RETENTION_SECONDS = 86400  # 单次验证失败记录保留时间（秒），1 天
@@ -66,7 +88,8 @@ VERBOSE = os.getenv("TG_VERBOSE", "").lower() in ("1", "true", "yes")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
 # 垃圾关键词：三个字段各自独立配置
-# {"text": {"exact": [], "match": []}, "name": {...}, "bio": {...}}
+# {"text": {"exact": [], "match": [], "_ac": automaton, "_regex": []}, "name": {...}, "bio": {...}}
+# _ac: Aho-Corasick 自动机（用于 match 子串）；_regex: 预编译正则列表
 spam_keywords = {"text": {"exact": [], "match": []}, "name": {"exact": [], "match": []}, "bio": {"exact": [], "match": []}}
 
 # 人机验证：简介含 tg 链接、http 链接或 @ 的用户需验证
@@ -86,9 +109,9 @@ API_ID = 6
 API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
 SESSION_NAME = "bytecler_bot"
 
-# 两段式关键词配置：等待用户输入类型和关键词
-PENDING_KEYWORD_TIMEOUT = 60
-pending_keyword_cmd = {}  # user_id: {"cmd": "add_text", "time": timestamp}
+# 关键词管理模式：连续输入切换添加/删除，直到 /cancel 或 /start
+PENDING_KEYWORD_TIMEOUT = 300
+pending_keyword_cmd = {}  # user_id: {"field": "text"|"name"|"bio", "time": timestamp}
 
 # sender_bio 缓存，减少 GetFullUserRequest 调用
 BIO_CACHE_TTL = 86400  # 秒（24小时）
@@ -458,7 +481,11 @@ async def _handle_verification_result(client, event, chat_id: str, user_id: int,
         _save_verification_blacklist()
         pending_by_user.pop((chat_id, user_id), None)
         try:
-            succ_msg = await event.reply(f"【{_get_full_name(event.sender)}】\n\n✓ 验证通过，可以正常发言了")
+            succ_msg = await event.reply(
+                f"【{full_name}】\n\n"
+                "✓ 验证通过\n\n"
+                "已将您加入白名单，可以正常发言了。"
+            )
             asyncio.create_task(_delete_msg_after(client, int(chat_id), [event.message.id, succ_msg.id]))
         except Exception:
             pass
@@ -493,8 +520,23 @@ def _parse_field_keywords(cfg: dict) -> tuple:
     return exact, match_list
 
 
+def _build_ahocorasick_automaton(match_list: list) -> "ahocorasick.Automaton|None":
+    """从 match 列表中的子串关键词构建 Aho-Corasick 自动机，正则类型跳过"""
+    if not AHOCORASICK_AVAILABLE:
+        return None
+    str_keywords = [item[1] for item in match_list if item[0] == "str" and item[1]]
+    if not str_keywords:
+        return None
+    automaton = ahocorasick.Automaton()
+    for kw in str_keywords:
+        kw_lower = kw.lower()
+        automaton.add_word(kw_lower, kw_lower)
+    automaton.make_automaton()
+    return automaton
+
+
 def _load_spam_keywords():
-    """加载垃圾关键词配置，三个字段各自独立"""
+    """加载垃圾关键词配置，三个字段各自独立，并为 match 子串构建 Aho-Corasick 自动机"""
     global spam_keywords
     if not SPAM_KEYWORDS_PATH.exists():
         return
@@ -503,7 +545,11 @@ def _load_spam_keywords():
             cfg = json.load(f)
         for field in ("text", "name", "bio"):
             field_cfg = cfg.get(field) or {}
-            spam_keywords[field]["exact"], spam_keywords[field]["match"] = _parse_field_keywords(field_cfg)
+            exact_list, match_list = _parse_field_keywords(field_cfg)
+            spam_keywords[field]["exact"] = exact_list
+            spam_keywords[field]["match"] = match_list
+            spam_keywords[field]["_ac"] = _build_ahocorasick_automaton(match_list)
+            spam_keywords[field]["_regex"] = [item[1] for item in match_list if item[0] == "regex"]
     except Exception as e:
         print(f"加载垃圾关键词失败: {e}")
 
@@ -615,6 +661,30 @@ async def _get_sender_bio_cached(client, user_id: int) -> Optional[str]:
         return None
 
 
+def _check_field_spam(kw_cfg: dict, value: str) -> Optional[str]:
+    """检查单个字段是否命中关键词（exact / Aho-Corasick 子串 / 正则）"""
+    if not value:
+        return None
+    value_lower = value.lower()
+    exact_list = kw_cfg.get("exact") or []
+    for kw in exact_list:
+        if value_lower == kw.lower():
+            return kw
+    ac = kw_cfg.get("_ac")
+    if ac is not None:
+        for _end, matched in ac.iter(value_lower):
+            return matched
+    else:
+        # pyahocorasick 未安装时回退到子串遍历
+        for item in kw_cfg.get("match") or []:
+            if item[0] == "str" and item[1] in value_lower:
+                return item[1]
+    for regex in kw_cfg.get("_regex") or []:
+        if regex.search(value):
+            return regex.pattern
+    return None
+
+
 def _check_spam(text: str, first_name: str, last_name: str, sender_bio: Optional[str]) -> Optional[str]:
     """
     检查是否命中垃圾关键词。三个字段各自独立配置关键词：
@@ -622,61 +692,95 @@ def _check_spam(text: str, first_name: str, last_name: str, sender_bio: Optional
     - name: first_name + last_name 组合
     - bio: 简介
     每个字段只检查自己的 exact/match，返回命中的关键词。
+    子串匹配使用 Aho-Corasick 算法，关键词数量增加时性能稳定。
     """
     msg_text = (text or "").strip()
     full_name = ((first_name or "").strip() + " " + (last_name or "").strip()).strip()
     bio = (sender_bio or "").strip()
-
     field_values = {"text": msg_text, "name": full_name, "bio": bio}
-
     for field, value in field_values.items():
         kw_cfg = spam_keywords.get(field) or {}
-        exact_list = kw_cfg.get("exact") or []
-        match_list = kw_cfg.get("match") or []
-
-        for kw in exact_list:
-            if value and value.lower() == kw.lower():
-                return kw
-
-        for item in match_list:
-            if item[0] == "str":
-                if item[1] in (value.lower() or ""):
-                    return item[1]
-            else:
-                if item[1].search(value):
-                    return item[1].pattern
-
+        hit = _check_field_spam(kw_cfg, value)
+        if hit:
+            return hit
     return None
 
 
 def _check_spam_name_bio(first_name: str, last_name: str, sender_bio: Optional[str]) -> Optional[str]:
     """
     检查 name 或 bio 是否命中垃圾关键词（用于人机验证）。
-    返回命中的关键词，如果未命中则返回 None。
+    返回命中的关键词，如果未命中则返回 None。使用 Aho-Corasick 做子串匹配。
     """
     full_name = ((first_name or "").strip() + " " + (last_name or "").strip()).strip()
     bio = (sender_bio or "").strip()
-
-    field_values = {"name": full_name, "bio": bio}
-
-    for field, value in field_values.items():
+    for field, value in (("name", full_name), ("bio", bio)):
         kw_cfg = spam_keywords.get(field) or {}
-        exact_list = kw_cfg.get("exact") or []
-        match_list = kw_cfg.get("match") or []
-
-        for kw in exact_list:
-            if value and value.lower() == kw.lower():
-                return kw
-
-        for item in match_list:
-            if item[0] == "str":
-                if item[1] in (value.lower() or ""):
-                    return item[1]
-            else:
-                if item[1].search(value):
-                    return item[1].pattern
-
+        hit = _check_field_spam(kw_cfg, value)
+        if hit:
+            return hit
     return None
+
+
+def _check_ai_trigger(
+    text: str,
+    reply_to_msg,
+    bot_id: int,
+    bot_username: Optional[str],
+) -> tuple[bool, str, Optional[str]]:
+    """
+    检查是否触发 AI 回复。
+    唤醒：霜刃，/验证官，/@机器人/回复机器人
+    返回 (是否触发, 用户问题, 被回复的机器人消息文本或 None)
+    """
+    t = (text or "").strip()
+    if not t:
+        return False, "", None
+    query = ""
+    replied_bot_text: Optional[str] = None
+    # 霜刃，
+    if t.startswith("霜刃，"):
+        query = t[3:].strip()
+    # 验证官，
+    elif t.startswith("验证官，"):
+        query = t[4:].strip()
+    # @提及
+    elif bot_username and f"@{bot_username}".lower() in t.lower():
+        query = re.sub(rf"@{re.escape(bot_username)}\s*", "", t, flags=re.IGNORECASE).strip()
+    # 回复机器人：将被回复的机器人消息内容一并送入 KIMI
+    elif reply_to_msg and getattr(reply_to_msg, "sender_id", None) == bot_id:
+        query = t
+        replied_bot_text = (reply_to_msg.text or reply_to_msg.message or "").strip() or None
+    else:
+        return False, "", None
+    if not query:
+        query = "你好，有什么可以帮你的？"
+    return True, query, replied_bot_text
+
+
+async def _call_kimi_single_turn(user_message: str, replied_bot_text: Optional[str] = None) -> str:
+    """单轮调用 KIMI，无历史。若 replied_bot_text 存在则一并送入"""
+    if not KIMI_API_KEY:
+        return "未配置 AI（OPENAI_API_KEY）"
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL)
+        content = user_message
+        if replied_bot_text:
+            content = f"【用户回复的机器人上一条消息】\n{replied_bot_text}\n\n【用户本次说的话】\n{user_message}"
+        messages = [
+            {"role": "system", "content": "你是一个冷酷的女杀手，沉默寡言。你的老板是小熊。回答控制在15字以内，尽量一句话。复杂问题时可回复\"不知道\"，\"小助理，你来回答\"，\"......\"，\"无可奉告\""},
+            {"role": "user", "content": content},
+        ]
+        resp = client.chat.completions.create(
+            model=KIMI_MODEL,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.7,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or "（无回复）"
+    except Exception as e:
+        return f"AI 调用异常：{e}"
 
 
 async def main():
@@ -700,13 +804,10 @@ async def main():
         scope=BotCommandScopeDefault(),
         lang_code="zh",
         commands=[
-            BotCommand(command="add_name", description="添加昵称关键词"),
-            BotCommand(command="add_bio", description="添加简介关键词"),
-            BotCommand(command="add_text", description="添加消息关键词"),
-            BotCommand(command="del_name", description="删除昵称关键词"),
-            BotCommand(command="del_bio", description="删除简介关键词"),
-            BotCommand(command="del_text", description="删除消息关键词"),
             BotCommand(command="list", description="查看关键词"),
+            BotCommand(command="kw_text", description="消息关键词管理"),
+            BotCommand(command="kw_name", description="昵称关键词管理"),
+            BotCommand(command="kw_bio", description="简介关键词管理"),
             BotCommand(command="start", description="启动"),
             BotCommand(command="help", description="帮助"),
             BotCommand(command="cancel", description="取消操作"),
@@ -715,9 +816,38 @@ async def main():
         ],
     ))
 
-    # 机器人入群时自动加入 verified_users；记录所有用户入群时间
+    def _add_to_blacklist_and_save(user_id: int):
+        """将用户加入黑名单并保存"""
+        verification_blacklist.add(user_id)
+        _save_verification_blacklist()
+
+    # 监控：管理员限制或封禁用户时，将用户加入黑名单
+    @client.on(events.Raw)
+    async def on_raw_update(update):
+        if isinstance(update, UpdateChannelParticipant) and isinstance(
+            getattr(update, "new_participant", None), ChannelParticipantBanned
+        ):
+            chat_id = str(-1000000000000 - update.channel_id)
+            if _chat_allowed(chat_id):
+                _add_to_blacklist_and_save(update.user_id)
+                if VERBOSE:
+                    print(f"[黑名单] 用户 {update.user_id} 被限制/封禁，已加入黑名单: 群{chat_id}")
+
+    # 有机器人入群时，自动加入白名单（仅入群事件触发，保证所有机器人都在白名单里）
     @client.on(events.ChatAction)
     async def on_chat_action(event):
+        if event.user_kicked:
+            chat_peer = getattr(event, "chat_peer", None)
+            if isinstance(chat_peer, PeerChannel):
+                chat_id = str(-1000000000000 - chat_peer.channel_id)
+            else:
+                chat_id = str(getattr(event, "chat_id", None) or "")
+            if chat_id and _chat_allowed(chat_id):
+                for uid in (event.user_ids or []):
+                    _add_to_blacklist_and_save(uid)
+                    if VERBOSE:
+                        print(f"[黑名单] 用户 {uid} 被踢出，已加入黑名单: 群{chat_id}")
+            return
         if not (event.user_added or event.user_joined):
             return
         chat_peer = getattr(event, "chat_peer", None)
@@ -728,21 +858,23 @@ async def main():
         if not chat_id or not _chat_allowed(chat_id):
             return
         now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        bot_id = me.id
         for uid in (event.user_ids or []):
             join_times[uid] = now_iso
-            if uid == bot_id:
-                _add_verified_user(
-                    bot_id,
-                    username=getattr(me, "username", None),
-                    full_name=_get_full_name(me),
-                )
-                if VERBOSE:
-                    print(f"[入群] 机器人已加入 verified_users: 群{chat_id}")
-                break
+            try:
+                user = await event.client.get_entity(uid)
+                if getattr(user, "bot", False):
+                    _add_verified_user(
+                        uid,
+                        username=getattr(user, "username", None),
+                        full_name=_get_full_name(user),
+                    )
+                    if VERBOSE:
+                        print(f"[入群] 机器人 {uid} 已加入 verified_users: 群{chat_id}")
+            except Exception:
+                pass
         _save_verified_users()
 
-    # 启动时向群发送你好，并将机器人加入 verified_users
+    # 启动时向群发送你好
     if TARGET_GROUP_IDS:
         print("你好")
         for gid in TARGET_GROUP_IDS:
@@ -750,15 +882,9 @@ async def main():
                 chat = await client.get_entity(int(gid))
                 name = getattr(chat, "title", None) or getattr(chat, "name", "") or gid
                 print(f"  群: {name} (ID: {gid})")
-                _add_verified_user(
-                    me.id,
-                    username=getattr(me, "username", None),
-                    full_name=_get_full_name(me),
-                )
                 await client.send_message(int(gid), "你好")
             except Exception as e:
                 print(f"  群{gid} 发送失败: {e}")
-        _save_verified_users()
 
     @client.on(events.NewMessage)
     async def on_message(event):
@@ -788,8 +914,44 @@ async def main():
             return
         uid = event.sender.id
 
-        # 1. 白名单成员（按用户，多群通用）：不再做任何检查，直接通过
+        # 1. 白名单成员（按用户，多群通用）：检查 AI 触发，否则直接通过
         if uid in verified_users:
+            # AI 唤醒：霜刃，/验证官，/@机器人/回复机器人
+            if text:
+                reply_msg = await event.get_reply_message() if event.message.reply_to else None
+                triggered, query, replied_bot_text = _check_ai_trigger(
+                    text, reply_msg, me.id, getattr(me, "username", None)
+                )
+                if triggered and KIMI_API_KEY:
+                    try:
+                        reply_text = await _call_kimi_single_turn(query, replied_bot_text)
+                        await event.reply(reply_text)
+                        # 霜刃说「小助理，你来回答」时，小助理收不到（Telegram 不转发 bot→bot）
+                        # 写入 handoff，由小助理轮询代为回复
+                        rt = (reply_text or "").strip().rstrip("。.！？!? ")
+                        if "小助理" in rt and "你来回答" in rt:
+                            try:
+                                from handoff import put_handoff
+                                if reply_msg and getattr(reply_msg, "sender_id", None) != me.id:
+                                    q_text = (reply_msg.text or reply_msg.message or "").strip()
+                                    if q_text:
+                                        reply_to_id = reply_msg.id
+                                        put_handoff(int(chat_id), reply_to_id, q_text)
+                                    else:
+                                        put_handoff(int(chat_id), event.message.id, query)
+                                else:
+                                    put_handoff(int(chat_id), event.message.id, query)
+                            except Exception as he:
+                                print(f"[handoff] 写入失败: {he}")
+                        if VERBOSE:
+                            print(f"[AI] 群{chat_id} | {_get_sender_display(event.sender)} | 已回复")
+                    except Exception as e:
+                        print(f"[AI 失败] {e}")
+                        try:
+                            await event.reply(f"AI 调用失败：{e}")
+                        except Exception:
+                            pass
+                    return
             msg_type = get_message_type(event.message)
             if VERBOSE:
                 print(f"[消息] 群{chat_id} | {_get_sender_display(event.sender)} | {msg_type} | {text[:40]}...")
@@ -809,15 +971,37 @@ async def main():
         except Exception:
             return  # 无法获取消息（如已删除），流程结束
 
-        # 3. 广告判定（网页且文本≤2）→ 进入人机验证
+        # 3. 广告判定（网页且文本≤10）→ 进入人机验证
         msg_type = get_message_type(event.message)
-        if msg_type == "webpage" and len(text) <= 2:
+        if msg_type == "webpage" and len(text) <= 10:
             await _start_verification(
                 event.client, event, chat_id,
                 "⚠️ 检测到您的消息中含有疑似广告，请先完成人机验证。",
                 "广告",
             )
             return
+
+        # 3.5 引用非本群消息判定 → 进入人机验证
+        reply_to = getattr(event.message, "reply_to", None)
+        if reply_to:
+            reply_peer = getattr(reply_to, "reply_to_peer_id", None)
+            if reply_peer is not None:
+                try:
+                    if isinstance(reply_peer, PeerChannel):
+                        reply_chat_id = str(-1000000000000 - reply_peer.channel_id)
+                    elif isinstance(reply_peer, PeerChat):
+                        reply_chat_id = str(-reply_peer.chat_id)
+                    else:
+                        reply_chat_id = None  # PeerUser 等其它类型暂不处理
+                    if reply_chat_id and reply_chat_id != str(chat_id):
+                        await _start_verification(
+                            event.client, event, chat_id,
+                            "⚠️ 检测到您引用了非本群消息，疑似广告，请先完成人机验证。",
+                            "引用",
+                        )
+                        return
+                except Exception:
+                    pass
 
         # 4. 发言 text 关键词判定 → 进入人机验证
         text_matched_kw = _check_spam(text, "", "", None)
@@ -854,10 +1038,17 @@ async def main():
         sender_bio = await _get_sender_bio_cached(event.client, event.sender.id)
         bio_matched_kw = _check_spam_name_bio("", "", sender_bio)
         bio_has_link = _bio_needs_verification(sender_bio)
-        if bio_matched_kw or bio_has_link:
+        if bio_matched_kw:
             await _start_verification(
                 event.client, event, chat_id,
                 "⚠️ 检测到您简介中含有疑似广告词，请先完成人机验证。",
+                "简介",
+            )
+            return
+        if bio_has_link:
+            await _start_verification(
+                event.client, event, chat_id,
+                "⚠️ 简介中有链接，疑似广告，请先完成人机验证。",
                 "简介",
             )
             return
@@ -878,7 +1069,63 @@ async def main():
     async def cmd_start(event):
         if not event.is_private:
             return
-        await event.reply("Bytecler 群消息监控机器人\n发送 /help 查看完整指令")
+        if event.sender and event.sender.id in pending_keyword_cmd:
+            pending_keyword_cmd.pop(event.sender.id, None)
+            await event.reply("已退出关键词管理。\n\nBytecler 群消息监控机器人\n发送 /help 查看完整指令")
+        else:
+            await event.reply("Bytecler 群消息监控机器人\n发送 /help 查看完整指令")
+
+    _MSG_LINK_RE = re.compile(
+        r"https://t\.me/([a-zA-Z0-9_]+)/(\d+)"
+    )
+
+    @client.on(events.NewMessage)
+    async def on_private_msg_link(event):
+        """私聊中输入 https://t.me/用户名/消息ID 格式链接，霜刃解析并回复 JSON（text 截取前 100 字符）"""
+        if not event.is_private or not event.sender:
+            return
+        text = (event.message.text or event.message.message or "").strip()
+        if not text:
+            return
+        m = _MSG_LINK_RE.search(text)
+        if not m:
+            return
+        try:
+            entity = m.group(1)
+            msg_id = int(m.group(2))
+            msg = await event.client.get_messages(entity, ids=msg_id)
+            if not msg:
+                await event.reply("无法获取该消息（可能已删除或无权访问）")
+                return
+            msg_dict = msg.to_dict()
+            for key in ("message", "text"):
+                if key in msg_dict and isinstance(msg_dict[key], str) and len(msg_dict[key]) > 100:
+                    msg_dict[key] = msg_dict[key][:100] + "..."
+
+            def _drop_none(obj):
+                if obj is None or isinstance(obj, bytes):
+                    return None
+                if isinstance(obj, dict):
+                    return {k: v for k, v in ((k, _drop_none(v)) for k, v in obj.items())
+                            if v is not None}
+                if isinstance(obj, list):
+                    return [x for x in (_drop_none(item) for item in obj) if x is not None]
+                return obj
+
+            def _json_default(o):
+                if isinstance(o, datetime):
+                    return o.isoformat()
+                if isinstance(o, bytes):
+                    return f"<bytes len={len(o)}>"
+                raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+            msg_dict = _drop_none(msg_dict)
+            out = json.dumps(msg_dict, ensure_ascii=False, indent=2, default=_json_default)
+            if len(out) > 4000:
+                out = out[:4000] + "\n\n... (已截断)"
+            await event.reply(out)
+        except Exception as e:
+            await event.reply(f"解析失败: {e}")
 
     @client.on(events.NewMessage(pattern=r"^/help"))
     async def cmd_help(event):
@@ -888,15 +1135,12 @@ async def main():
         msg = f"""Bytecler 指令（仅私聊有效）{admin_hint}
 
 • /list — 查看垃圾关键词
-• /add_text, /add_name, /add_bio — 添加（两段式）
-• /del_text, /del_name, /del_bio — 删除（两段式）
+• /kw_text, /kw_name, /kw_bio — 关键词管理（发送则切换添加/删除，/cancel 或 /start 退出）
 • /cancel — 取消当前操作
 • /reload — 从文件重载关键词
 • /verified_stats — 导出用户统计
 
-两段式：发送命令后按提示输入关键词
-• 子串匹配：直接输入，如 加V
-• 精确匹配：/ 前缀，如 / 加微信
+关键词格式：子串匹配直接输入；精确匹配用 / 前缀，如 / 加微信
 """
         await event.reply(msg)
 
@@ -914,8 +1158,7 @@ async def main():
             mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
             lines.append(f"【{label}】exact: {ex or '无'} | match: {mt or '无'}")
         lines.append("")
-        lines.append("添加/删除: 发送命令后输入关键词")
-        lines.append("子串匹配: 加V  |  精确匹配: / 加微信")
+        lines.append("管理: /kw_text /kw_name /kw_bio 进入模式后输入关键词切换")
         await event.reply("\n".join(lines))
 
     @client.on(events.NewMessage(pattern=r"^/reload"))
@@ -933,59 +1176,59 @@ async def main():
     async def cmd_verified_stats(event):
         """显示验证通过用户统计：user_id, username, full_name, 入群时间, 验证通过时间"""
         if not event.is_private or not event.sender:
+            if event.is_private is False and event.sender:
+                await event.reply("该命令仅在私聊中有效。")
             return
         if not _is_admin(event.sender.id):
             await event.reply("无权限")
             return
-        
-        # 统计信息（按用户，多群通用）
-        total = len(verified_users)
-        has_join_time = sum(1 for uid in verified_users if (verified_users_details.get(uid) or {}).get("join_time"))
-        
-        lines = [f"📊 验证通过用户统计（按用户，多群通用）\n"]
-        lines.append(f"总用户数: {total}")
-        lines.append(f"有入群时间记录: {has_join_time}")
-        lines.append(f"\n用户列表（显示前20个）:")
-        count = 0
-        for uid in sorted(verified_users):
-            if count >= 20:
-                lines.append(f"\n... 还有 {total - 20} 个用户未显示")
-                break
-            d = verified_users_details.get(uid) or {}
-            user_id = d.get("user_id") or uid
-            username = d.get("username") or "无"
-            full_name = d.get("full_name") or "用户"
-            join_time = d.get("join_time") or "未知"
-            verify_time = d.get("verify_time") or "未知"
-            
-            # 格式化时间（只显示日期和时间，去掉秒）
-            if join_time and join_time != "未知":
-                try:
-                    dt = datetime.fromisoformat(join_time.replace("Z", "+00:00"))
-                    join_time = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            if verify_time and verify_time != "未知":
-                try:
-                    dt = datetime.fromisoformat(verify_time.replace("Z", "+00:00"))
-                    verify_time = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            
-            lines.append(f"{count + 1}. ID:{user_id} | @{username} | {full_name}")
-            lines.append(f"   入群: {join_time} | 验证: {verify_time}")
-            count += 1
-        
-        msg = "\n".join(lines)
-        
-        # Telegram 消息最大 4096 字符，如果超过则截断
-        if len(msg) > 4000:
-            msg = msg[:4000] + f"\n\n... (消息过长，已截断)"
-        
         try:
+            total = len(verified_users)
+            has_join_time = sum(1 for uid in verified_users if (verified_users_details.get(uid) or {}).get("join_time"))
+
+            lines = [f"📊 验证通过用户统计（按用户，多群通用）\n"]
+            lines.append(f"总用户数: {total}")
+            lines.append(f"有入群时间记录: {has_join_time}")
+            lines.append(f"\n用户列表（按验证时间倒序，显示前20个）:")
+            count = 0
+            def _sort_key(uid):
+                d = verified_users_details.get(uid) or {}
+                return d.get("verify_time") or "0000-00-00"
+            for uid in sorted(verified_users, key=_sort_key, reverse=True):
+                if count >= 20:
+                    lines.append(f"\n... 还有 {total - 20} 个用户未显示")
+                    break
+                d = verified_users_details.get(uid) or {}
+                user_id = d.get("user_id") or uid
+                username = d.get("username") or "无"
+                full_name = d.get("full_name") or "用户"
+                join_time = d.get("join_time") or "未知"
+                verify_time = d.get("verify_time") or "未知"
+
+                if join_time and join_time != "未知":
+                    try:
+                        dt = datetime.fromisoformat(join_time.replace("Z", "+00:00"))
+                        join_time = dt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        pass
+                if verify_time and verify_time != "未知":
+                    try:
+                        dt = datetime.fromisoformat(verify_time.replace("Z", "+00:00"))
+                        verify_time = dt.strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        pass
+
+                lines.append(f"{count + 1}. ID:{user_id} | @{username} | {full_name}")
+                lines.append(f"   入群: {join_time} | 验证: {verify_time}")
+                count += 1
+
+            msg = "\n".join(lines)
+            if len(msg) > 4000:
+                msg = msg[:4000] + "\n\n... (消息过长，已截断)"
+
             await event.reply(msg)
         except Exception as e:
-            await event.reply(f"发送失败: {e}")
+            await event.reply(f"统计失败: {e}")
 
     @client.on(events.NewMessage(pattern=r"^/cancel"))
     async def cmd_cancel(event):
@@ -997,67 +1240,58 @@ async def main():
         else:
             await event.reply("当前无待完成的操作")
 
-    def _do_add(field: str, kw_type: str, keyword: str, cmd: str) -> str:
+    def _do_toggle(field: str, kw_type: str, keyword: str) -> str:
+        """存在则删，不存在则添"""
         kw_cfg = spam_keywords[field]
-        cmd_text = f" /{cmd} "
-        if kw_type == "exact":
-            if keyword not in kw_cfg["exact"]:
-                kw_cfg["exact"].append(keyword)
-                _save_spam_keywords()
-                return f"已添加 exact: {keyword}\n\n再次添加: {cmd_text}"
-            return f"该关键词已存在\n\n再次添加: {cmd_text}"
-        existing = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in kw_cfg["match"]]
-        key_str = keyword if (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2) else keyword.lower()
-        if key_str not in existing:
-            if keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2:
-                kw_cfg["match"].append(("regex", re.compile(keyword[1:-1], re.I)))
-            else:
-                kw_cfg["match"].append(("str", keyword.lower()))
-            _save_spam_keywords()
-            return f"已添加 match: {keyword}\n\n再次添加: {cmd_text}"
-        return f"该关键词已存在\n\n再次添加: {cmd_text}"
-
-    def _do_del(field: str, kw_type: str, keyword: str, cmd: str) -> str:
-        kw_cfg = spam_keywords[field]
-        cmd_text = f" /{cmd} "
         if kw_type == "exact":
             if keyword in kw_cfg["exact"]:
                 kw_cfg["exact"].remove(keyword)
                 _save_spam_keywords()
-                return f"已删除 exact: {keyword}\n\n再次删除: {cmd_text}"
-            return f"未找到该关键词\n\n再次删除: {cmd_text}"
+                return f"❌ 已删除 exact: {keyword}"
+            kw_cfg["exact"].append(keyword)
+            _save_spam_keywords()
+            return f"✅ 已添加 exact: {keyword}"
+        # match
+        existing = [(x[0], x[1] if x[0] == "str" else f"/{x[1].pattern}/") for x in kw_cfg["match"]]
+        key_str = keyword if (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2) else keyword.lower()
         for i, item in enumerate(kw_cfg["match"]):
-            if item[0] == "str" and item[1] == keyword.lower():
+            cmp = item[1] if item[0] == "str" else f"/{item[1].pattern}/"
+            if cmp == key_str:
                 kw_cfg["match"].pop(i)
                 _save_spam_keywords()
-                return f"已删除 match: {keyword}\n\n再次删除: {cmd_text}"
-            if item[0] == "regex" and f"/{item[1].pattern}/" == keyword:
-                kw_cfg["match"].pop(i)
-                _save_spam_keywords()
-                return f"已删除 match: {keyword}\n\n再次删除: {cmd_text}"
-        return f"未找到该关键词\n\n再次删除: {cmd_text}"
+                return f"❌ 已删除 match: {keyword}"
+        if keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2:
+            kw_cfg["match"].append(("regex", re.compile(keyword[1:-1], re.I)))
+        else:
+            kw_cfg["match"].append(("str", keyword.lower()))
+        _save_spam_keywords()
+        return f"✅ 已添加 match: {keyword}"
 
-    async def _handle_add_del_step1(event, cmd: str):
-        """第一步：收到命令，等待输入"""
+    async def _handle_kw_mode(event, field: str):
+        """进入关键词管理模式"""
         if not event.is_private or not event.sender:
             return
         if not _is_admin(event.sender.id):
             await event.reply("无权限")
             return
-        action = "添加" if cmd.startswith("add_") else "删除"
-        field_label = {"text": "消息", "name": "昵称", "bio": "简介"}.get(cmd[4:], "")
-        pending_keyword_cmd[event.sender.id] = {"cmd": cmd, "time": time.time()}
-        await event.reply(f"【{action}{field_label}】\n请输入关键词（默认子串匹配）\n精确匹配请用 / 前缀，如：/ 加微信\n发送 /cancel 取消")
+        label = {"text": "消息", "name": "昵称", "bio": "简介"}[field]
+        pending_keyword_cmd[event.sender.id] = {"field": field, "time": time.time()}
+        await event.reply(
+            f"【{label}关键词】管理模式\n"
+            "发送关键词：已存在则删除，不存在则添加。\n"
+            "子串匹配直接输入，精确匹配用 / 前缀，如：/ 加微信\n"
+            "输入 /cancel 或 /start 退出"
+        )
 
     @client.on(events.NewMessage)
     async def on_pending_keyword_input(event):
-        """第二步：收到用户输入的类型和关键词"""
+        """关键词管理模式：收到用户输入则切换添加/删除，保持模式直到 /cancel 或 /start"""
         if not event.is_private or not event.sender:
             return
         if not _is_admin(event.sender.id):
-            return  # 无权限时静默忽略（可能已在 step1 提示过）
+            return
         text = (event.message.text or "").strip()
-        if text.startswith("/") and (len(text) < 2 or text[1] != " "):  # 命令如 /add_text 由对应 handler 处理
+        if text.startswith("/") and (len(text) < 2 or text[1] != " "):
             return
         user_id = event.sender.id
         if user_id not in pending_keyword_cmd:
@@ -1067,7 +1301,8 @@ async def main():
             pending_keyword_cmd.pop(user_id, None)
             await event.reply("操作已超时，请重新发送命令")
             return
-        cmd = pending_keyword_cmd.pop(user_id)["cmd"]
+        field = pending_keyword_cmd[user_id]["field"]
+        pending_keyword_cmd[user_id]["time"] = now
         if text.startswith("/ ") and len(text) > 2:
             kw_type, keyword = "exact", text[2:].strip()
         else:
@@ -1075,17 +1310,13 @@ async def main():
         if not keyword:
             await event.reply("关键词不能为空")
             return
-        field = cmd[4:]
-        if cmd.startswith("add_"):
-            msg = _do_add(field, kw_type, keyword, cmd)
-        else:
-            msg = _do_del(field, kw_type, keyword, cmd)
+        msg = _do_toggle(field, kw_type, keyword)
         await event.reply(msg)
 
-    for c in ["add_text", "add_name", "add_bio", "del_text", "del_name", "del_bio"]:
-        @client.on(events.NewMessage(pattern=rf"^/{re.escape(c)}"))
-        async def _add_del_handler(event, cmd=c):
-            await _handle_add_del_step1(event, cmd)
+    for f in ["text", "name", "bio"]:
+        @client.on(events.NewMessage(pattern=rf"^/kw_{re.escape(f)}"))
+        async def _kw_handler(event, field=f):
+            await _handle_kw_mode(event, field)
 
     async def periodic_heartbeat():
         n = 0
@@ -1094,7 +1325,40 @@ async def main():
             n += 1
             print(f"[ heartbeat ] 运行中 (第{n}次)")
 
+    async def frost_reply_poller():
+        """小助理回复含「霜刃」时收不到，轮询 handoff 代为发送「......」"""
+        while True:
+            await asyncio.sleep(2)
+            try:
+                from handoff import take_frost_reply_handoff
+                while True:
+                    req = take_frost_reply_handoff()
+                    if not req:
+                        break
+                    try:
+                        await client(SetTypingRequest(peer=req["chat_id"], action=SendMessageTypingAction()))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(10)
+                    try:
+                        await client(SetTypingRequest(peer=req["chat_id"], action=SendMessageTypingAction()))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(5)
+                    try:
+                        await client.send_message(
+                            req["chat_id"],
+                            "......",
+                            reply_to=req["reply_to_message_id"],
+                        )
+                    except Exception as send_err:
+                        await client.send_message(req["chat_id"], "......")
+                    print(f"[霜刃代为回复] 群{req['chat_id']} reply_to={req['reply_to_message_id']}")
+            except Exception as e:
+                print(f"[frost_reply_poller] {e}")
+
     asyncio.create_task(periodic_heartbeat())
+    asyncio.create_task(frost_reply_poller())
     print("机器人已启动，等待消息...")
     print("提示: 若收不到消息，请在 @BotFather 对机器人执行 /setprivacy 选择 Disable 关闭隐私模式")
     await client.run_until_disconnected()

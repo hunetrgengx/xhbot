@@ -30,6 +30,11 @@ logging.basicConfig(
 # 创建日志记录器
 logger = logging.getLogger('main')
 
+# 将 xhbot 根目录加入 path，便于 bytecler/xhchat 导入 handoff 模块
+_xhbot_root = Path(__file__).resolve().parent
+if str(_xhbot_root) not in sys.path:
+    sys.path.insert(0, str(_xhbot_root))
+
 
 # 线程名 -> logger 名称映射，用于 stderr 输出时带上正确前缀
 _THREAD_TO_LOGGER = {
