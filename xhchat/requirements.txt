@@ -1,0 +1,9 @@
+# Telegram Bot
+python-telegram-bot==21.7
+
+# AI 服务
+openai==1.57.0
+httpx>=0.24.0
+
+# 工具
+python-dotenv==1.0.1
