@@ -177,25 +177,26 @@ cat > "$DEPLOY_DIR/stop.sh" << STOP_EOF
 # xhbot 双机器人停止脚本
 
 CODE_DIR="/tgbot/xhbots/xhbot"
+DEPLOY_DIR="/tgbot/xhbots/xhbotsh"
 
 echo "🛑 停止 xhbot..."
 
-PID=$(pgrep -f "python3.*main.py" | head -1)
+# 多种方式匹配进程（兼容 python/python3、main.py 路径、systemd、nohup 等）
+PID=\$(pgrep -f "python3.*main\.py" | head -1)
+[ -z "\$PID" ] && PID=\$(pgrep -f "python.*main\.py" | head -1)
+[ -z "\$PID" ] && PID=\$(pgrep -f "$CODE_DIR/main\.py" | head -1)
+[ -z "\$PID" ] && PID=\$(pgrep -f "$DEPLOY_DIR/venv.*python.*main" | head -1)
+[ -z "\$PID" ] && PID=\$(ps aux | grep -E "python3?.*(main\.py|bot\.py)" | grep -v grep | awk '{print \$2}' | head -1)
 
-if [ -z "$PID" ]; then
-    # 兼容旧进程名
-    PID=$(ps aux | grep -E "python3.*(main\.py|bot\.py)" | grep -v grep | awk '{print $2}' | head -1)
-fi
-
-if [ -z "$PID" ]; then
+if [ -z "\$PID" ]; then
     echo "❌ 未找到运行中的进程"
 else
-    echo "🔍 找到进程 PID: $PID"
-    kill -15 $PID 2>/dev/null
+    echo "🔍 找到进程 PID: \$PID"
+    kill -15 \$PID 2>/dev/null
     sleep 3
-    if ps -p $PID > /dev/null 2>&1; then
+    if ps -p \$PID > /dev/null 2>&1; then
         echo "⚠️  进程仍在运行，强制停止..."
-        kill -9 $PID 2>/dev/null
+        kill -9 \$PID 2>/dev/null
         sleep 1
     fi
     echo "✅ 机器人已停止"
