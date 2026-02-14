@@ -144,9 +144,10 @@ if [ ! -f "$CODE_DIR/main.py" ]; then
     exit 1
 fi
 
-# 停止已运行进程（只匹配 xhbotsh，避免误杀 cjbot）
+# 停止已运行进程（main + bytecler 子进程，避免误杀 cjbot）
 echo "🛑 停止已运行的 xhbot 进程..."
 pkill -f "xhbotsh/venv.*main\.py" 2>/dev/null || true
+pkill -f "xhbotsh/venv.*bytecler/bot\.py" 2>/dev/null || true
 sleep 2
 
 # 启动机器人（工作目录为代码根目录）
@@ -182,16 +183,18 @@ echo "🛑 停止 xhbot..."
 
 # 只匹配 xhbotsh 路径，避免误杀 cjbot 等其他机器人
 PIDS=\$(pgrep -f "xhbotsh/venv.*main\.py")
-if [ -z "\$PIDS" ]; then
+PIDS_BYTECLER=\$(pgrep -f "xhbotsh/venv.*bytecler/bot\.py")
+if [ -z "\$PIDS" ] && [ -z "\$PIDS_BYTECLER" ]; then
     echo "❌ 未找到运行中的 xhbot 进程"
 else
-    echo "🔍 找到进程: \$PIDS"
-    echo "\$PIDS" | xargs -r kill -15 2>/dev/null
+    echo "🔍 找到进程: \$PIDS \$PIDS_BYTECLER"
+    echo "\$PIDS \$PIDS_BYTECLER" | xargs -r kill -15 2>/dev/null
     sleep 3
     REMAIN=\$(pgrep -f "xhbotsh/venv.*main\.py")
-    if [ -n "\$REMAIN" ]; then
+    REMAIN_BYTECLER=\$(pgrep -f "xhbotsh/venv.*bytecler/bot\.py")
+    if [ -n "\$REMAIN" ] || [ -n "\$REMAIN_BYTECLER" ]; then
         echo "⚠️  部分进程仍在运行，强制停止..."
-        echo "\$REMAIN" | xargs -r kill -9 2>/dev/null
+        echo "\$REMAIN \$REMAIN_BYTECLER" | xargs -r kill -9 2>/dev/null
         sleep 1
     fi
     echo "✅ 已停止所有 xhbot 进程"

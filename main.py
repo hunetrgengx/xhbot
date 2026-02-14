@@ -11,6 +11,7 @@ import importlib.util
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -110,17 +111,26 @@ class ColoredFormatter(logging.Formatter):
         return f"{prefix} {log_msg}"
 
 
-# Ctrl+C 时立即强制退出，避免 PTB/bytecler 优雅关闭期间的日志刷屏
-# 劫持 signal.signal，确保 PTB 等库无法覆盖我们的 SIGINT handler
+# Ctrl+C / kill 时终止 bytecler 子进程并退出
+def _signal_handler(signum, frame):
+    global _bytecler_proc
+    try:
+        if _bytecler_proc and _bytecler_proc.poll() is None:
+            _bytecler_proc.terminate()
+            _bytecler_proc.wait(timeout=3)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 _orig_signal = signal.signal
 def _our_signal(signum, handler):
-    if signum == signal.SIGINT:
-        def _wrapper(s, f):
-            os._exit(0)
-        return _orig_signal(signum, _wrapper)
+    if signum in (signal.SIGINT, signal.SIGTERM):
+        return _orig_signal(signum, _signal_handler)
     return _orig_signal(signum, handler)
 signal.signal = _our_signal
-signal.signal(signal.SIGINT, lambda s, f: None)  # 初始化，后续 PTB 设置 SIGINT 时也会被替换为 _wrapper
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 # 应用彩色格式化器
 for handler in logging.root.handlers:
@@ -130,42 +140,33 @@ for handler in logging.root.handlers:
     ))
 
 
-def run_bytecler():
-    """运行 bytecler 机器人"""
-    original_stdout = sys.stdout
-    original_stderr = sys.stderr
-    original_cwd = os.getcwd()
-    
+_bytecler_proc = None  # 子进程句柄，用于 Ctrl+C 时终止
+
+
+def run_bytecler_subprocess():
+    """以子进程运行 bytecler，避免 PTB run_polling 的 add_signal_handler 必须在主线程的限制"""
+    global _bytecler_proc
+    xhbot_root = Path(__file__).resolve().parent
+    bytecler_path = xhbot_root / 'bytecler'
+    bot_py = bytecler_path / 'bot.py'
+    if not bot_py.exists():
+        logger.error(f"未找到 bytecler/bot.py: {bot_py}")
+        return False
+    logger.info("正在启动 Bytecler 机器人（子进程）...")
     try:
-        logger.info("正在启动 Bytecler 机器人...")
-        bytecler_path = Path(__file__).parent / 'bytecler'
-        
-        # bytecler 使用相对路径（如 spam_keywords.json），需切换工作目录
-        os.chdir(bytecler_path)
-        
-        # 重定向输出到日志；stderr 使用线程感知包装器，确保各线程错误带上正确前缀
-        sys.stdout = PrintToLogger(bot_name='bytecler')
-        sys.stderr = ThreadAwareStderrWrapper(original_stderr)
-        
-        try:
-            # 显式加载 bytecler/bot.py，避免与 xhchat 的 bot 包冲突
-            bot_file = bytecler_path / "bot.py"
-            spec = importlib.util.spec_from_file_location("bytecler_bot", bot_file)
-            bytecler_module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(bytecler_module)
-            asyncio.run(bytecler_module.main())
-        finally:
-            os.chdir(original_cwd)
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-    except KeyboardInterrupt:
-        logger.info("Bytecler 机器人已停止")
+        # 子进程继承 stdout/stderr，nohup 重定向时一并写入 bot.log
+        _bytecler_proc = subprocess.Popen(
+            [sys.executable, str(bot_py)],
+            cwd=str(bytecler_path),
+            stdin=subprocess.DEVNULL,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            env=os.environ.copy(),
+        )
+        return True
     except Exception as e:
-        os.chdir(original_cwd)
-        sys.stdout = original_stdout
-        sys.stderr = original_stderr
-        logger.error(f"Bytecler 机器人启动失败: {e}", exc_info=True)
-        raise
+        logger.error(f"Bytecler 子进程启动失败: {e}", exc_info=True)
+        return False
 
 
 def run_xhchat():
@@ -196,62 +197,61 @@ def run_xhchat():
 
 def main():
     """主函数：同时启动两个机器人
-    
-    python-telegram-bot 的 run_polling 必须在主线程运行（信号处理限制），
-    因此 xhchat 跑主线程，bytecler（asyncio）跑子线程。
+
+    PTB 的 run_polling 必须在主线程运行（add_signal_handler 限制），
+    因此 bytecler 以子进程运行（自有主线程），xhchat 跑主进程主线程。
     """
+    global _bytecler_proc
     logger.info("=" * 60)
     logger.info("正在启动双机器人系统...")
     logger.info("=" * 60)
-    
+
     # 检查必要的文件是否存在
     bytecler_bot = Path(__file__).parent / 'bytecler' / 'bot.py'
     xhchat_run = Path(__file__).parent / 'xhchat' / 'run.py'
-    
+
     if not bytecler_bot.exists():
         logger.error(f"未找到 bytecler/bot.py: {bytecler_bot}")
         sys.exit(1)
-    
+
     if not xhchat_run.exists():
         logger.error(f"未找到 xhchat/run.py: {xhchat_run}")
         sys.exit(1)
-    
+
     logger.info("文件检查通过，开始启动机器人...")
-    
-    # bytecler 用 asyncio，可在子线程运行
-    bytecler_thread = threading.Thread(
-        target=run_bytecler,
-        name="ByteclerThread",
-        daemon=True
-    )
-    bytecler_thread.start()
-    
+
+    # bytecler 以子进程运行，避免 PTB run_polling 的 set_wakeup_fd 主线程限制
+    if not run_bytecler_subprocess():
+        sys.exit(1)
+
     logger.info("等待 Bytecler 机器人初始化...")
     time.sleep(2)
-    
-    if not bytecler_thread.is_alive():
-        logger.error("Bytecler 机器人启动失败，线程已退出")
+
+    if _bytecler_proc and _bytecler_proc.poll() is not None:
+        logger.error("Bytecler 机器人启动失败，进程已退出")
         sys.exit(1)
-    
+
     logger.info("Bytecler 已启动，现在启动 XhChat 机器人（主线程）...")
-    
-    # xhchat 的 run_polling 必须在主线程（set_wakeup_fd / 信号处理）
-    # Ctrl+C 时 PTB 会自行处理 SIGINT 并让 run_polling 返回，此处捕获后立即强制退出，避免日志刷屏
+
+    # xhchat 的 run_polling 必须在主线程
     try:
         run_xhchat()
     except KeyboardInterrupt:
         pass
     except Exception as e:
         logger.error(f"启动过程中发生错误: {e}", exc_info=True)
-        os._exit(1)  # 强制退出，避免 daemon 线程导致无法退出
+        os._exit(1)
 
-    # run_xhchat 返回（含 Ctrl+C）后立即强制退出，不等待 bytecler，不执行 finally
+    # 终止 bytecler 子进程
     try:
-        bmod = sys.modules.get("bytecler_bot")
-        if bmod and hasattr(bmod, "stop_bytecler"):
-            bmod.stop_bytecler()
+        if _bytecler_proc and _bytecler_proc.poll() is None:
+            _bytecler_proc.terminate()
+            _bytecler_proc.wait(timeout=5)
     except Exception:
-        pass
+        try:
+            _bytecler_proc.kill()
+        except Exception:
+            pass
     os._exit(0)
 
 
