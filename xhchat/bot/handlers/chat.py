@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
-from config.settings import AI_PROVIDER, ALLOWED_CHAT_ID
+from config.settings import AI_PROVIDER, ALLOWED_CHAT_IDS
 from bot.services.sticker_service import get_sticker_ids
 from bot.services.ai_service import chat_completion
 from bot.services.context_manager import (
@@ -42,7 +42,7 @@ def should_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[
         return False, ""
 
     # 仅允许在指定群组使用
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
+    if update.effective_chat.id not in ALLOWED_CHAT_IDS:
         return False, ""
 
     # 触发方式1：以「小助理，」开头
@@ -70,7 +70,7 @@ async def handle_sticker_reply_to_bot(update: Update, context: ContextTypes.DEFA
     """群组中回复机器人消息并发送贴纸时，用配置的贴纸回复"""
     if not update.message or not update.message.sticker:
         return
-    if update.effective_chat.id != ALLOWED_CHAT_ID:
+    if update.effective_chat.id not in ALLOWED_CHAT_IDS:
         return
     reply_to = update.message.reply_to_message
     if not reply_to or not reply_to.from_user:
@@ -108,7 +108,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         if update.effective_chat.type == "private":
             await update.message.reply_text("本机器人仅在群组中使用，请将机器人加入群组后 @提及 或 以「小助理，」开头 提问。")
-        elif update.effective_chat.id != ALLOWED_CHAT_ID:
+        elif update.effective_chat.id not in ALLOWED_CHAT_IDS:
             await update.message.reply_text("本机器人仅在指定群组中可用，如有需要请联系 @XHNVPU 并注明来意。")
         return
 

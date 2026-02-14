@@ -4,7 +4,7 @@ from telegram import Update, User
 from telegram.ext import ContextTypes
 from telegram.constants import MessageEntityType, ParseMode
 
-from config.settings import ALLOWED_CHAT_ID
+from config.settings import ALLOWED_CHAT_IDS
 
 WARN_MSG_TEMPLATE = "{target_name}，经【{reporter_name}】举报，现核实您已违反群规，即将被移出群聊 {target_mention}"
 
@@ -32,7 +32,7 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
-    if chat_id != ALLOWED_CHAT_ID:
+    if chat_id not in ALLOWED_CHAT_IDS:
         return
     if update.effective_chat.type not in ("group", "supergroup"):
         await update.message.reply_text("请在群组中使用此命令。")

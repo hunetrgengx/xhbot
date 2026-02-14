@@ -32,7 +32,7 @@ from bot.handlers.xh import cmd_xhadd, cmd_xhdel, cmd_xhset
 from bot.handlers.warn import cmd_warn
 from bot.handlers.warm import track_admin_activity
 from bot.services.warm_scheduler import run_warm_scheduler
-from config.settings import ALLOWED_CHAT_ID
+from config.settings import ALLOWED_CHAT_IDS
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -74,7 +74,7 @@ def main():
     # 暖群：group -1 先执行，监听管理员发言
     app.add_handler(
         MessageHandler(
-            filters.Chat(chat_id=ALLOWED_CHAT_ID) & filters.ChatType.GROUPS,
+            filters.Chat(chat_id=ALLOWED_CHAT_IDS) & filters.ChatType.GROUPS,
             track_admin_activity,
         ),
         group=-1,
@@ -83,7 +83,7 @@ def main():
     # 群组中回复机器人并发贴纸：用配置的贴纸回复
     app.add_handler(
         MessageHandler(
-            filters.Chat(chat_id=ALLOWED_CHAT_ID) & filters.ChatType.GROUPS & filters.Sticker.ALL,
+            filters.Chat(chat_id=ALLOWED_CHAT_IDS) & filters.ChatType.GROUPS & filters.Sticker.ALL,
             handle_sticker_reply_to_bot,
         ),
     )

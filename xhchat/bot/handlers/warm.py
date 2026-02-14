@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ALLOWED_CHAT_ID
+from config.settings import ALLOWED_CHAT_IDS
 from bot.handlers.warn import _update_username_cache
 from bot.models.database import (
     get_group_activity,
@@ -60,7 +60,7 @@ async def track_admin_activity(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message or not update.effective_chat:
         return
     chat_id = update.effective_chat.id
-    if chat_id != ALLOWED_CHAT_ID:
+    if chat_id not in ALLOWED_CHAT_IDS:
         return
     if update.effective_chat.type not in ("group", "supergroup"):
         return
@@ -128,76 +128,78 @@ async def check_and_warm(context: ContextTypes.DEFAULT_TYPE):
 
     sticker_ids = get_sticker_ids()
 
-    # 首次运行：发送启动暖群（60 秒后 bot 已就绪）
+    # 首次运行：发送启动暖群（60 秒后 bot 已就绪），向每个群发送
     if not _startup_warm_done:
         _startup_warm_done = True
-        try:
-            use_sticker = sticker_ids and random.random() < 0.5
-            if use_sticker:
-                sticker_id = random.choice(sticker_ids)
-                await context.bot.send_sticker(chat_id=ALLOWED_CHAT_ID, sticker=sticker_id)
-            else:
-                msg = random.choice(WARM_MESSAGES)
-                await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg)
-            logger.info("启动暖群: 已发送%s", "贴纸" if use_sticker else "文案")
-        except Exception as e:
-            logger.warning("启动暖群失败: %s", e)
+        for cid in ALLOWED_CHAT_IDS:
+            try:
+                use_sticker = sticker_ids and random.random() < 0.5
+                if use_sticker:
+                    sticker_id = random.choice(sticker_ids)
+                    await context.bot.send_sticker(chat_id=cid, sticker=sticker_id)
+                else:
+                    msg = random.choice(WARM_MESSAGES)
+                    await context.bot.send_message(chat_id=cid, text=msg)
+                logger.info("启动暖群: chat_id=%s 已发送%s", cid, "贴纸" if use_sticker else "文案")
+            except Exception as e:
+                logger.warning("启动暖群 chat_id=%s 失败: %s", cid, e)
 
     if not WARM_ENABLED:
         return
-    chat_id = ALLOWED_CHAT_ID
-    now = datetime.utcnow()
 
-    # 静默时段（如 0-8 点不暖群，使用本地时间）
-    if WARM_SILENT_START is not None and WARM_SILENT_END is not None:
-        hour = datetime.now().hour
-        if WARM_SILENT_START <= WARM_SILENT_END:
-            if WARM_SILENT_START <= hour < WARM_SILENT_END:
-                return
-        else:
-            if hour >= WARM_SILENT_START or hour < WARM_SILENT_END:
-                return
+    for chat_id in ALLOWED_CHAT_IDS:
+        now = datetime.utcnow()
 
-    try:
-        activity = get_group_activity(chat_id)
-    except Exception as e:
-        logger.warning("暖群: 读取活动记录失败 %s", e)
-        return
-
-    last_admin = activity.get("last_admin_message_at") if activity else None
-    last_warm = activity.get("last_warm_at") if activity else None
-
-    def parse_ts(s):
-        if not s:
-            return None
-        try:
-            return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
-
-    last_admin_dt = parse_ts(last_admin)
-    last_warm_dt = parse_ts(last_warm)
-
-    idle_minutes = WARM_IDLE_MINUTES
-    cooldown_minutes = WARM_COOLDOWN_MINUTES
-
-    # 从未有管理员发言过：不暖群（避免群刚加机器人就发）
-    if last_admin_dt is None:
-        return
-
-    idle_ok = (now - last_admin_dt) >= timedelta(minutes=idle_minutes)
-    cooldown_ok = last_warm_dt is None or (now - last_warm_dt) >= timedelta(minutes=cooldown_minutes)
-
-    if idle_ok and cooldown_ok:
-        try:
-            use_sticker = sticker_ids and random.random() < 0.5
-            if use_sticker:
-                sticker_id = random.choice(sticker_ids)
-                await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+        # 静默时段（如 0-8 点不暖群，使用本地时间）
+        if WARM_SILENT_START is not None and WARM_SILENT_END is not None:
+            hour = datetime.now().hour
+            if WARM_SILENT_START <= WARM_SILENT_END:
+                if WARM_SILENT_START <= hour < WARM_SILENT_END:
+                    continue
             else:
-                msg = random.choice(WARM_MESSAGES)
-                await context.bot.send_message(chat_id=chat_id, text=msg)
-            update_warm_at(chat_id)
-            logger.info("暖群: chat_id=%s 已发送%s", chat_id, "贴纸" if use_sticker else "文案")
+                if hour >= WARM_SILENT_START or hour < WARM_SILENT_END:
+                    continue
+
+        try:
+            activity = get_group_activity(chat_id)
         except Exception as e:
-            logger.warning("暖群: 发送失败 %s", e)
+            logger.warning("暖群: chat_id=%s 读取活动记录失败 %s", chat_id, e)
+            continue
+
+        last_admin = activity.get("last_admin_message_at") if activity else None
+        last_warm = activity.get("last_warm_at") if activity else None
+
+        def parse_ts(s):
+            if not s:
+                return None
+            try:
+                return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+
+        last_admin_dt = parse_ts(last_admin)
+        last_warm_dt = parse_ts(last_warm)
+
+        idle_minutes = WARM_IDLE_MINUTES
+        cooldown_minutes = WARM_COOLDOWN_MINUTES
+
+        # 从未有管理员发言过：不暖群（避免群刚加机器人就发）
+        if last_admin_dt is None:
+            continue
+
+        idle_ok = (now - last_admin_dt) >= timedelta(minutes=idle_minutes)
+        cooldown_ok = last_warm_dt is None or (now - last_warm_dt) >= timedelta(minutes=cooldown_minutes)
+
+        if idle_ok and cooldown_ok:
+            try:
+                use_sticker = sticker_ids and random.random() < 0.5
+                if use_sticker:
+                    sticker_id = random.choice(sticker_ids)
+                    await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+                else:
+                    msg = random.choice(WARM_MESSAGES)
+                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                update_warm_at(chat_id)
+                logger.info("暖群: chat_id=%s 已发送%s", chat_id, "贴纸" if use_sticker else "文案")
+            except Exception as e:
+                logger.warning("暖群 chat_id=%s 发送失败: %s", chat_id, e)

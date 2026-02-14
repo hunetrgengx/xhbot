@@ -27,6 +27,7 @@ bytecler/verified_users.json
 bytecler/sync_lottery_checkpoint.json
 bytecler/verification_failures.json
 bytecler/verification_blacklist.json
+bytecler/verification_records.json
 bytecler/bio_calls.jsonl
 bytecler/spam_keywords.json
 bytecler/verified_users.*.json

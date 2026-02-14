@@ -1,6 +1,6 @@
 # Bytecler - Telegram 群消息监控机器人
 
-基于 Telethon (MTProto) 的 Telegram 群消息监控与垃圾过滤机器人。
+基于 python-telegram-bot (PTB) 的群消息监控与垃圾过滤机器人。
 
 ## 功能
 
@@ -41,6 +41,8 @@ pip install -r requirements.txt
 ```bash
 python bot.py
 ```
+
+`bot.py` 为霜刃 PTB 实现（已合并原 bot_ptb + shared）。
 
 首次运行会向配置的群发送「你好」。若收不到消息，请在 @BotFather 对机器人执行 `/setprivacy` 选择 Disable 关闭隐私模式。
 

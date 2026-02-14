@@ -18,8 +18,21 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 # 管理员 user_id，只有此用户可执行管理命令（/settings /set_model /set_prompt 等）
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "7171378911"))
 
-# 允许使用机器人的群组 ID，仅此群可用（AI 对话、/xhadd /xhdel /xhset）
-ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "-1001330784088"))
+# 允许使用机器人的群组 ID，多个用逗号分隔（AI 对话、/xhadd /xhdel /xhset）
+def _parse_chat_ids(s: str) -> frozenset:
+    ids = set()
+    for x in (s or "").split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            ids.add(int(x))
+        except ValueError:
+            pass
+    return frozenset(ids)
+
+
+ALLOWED_CHAT_IDS = _parse_chat_ids(os.getenv("ALLOWED_CHAT_ID", "-1001330784088"))
 
 # AI 提供商: openai | kimi
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()

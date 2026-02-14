@@ -1,8 +1,8 @@
-"""设定管理命令：/xhadd /xhdel /xhset，仅允许群 ALLOWED_CHAT_ID 使用"""
+"""设定管理命令：/xhadd /xhdel /xhset，仅允许群 ALLOWED_CHAT_IDS 使用"""
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from config.settings import ALLOWED_CHAT_ID, BOT_OWNER_ID
+from config.settings import ALLOWED_CHAT_IDS, BOT_OWNER_ID
 
 XHSET_DELETE_DELAY = 3  # 秒
 
@@ -17,7 +17,7 @@ def _is_owner(update: Update) -> bool:
 
 
 def _is_allowed_chat(update: Update) -> bool:
-    return update.effective_chat.id == ALLOWED_CHAT_ID
+    return update.effective_chat.id in ALLOWED_CHAT_IDS
 
 
 def _get_args_after_command(text: str, cmd: str) -> str:

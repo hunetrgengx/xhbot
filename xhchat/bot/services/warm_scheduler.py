@@ -15,7 +15,7 @@ except ImportError:
 from telegram import Bot
 from config.settings import (
     TELEGRAM_BOT_TOKEN,
-    ALLOWED_CHAT_ID,
+    ALLOWED_CHAT_IDS,
     WARM_ENABLED,
     WARM_IDLE_MINUTES,
     WARM_COOLDOWN_MINUTES,
@@ -66,38 +66,49 @@ async def _delete_message_async(bot: Bot, chat_id: int, message_id: int) -> None
 
 
 async def _do_random_water_async(bot: Bot) -> None:
-    """随机水群：仅发送贴纸"""
+    """随机水群：仅发送贴纸，向每个允许的群发送"""
     sticker_ids = get_sticker_ids()
     if not sticker_ids:
         return
     if _in_silent_period():
         return
+    sticker_id = random.choice(sticker_ids)
+    for chat_id in ALLOWED_CHAT_IDS:
+        try:
+            await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+            logger.info("随机水群: chat_id=%s 已发送贴纸", chat_id)
+        except Exception as e:
+            logger.warning("随机水群 chat_id=%s 失败: %s", chat_id, e)
+
+
+def _parse_ts(s):
+    if not s:
+        return None
     try:
-        sticker_id = random.choice(sticker_ids)
-        await bot.send_sticker(chat_id=ALLOWED_CHAT_ID, sticker=sticker_id)
-        logger.info("随机水群: 已发送贴纸")
-    except Exception as e:
-        logger.warning("随机水群失败: %s", e)
+        return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 
 async def _do_warm_tick_async(bot: Bot) -> None:
-    """执行一次暖群检查"""
+    """执行一次暖群检查，对每个允许的群独立检查"""
     global _startup_warm_done
-    # 首次运行：启动暖群
+    # 首次运行：启动暖群，向每个群发送
     if not _startup_warm_done:
         _startup_warm_done = True
-        try:
-            sticker_ids = get_sticker_ids()
-            use_sticker = sticker_ids and random.random() < 0.5
-            if use_sticker:
-                sticker_id = random.choice(sticker_ids)
-                await bot.send_sticker(chat_id=ALLOWED_CHAT_ID, sticker=sticker_id)
-            else:
-                msg = random.choice(WARM_MESSAGES)
-                await bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg)
-            logger.info("启动暖群: 已发送%s", "贴纸" if use_sticker else "文案")
-        except Exception as e:
-            logger.warning("启动暖群失败: %s", e)
+        sticker_ids = get_sticker_ids()
+        for chat_id in ALLOWED_CHAT_IDS:
+            try:
+                use_sticker = sticker_ids and random.random() < 0.5
+                if use_sticker:
+                    sticker_id = random.choice(sticker_ids)
+                    await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+                else:
+                    msg = random.choice(WARM_MESSAGES)
+                    await bot.send_message(chat_id=chat_id, text=msg)
+                logger.info("启动暖群: chat_id=%s 已发送%s", chat_id, "贴纸" if use_sticker else "文案")
+            except Exception as e:
+                logger.warning("启动暖群 chat_id=%s 失败: %s", chat_id, e)
 
     if not WARM_ENABLED:
         return
@@ -113,44 +124,36 @@ async def _do_warm_tick_async(bot: Bot) -> None:
             if hour >= WARM_SILENT_START or hour < WARM_SILENT_END:
                 return
 
-    try:
-        activity = get_group_activity(ALLOWED_CHAT_ID)
-    except Exception as e:
-        logger.warning("暖群: 读取活动记录失败 %s", e)
-        return
-
-    last_admin = activity.get("last_admin_message_at") if activity else None
-    last_warm = activity.get("last_warm_at") if activity else None
-
-    def parse_ts(s):
-        if not s:
-            return None
+    for chat_id in ALLOWED_CHAT_IDS:
         try:
-            return datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return None
-
-    last_admin_dt = parse_ts(last_admin)
-    last_warm_dt = parse_ts(last_warm)
-    if last_admin_dt is None:
-        return
-
-    idle_ok = (now - last_admin_dt) >= timedelta(minutes=WARM_IDLE_MINUTES)
-    cooldown_ok = last_warm_dt is None or (now - last_warm_dt) >= timedelta(minutes=WARM_COOLDOWN_MINUTES)
-    if idle_ok and cooldown_ok:
-        try:
-            sticker_ids = get_sticker_ids()
-            use_sticker = sticker_ids and random.random() < 0.5
-            if use_sticker:
-                sticker_id = random.choice(sticker_ids)
-                await bot.send_sticker(chat_id=ALLOWED_CHAT_ID, sticker=sticker_id)
-            else:
-                msg = random.choice(WARM_MESSAGES)
-                await bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg)
-            update_warm_at(ALLOWED_CHAT_ID)
-            logger.info("暖群: chat_id=%s 已发送%s", ALLOWED_CHAT_ID, "贴纸" if use_sticker else "文案")
+            activity = get_group_activity(chat_id)
         except Exception as e:
-            logger.warning("暖群: 发送失败 %s", e)
+            logger.warning("暖群: chat_id=%s 读取活动记录失败 %s", chat_id, e)
+            continue
+
+        last_admin = activity.get("last_admin_message_at") if activity else None
+        last_warm = activity.get("last_warm_at") if activity else None
+        last_admin_dt = _parse_ts(last_admin)
+        last_warm_dt = _parse_ts(last_warm)
+        if last_admin_dt is None:
+            continue
+
+        idle_ok = (now - last_admin_dt) >= timedelta(minutes=WARM_IDLE_MINUTES)
+        cooldown_ok = last_warm_dt is None or (now - last_warm_dt) >= timedelta(minutes=WARM_COOLDOWN_MINUTES)
+        if idle_ok and cooldown_ok:
+            try:
+                sticker_ids = get_sticker_ids()
+                use_sticker = sticker_ids and random.random() < 0.5
+                if use_sticker:
+                    sticker_id = random.choice(sticker_ids)
+                    await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+                else:
+                    msg = random.choice(WARM_MESSAGES)
+                    await bot.send_message(chat_id=chat_id, text=msg)
+                update_warm_at(chat_id)
+                logger.info("暖群: chat_id=%s 已发送%s", chat_id, "贴纸" if use_sticker else "文案")
+            except Exception as e:
+                logger.warning("暖群 chat_id=%s 发送失败: %s", chat_id, e)
 
 
 async def _process_handoff_async(bot: Bot) -> None:
@@ -163,7 +166,7 @@ async def _process_handoff_async(bot: Bot) -> None:
         chat_id = req["chat_id"]
         reply_to_id = req["reply_to_message_id"]
         question = req["question"]
-        if chat_id != ALLOWED_CHAT_ID:
+        if chat_id not in ALLOWED_CHAT_IDS:
             logger.warning("handoff: 跳过非允许群 chat_id=%s", chat_id)
             return
         from bot.services.text_utils import replace_emoji_digits

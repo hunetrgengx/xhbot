@@ -10,6 +10,7 @@ import asyncio
 import importlib.util
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -108,6 +109,18 @@ class ColoredFormatter(logging.Formatter):
         log_msg = super().format(record)
         return f"{prefix} {log_msg}"
 
+
+# Ctrl+C 时立即强制退出，避免 PTB/bytecler 优雅关闭期间的日志刷屏
+# 劫持 signal.signal，确保 PTB 等库无法覆盖我们的 SIGINT handler
+_orig_signal = signal.signal
+def _our_signal(signum, handler):
+    if signum == signal.SIGINT:
+        def _wrapper(s, f):
+            os._exit(0)
+        return _orig_signal(signum, _wrapper)
+    return _orig_signal(signum, handler)
+signal.signal = _our_signal
+signal.signal(signal.SIGINT, lambda s, f: None)  # 初始化，后续 PTB 设置 SIGINT 时也会被替换为 _wrapper
 
 # 应用彩色格式化器
 for handler in logging.root.handlers:
@@ -223,17 +236,23 @@ def main():
     logger.info("Bytecler 已启动，现在启动 XhChat 机器人（主线程）...")
     
     # xhchat 的 run_polling 必须在主线程（set_wakeup_fd / 信号处理）
+    # Ctrl+C 时 PTB 会自行处理 SIGINT 并让 run_polling 返回，此处捕获后立即强制退出，避免日志刷屏
     try:
         run_xhchat()
     except KeyboardInterrupt:
-        logger.info("收到停止信号 (Ctrl+C)，正在关闭...")
+        pass
     except Exception as e:
         logger.error(f"启动过程中发生错误: {e}", exc_info=True)
-        sys.exit(1)
-    finally:
-        logger.info("=" * 60)
-        logger.info("双机器人系统已关闭")
-        logger.info("=" * 60)
+        os._exit(1)  # 强制退出，避免 daemon 线程导致无法退出
+
+    # run_xhchat 返回（含 Ctrl+C）后立即强制退出，不等待 bytecler，不执行 finally
+    try:
+        bmod = sys.modules.get("bytecler_bot")
+        if bmod and hasattr(bmod, "stop_bytecler"):
+            bmod.stop_bytecler()
+    except Exception:
+        pass
+    os._exit(0)
 
 
 if __name__ == "__main__":

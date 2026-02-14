@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bytecler - Telegram 群消息监控与垃圾过滤机器人1
-
-功能：广告检测、垃圾关键词过滤、人机验证（简介含 tg/@ 的用户）、私聊管理关键词
+Bytecler 霜刃 - PTB 版（合并 bot_ptb + shared）
+实现功能参见 BYTECLER_PTB_ANALYSIS.md
 """
-
 import asyncio
 import json
 import os
@@ -13,11 +11,16 @@ import random
 import re
 import sqlite3
 import sys
-import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
 
 try:
     import ahocorasick
@@ -25,627 +28,63 @@ try:
 except ImportError:
     AHOCORASICK_AVAILABLE = False
 
-# 路径：Windows 用绝对路径，Ubuntu 用相对路径（以 bytecler 目录为基准）
-_BYTECLER_DIR = Path(__file__).resolve().parent if sys.platform == "win32" else None
-
-def _path(name: str) -> Path:
-    if sys.platform == "win32" and _BYTECLER_DIR:
-        return _BYTECLER_DIR / name
-    return Path(name)
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    # 尝试加载 xhchat 的 .env 以获取 OPENAI_API_KEY（bytecler 未配置时使用）
-    _xhchat_env = Path(__file__).resolve().parent.parent / "xhchat" / ".env"
-    if _xhchat_env.exists():
-        load_dotenv(dotenv_path=_xhchat_env, override=False)
-except ImportError:
-    pass
-
-# AI (KIMI) - 使用 xhchat 的 token
-KIMI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-KIMI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.moonshot.cn/v1")
-KIMI_MODEL = os.getenv("MODEL_NAME", "moonshot-v1-128k")
-
-# 小助理 bot 的 @用户名（用于检测小助理提到霜刃时回复）
-XHCHAT_BOT_USERNAME = (os.getenv("XHCHAT_BOT_USERNAME") or os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
-
-from telethon import TelegramClient, events, Button
-from telethon.errors import FloodWaitError
-from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.functions.messages import SetTypingRequest
-from telethon.tl.functions.bots import SetBotCommandsRequest
-from telethon.tl.types import SendMessageTypingAction
-from telethon.tl.types import BotCommand, BotCommandScopeDefault
-from telethon.tl.types import PeerChannel, PeerChat
-from telethon.tl.types import (
-    MessageMediaPhoto,
-    MessageMediaDocument,
-    MessageMediaContact,
-    MessageMediaGeo,
-    MessageMediaPoll,
-    MessageMediaWebPage,
-    MessageMediaDice,
-    UpdateChannelParticipant,
-    ChannelParticipantBanned,
+from telegram import Update, ChatMemberBanned, ChatMemberRestricted, ChatMemberLeft, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram.constants import MessageEntityType
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ChatMemberHandler, CallbackQueryHandler,
+    ContextTypes, filters,
 )
 
-# 配置
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GROUP_ID_STR = os.getenv("GROUP_ID", "")
-TARGET_GROUP_IDS = {s.strip() for s in GROUP_ID_STR.split(",") if s.strip()}
+# ==================== 共享逻辑 (原 shared.py) ====================
+_BASE = Path(__file__).resolve().parent
+
+def _path(name: str) -> Path:
+    return _BASE / name
+
 SPAM_KEYWORDS_PATH = _path("spam_keywords.json")
 VERIFIED_USERS_PATH = _path("verified_users.json")
 VERIFICATION_FAILURES_PATH = _path("verification_failures.json")
-VERIFICATION_BLACKLIST_PATH = _path("verification_blacklist.json")  # 曾 5 次失败或验证超时被限制的用户
-BIO_CALLS_LOG_PATH = _path("bio_calls.jsonl")  # 每次调用 bio 接口后追加一条记录
-VERIFY_TIMEOUT = 90  # 验证码有效期（秒）
-VERIFY_MSG_DELETE_AFTER = 30  # 验证相关消息保留多久后自动删除（秒）
-VERIFY_FAIL_THRESHOLD = 5  # 验证失败次数阈值，达到则限制
-VERIFY_FAILURES_RETENTION_SECONDS = 86400  # 单次验证失败记录保留时间（秒），1 天
-VERIFY_RESTRICT_DURATION = 1  # 限制时长（天），0=永久
-UNBAN_BOT_USERNAME = os.getenv("UNBAN_BOT_USERNAME", "@XHNPBOT")
-VERBOSE = os.getenv("TG_VERBOSE", "").lower() in ("1", "true", "yes")
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
-# 抽奖白名单同步（服务器路径，通过 LOTTERY_DB_PATH 环境变量配置）
-LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
+VERIFICATION_BLACKLIST_PATH = _path("verification_blacklist.json")
+VERIFICATION_RECORDS_PATH = _path("verification_records.json")
 SYNC_LOTTERY_CHECKPOINT_PATH = _path("sync_lottery_checkpoint.json")
-SYNC_LOTTERY_HOUR = int(os.getenv("SYNC_LOTTERY_HOUR", "20"))  # UTC 20:00 = 北京凌晨 4:00
-# 垃圾关键词：三个字段各自独立配置
-# {"text": {"exact": [], "match": [], "_ac": automaton, "_regex": []}, "name": {...}, "bio": {...}}
-# _ac: Aho-Corasick 自动机（用于 match 子串）；_regex: 预编译正则列表
-spam_keywords = {"text": {"exact": [], "match": []}, "name": {"exact": [], "match": []}, "bio": {"exact": [], "match": []}}
+LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 
-# 人机验证：简介含 tg 链接、http 链接或 @ 的用户需验证
-TG_LINK_PATTERN = re.compile(r"(?:t\.me|telegram\.me|telegram\.dog)/[\w]+", re.I)
-BIO_HTTP_PATTERN = re.compile(r"https?://\S+", re.I)  # http:// 或 https://
-BIO_AT_PATTERN = re.compile(r"@\w+")  # @用户名
-
-verified_users = set()  # {user_id} 白名单，按用户不按群
-verified_users_details = {}  # {user_id: {user_id, username, full_name, join_time, verify_time}}
-join_times = {}  # {user_id: "ISO8601"} 入群时间（任一配置群）
-# 验证失败记录：{(chat_id, user_id): {"count": int, "first_ts": float}}，按群记录，超过保留期视为 0
+spam_keywords = {"text": {"exact": [], "match": [], "_ac": None, "_regex": []},
+                 "name": {"exact": [], "match": [], "_ac": None, "_regex": []},
+                 "bio": {"exact": [], "match": [], "_ac": None, "_regex": []},
+                 "whitelist": {"name": {"exact": [], "match": [], "_regex": []},
+                              "text": {"exact": [], "match": [], "_regex": []}}}
+verified_users = set()
+verified_users_details = {}
+join_times = {}
 verification_failures = {}
-verification_blacklist = set()  # {user_id} 黑名单，按用户不按群
-pending_by_user = {}  # {(chat_id, user_id): {"code": ..., "time": ...}} 待验证（仍按群+用户，因验证发生在某群）
+verification_blacklist = set()
+_verification_records = {}
+# 缓存用户最近一条消息，供管理员删除+限制/封禁时自动加入关键词，保存一天后自动删除
+LAST_MESSAGE_CACHE_TTL_SECONDS = 86400  # 24 小时
+_last_message_by_user: dict[tuple[str, int], tuple[str, float]] = {}
 
-API_ID = 6
-API_HASH = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
-SESSION_NAME = "bytecler_bot"
-
-# 关键词管理模式：连续输入切换添加/删除，直到 /cancel 或 /start
-PENDING_KEYWORD_TIMEOUT = 300
-pending_keyword_cmd = {}  # user_id: {"field": "text"|"name"|"bio", "time": timestamp}
-
-# sender_bio 缓存，减少 GetFullUserRequest 调用
-BIO_CACHE_TTL = 86400  # 秒（24小时）
-bio_cache = {}  # user_id: (bio, expire_time)
-# bio 接口限流：调用一次后 60s 内不再调用，多请求排队等待
-BIO_CALL_INTERVAL = 60  # 秒
-_last_bio_call_time = 0.0
-bio_call_lock = asyncio.Lock()
-
-def get_message_type(msg) -> str:
-    """获取消息类型"""
-    if not msg or not msg.media:
-        return "text" if (msg and (msg.text or msg.message)) else "unknown"
-    if isinstance(msg.media, MessageMediaPhoto):
-        return "photo"
-    if isinstance(msg.media, MessageMediaWebPage):
-        return "webpage"
-    if isinstance(msg.media, MessageMediaDocument):
-        doc = msg.media.document
-        if doc and doc.attributes:
-            for attr in doc.attributes:
-                k = type(attr).__name__
-                if "Video" in k:
-                    return "video"
-                if "Audio" in k or "Voice" in k:
-                    return "audio"
-                if "Sticker" in k:
-                    return "sticker"
-                if "Animated" in k:
-                    return "gif"
-        return "document"
-    if isinstance(msg.media, MessageMediaContact):
-        return "contact"
-    if isinstance(msg.media, MessageMediaGeo):
-        return "location"
-    if isinstance(msg.media, MessageMediaPoll):
-        return "poll"
-    if isinstance(msg.media, MessageMediaDice):
-        return "dice"
-    return "media"
+VERIFY_FAIL_THRESHOLD = 5
+VERIFY_FAILURES_RETENTION_SECONDS = 86400
+# 冷却间隔 + 时间窗口：15 秒内重复触发不计入，20 分钟内 5 次即限制
+TRIGGER_COOLDOWN_SECONDS = int(os.getenv("TRIGGER_COOLDOWN_SECONDS", "15"))
+TRIGGER_WINDOW_SECONDS = int(os.getenv("TRIGGER_WINDOW_SECONDS", "1200"))  # 20 分钟
+# 含 emoji 的消息/昵称触发验证，0/false 关闭
+ENABLE_EMOJI_CHECK = os.getenv("ENABLE_EMOJI_CHECK", "1").lower() not in ("0", "false", "no")
 
 
-def _chat_allowed(chat_id: str) -> bool:
-    return bool(TARGET_GROUP_IDS and str(chat_id) in TARGET_GROUP_IDS)
-
-
-def _get_full_name(sender) -> str:
-    """从 sender 提取完整昵称"""
-    if not sender:
-        return "用户"
-    fn = (getattr(sender, "first_name", None) or "").strip()
-    ln = (getattr(sender, "last_name", None) or "").strip()
-    return (fn + " " + ln).strip() or "用户"
-
-
-def _get_sender_display(sender) -> str:
-    """从 sender 提取用于日志的显示标识（username 或 id），sender 可为 None"""
-    if not sender:
-        return "?"
-    return getattr(sender, "username", None) or getattr(sender, "id", "?")
-
-
-def _is_admin(user_id: int) -> bool:
-    """检查是否为管理员（可修改关键词）。未配置 ADMIN_IDS 时所有人可操作"""
-    if not ADMIN_IDS:
-        return True
-    return user_id in ADMIN_IDS
-
-
-def _bio_needs_verification(bio: Optional[str]) -> bool:
-    """简介是否含 tg 链接、http 链接或 @"""
-    if not bio:
-        return False
-    return bool(
-        TG_LINK_PATTERN.search(bio) or BIO_HTTP_PATTERN.search(bio) or BIO_AT_PATTERN.search(bio)
-    )
-
-
-def _load_verified_users():
-    """加载已通过验证用户及详情（按用户不按群，多群通用）"""
-    global verified_users, verified_users_details, join_times
-    if not VERIFIED_USERS_PATH.exists():
-        return
-    try:
-        with open(VERIFIED_USERS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        raw_users = data.get("users") or []
-        raw_details = dict(data.get("details", {}) or {})
-        raw_join_times = dict(data.get("join_times", {}) or {})
-        verified_users = set()
-        for u in raw_users:
-            if isinstance(u, int):
-                verified_users.add(u)
-            elif isinstance(u, str):
-                if u.isdigit():
-                    verified_users.add(int(u))
-                else:
-                    parts = u.split(":", 1)
-                    if len(parts) == 2 and parts[1].isdigit():
-                        verified_users.add(int(parts[1]))
-        verified_users_details = {}
-        join_times = {}
-        for k, v in raw_details.items():
-            uid = int(k) if (isinstance(k, str) and k.isdigit()) else (int(k.split(":", 1)[1]) if ":" in str(k) else None)
-            if uid is not None and isinstance(v, dict):
-                verified_users_details[uid] = {
-                    "user_id": uid,
-                    "username": v.get("username"),
-                    "full_name": v.get("full_name") or "用户",
-                    "join_time": raw_join_times.get(k) or raw_join_times.get(str(uid)),
-                    "verify_time": v.get("verify_time"),
-                }
-        for k, t in raw_join_times.items():
-            uid = int(k) if (isinstance(k, str) and k.isdigit()) else (int(k.split(":", 1)[1]) if ":" in str(k) else None)
-            if uid is not None and (uid not in join_times or (t and (not join_times[uid] or t > join_times[uid]))):
-                join_times[uid] = t
-        for uid in verified_users:
-            if uid not in verified_users_details:
-                verified_users_details[uid] = {
-                    "user_id": uid,
-                    "username": None,
-                    "full_name": "用户",
-                    "join_time": join_times.get(uid),
-                    "verify_time": None,
-                }
-    except Exception as e:
-        print(f"加载已验证用户失败: {e}")
-
-
-def _get_verification_failures_count(chat_id: str, user_id: int) -> int:
-    """获取当前有效失败次数（按群+用户），超过保留期视为 0 并清理"""
-    key = (chat_id, user_id)
-    if key not in verification_failures:
-        return 0
-    ent = verification_failures[key]
-    now = time.time()
-    if now - ent["first_ts"] > VERIFY_FAILURES_RETENTION_SECONDS:
-        verification_failures.pop(key, None)
-        return 0
-    return ent["count"]
-
-
-def _increment_verification_failures(chat_id: str, user_id: int) -> int:
-    """失败次数 +1（按群+用户），若为新 key 或已过期则从 1 开始；返回当前次数"""
-    key = (chat_id, user_id)
-    now = time.time()
-    if key not in verification_failures:
-        verification_failures[key] = {"count": 1, "first_ts": now}
-        return 1
-    ent = verification_failures[key]
-    if now - ent["first_ts"] > VERIFY_FAILURES_RETENTION_SECONDS:
-        verification_failures[key] = {"count": 1, "first_ts": now}
-        return 1
-    ent["count"] += 1
-    return ent["count"]
-
-
-def _load_verification_failures():
-    """加载验证失败计数（仅加载未过期的，超过保留期不加载）"""
-    global verification_failures
-    if not VERIFICATION_FAILURES_PATH.exists():
-        return
-    try:
-        with open(VERIFICATION_FAILURES_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"加载验证失败计数失败: {e}")
-        return
-    now = time.time()
-    failures = data.get("failures") or {}
-    for k, v in failures.items():
-        parts = k.split(":", 1) if isinstance(k, str) else []
-        if len(parts) != 2 or not parts[1].isdigit():
-            continue
-        key = (parts[0], int(parts[1]))
-        if isinstance(v, dict) and "count" in v and "first_ts" in v:
-            first_ts = v["first_ts"]
-            if now - first_ts <= VERIFY_FAILURES_RETENTION_SECONDS:
-                verification_failures[key] = {"count": int(v["count"]), "first_ts": first_ts}
-        else:
-            verification_failures[key] = {"count": int(v), "first_ts": now}
-
-
-def _save_verification_failures():
-    """保存验证失败计数（按群+用户，仅保存未过期的）"""
-    try:
-        now = time.time()
-        to_save = {}
-        for (cid, uid), ent in verification_failures.items():
-            if now - ent["first_ts"] <= VERIFY_FAILURES_RETENTION_SECONDS:
-                to_save[f"{cid}:{uid}"] = {"count": ent["count"], "first_ts": ent["first_ts"]}
-        data = {"failures": to_save}
-        with open(VERIFICATION_FAILURES_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"保存验证失败计数失败: {e}")
-
-
-def _load_verification_blacklist():
-    """加载验证黑名单（按用户，曾 5 次失败或验证超时被限制的用户）"""
-    global verification_blacklist
-    if not VERIFICATION_BLACKLIST_PATH.exists():
-        return
-    try:
-        with open(VERIFICATION_BLACKLIST_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        raw = data.get("users") or []
-        verification_blacklist = set()
-        for u in raw:
-            if isinstance(u, int):
-                verification_blacklist.add(u)
-            elif isinstance(u, str):
-                if u.isdigit():
-                    verification_blacklist.add(int(u))
-                elif ":" in u:
-                    parts = u.split(":", 1)
-                    if parts[1].isdigit():
-                        verification_blacklist.add(int(parts[1]))
-    except Exception as e:
-        print(f"加载验证黑名单失败: {e}")
-
-
-def _save_verification_blacklist():
-    """保存验证黑名单（按用户）"""
-    try:
-        data = {"users": list(verification_blacklist)}
-        with open(VERIFICATION_BLACKLIST_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"保存验证黑名单失败: {e}")
-
-
-def _save_verified_users():
-    """保存已通过验证用户及详情（按用户，JSON 的 key 用 str(user_id)）"""
-    try:
-        details_out = {str(uid): v for uid, v in verified_users_details.items()}
-        join_times_out = {str(uid): t for uid, t in join_times.items()}
-        data = {
-            "users": list(verified_users),
-            "details": details_out,
-            "join_times": join_times_out,
-        }
-        with open(VERIFIED_USERS_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"保存已验证用户失败: {e}")
-
-
-def _sync_lottery_to_verified(full: bool = False) -> tuple[bool, int, str]:
-    """
-    从抽奖数据库同步到霜刃白名单。
-    full=True 时全量对比数据库并增量写入白名单；full=False 时按 checkpoint 增量同步。
-    只读打开源数据库，不写入、不阻塞、不损坏源库；当日失败可接受，漏数据问题不大。
-    返回 (success, new_count, error_msg)
-    """
-    last_sync = "1970-01-01T00:00:00Z"
-    if not full and SYNC_LOTTERY_CHECKPOINT_PATH.exists():
-        try:
-            with open(SYNC_LOTTERY_CHECKPOINT_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            last_sync = str(cfg.get("last_sync_time", last_sync))
-        except Exception:
-            pass
-    try:
-        uri = Path(LOTTERY_DB_PATH).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=5)
-        cur = conn.execute(
-            "SELECT user_id, username, full_name, join_time FROM user_participations WHERE join_time > ? ORDER BY join_time",
-            (last_sync,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return False, 0, str(e)
-    if not rows:
-        print(f"[抽奖同步] 数据库查询到 0 条记录 (last_sync={last_sync})，请确认表 user_participations 及 join_time 字段")
-    users_set = set()
-    details = {}
-    join_times_out = {}
-    if VERIFIED_USERS_PATH.exists():
-        try:
-            with open(VERIFIED_USERS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for u in data.get("users") or []:
-                uid = int(u) if isinstance(u, (int, str)) and str(u).isdigit() else None
-                if uid is not None:
-                    users_set.add(uid)
-            raw_details = dict(data.get("details", {}) or {})
-            raw_join = dict(data.get("join_times", {}) or {})
-            for k, v in raw_details.items():
-                uid = int(k) if (isinstance(k, str) and k.isdigit()) else (int(k.split(":", 1)[1]) if ":" in str(k) else None)
-                if uid is not None and isinstance(v, dict):
-                    details[uid] = {
-                        "user_id": uid,
-                        "username": v.get("username"),
-                        "full_name": v.get("full_name") or "用户",
-                        "join_time": raw_join.get(k) or raw_join.get(str(uid)),
-                        "verify_time": v.get("verify_time"),
-                    }
-            for k, t in raw_join.items():
-                uid = int(k) if (isinstance(k, str) and k.isdigit()) else (int(k.split(":", 1)[1]) if ":" in str(k) else None)
-                if uid is not None and t:
-                    join_times_out[uid] = t
-        except Exception as e:
-            return False, 0, str(e)
-    new_count = 0
-    max_join_time = last_sync
-    for row in rows:
-        uid = int(row[0]) if row[0] is not None else None
-        if uid is None:
-            continue
-        username = row[1] if row[1] else None
-        full_name = (row[2] or "").strip() or "用户"
-        jt = (row[3] or "").strip() if row[3] else None
-        if uid not in users_set:
-            users_set.add(uid)
-            details[uid] = {
-                "user_id": uid,
-                "username": username,
-                "full_name": full_name,
-                "join_time": jt,
-                "verify_time": None,
-            }
-            if jt:
-                join_times_out[uid] = jt
-            new_count += 1
-        if jt and jt > max_join_time:
-            max_join_time = jt
-    # 写入前再次读取文件，合并期间新增的用户（避免覆盖验证通过的用户）
-    if VERIFIED_USERS_PATH.exists():
-        try:
-            with open(VERIFIED_USERS_PATH, "r", encoding="utf-8") as f:
-                fresh = json.load(f)
-            for u in fresh.get("users") or []:
-                uid = int(u) if isinstance(u, (int, str)) and str(u).isdigit() else None
-                if uid is not None and uid not in users_set:
-                    users_set.add(uid)
-                    raw_d = dict(fresh.get("details", {}) or {})
-                    raw_j = dict(fresh.get("join_times", {}) or {})
-                    k = str(uid)
-                    v = raw_d.get(k) or raw_d.get(str(uid))
-                    if isinstance(v, dict):
-                        details[uid] = {
-                            "user_id": uid,
-                            "username": v.get("username"),
-                            "full_name": v.get("full_name") or "用户",
-                            "join_time": raw_j.get(k) or raw_j.get(str(uid)),
-                            "verify_time": v.get("verify_time"),
-                        }
-                    if raw_j.get(k) or raw_j.get(str(uid)):
-                        join_times_out[uid] = raw_j.get(k) or raw_j.get(str(uid))
-        except Exception:
-            pass
-    data_out = {
-        "users": list(users_set),
-        "details": {str(uid): v for uid, v in details.items()},
-        "join_times": {str(uid): t for uid, t in join_times_out.items()},
-    }
-    try:
-        write_dir = Path(VERIFIED_USERS_PATH).resolve().parent
-        fd, tmp = tempfile.mkstemp(dir=write_dir, prefix="verified_users.", suffix=".json")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data_out, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, str(Path(VERIFIED_USERS_PATH).resolve()))
-    except Exception as e:
-        import traceback
-        print(f"[抽奖同步] 写入白名单失败 path={Path(VERIFIED_USERS_PATH).resolve()}")
-        traceback.print_exc()
-        return False, 0, str(e)
-    try:
-        with open(SYNC_LOTTERY_CHECKPOINT_PATH, "w", encoding="utf-8") as f:
-            json.dump({"last_sync_time": max_join_time}, f, ensure_ascii=False)
-    except Exception:
-        pass
-    return True, new_count, ""
-
-
-def _add_verified_user(
-    user_id: int,
-    username: Optional[str] = None,
-    full_name: Optional[str] = None,
-    verify_time: Optional[str] = None,
-):
-    """添加已验证用户并记录详情（按用户，多群通用）"""
-    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    verified_users.add(user_id)
-    verified_users_details[user_id] = {
-        "user_id": user_id,
-        "username": username or None,
-        "full_name": full_name or "用户",
-        "join_time": join_times.get(user_id),
-        "verify_time": verify_time or now_iso,
-    }
-
-
-def _clean_expired_verifications():
-    """清理过期的待验证，返回 [(chat_id, user_id), ...] 供限制处理"""
-    now = time.time()
-    expired = []
-    for (cid, uid), v in list(pending_by_user.items()):
-        if now - v["time"] > VERIFY_TIMEOUT:
-            expired.append((cid, uid))
-            pending_by_user.pop((cid, uid), None)
-    return expired
-
-
-async def _delete_msg_after(client, chat_id: int, msg_ids, seconds: int = VERIFY_MSG_DELETE_AFTER):
-    """延时删除消息（用于验证相关消息），msg_ids 可为 int 或 list"""
-    await asyncio.sleep(seconds)
-    try:
-        ids = [msg_ids] if isinstance(msg_ids, int) else msg_ids
-        await client.delete_messages(chat_id, ids)
-    except Exception:
-        pass
-
-
-async def _restrict_user_and_notify(client, chat_id: str, user_id: int, full_name: Optional[str] = None):
-    """限制用户发送消息和媒体权限，并发送解封指引（30s后删除）
-
-    注意：Telethon 的 edit_permissions 中，False=限制，True=不限制。
-    仅适用于超级群（supergroup），普通群会抛出 ValueError。
-    """
-    until = datetime.utcnow() + timedelta(days=VERIFY_RESTRICT_DURATION) if VERIFY_RESTRICT_DURATION > 0 else None
-    if full_name is None:
-        try:
-            user = await client.get_entity(user_id)
-            full_name = _get_full_name(user)
-        except Exception:
-            full_name = "用户"
-    try:
-        await client.edit_permissions(
-            int(chat_id),
-            user_id,
-            until_date=until,
-            send_messages=False,  # False = 限制发送消息
-            send_media=False,     # False = 限制发送媒体
-        )
-        verification_failures.pop((chat_id, user_id), None)  # 仅清理当前群失败计数
-        for k in list(pending_by_user):
-            if k[1] == user_id:
-                pending_by_user.pop(k, None)
-        verification_blacklist.add(user_id)  # 进入黑名单（按用户，多群通用）
-        _save_verification_failures()
-        _save_verification_blacklist()
-        if VERBOSE:
-            print(f"[限制用户成功] 群 {chat_id} 用户 {user_id} 已被限制发言")
-    except ValueError as e:
-        if "channel or a supergroup" in str(e):
-            print(f"[限制用户失败] 群 {chat_id} 不是超级群，请将群升级为超级群后重试: {e}")
-        else:
-            print(f"[限制用户失败] {chat_id} {user_id}: {e}")
-        return
-    except Exception as e:
-        print(f"[限制用户失败] {chat_id} {user_id}: {e}")
-        return
-    try:
-        msg = await client.send_message(
-            int(chat_id),
-            f"【{full_name}】\n\n验证失败，如有需要，请联系 {UNBAN_BOT_USERNAME} 进行解封",
-        )
-        asyncio.create_task(_delete_msg_after(client, int(chat_id), msg.id))
-    except Exception as e:
-        print(f"[发送限制说明失败] {e}")
-
-
-async def _start_verification(client, event, chat_id: str, intro_line: str, label: str) -> None:
-    """统一人机验证入口：删消息、发验证码、加入待验证、定时删验证消息。intro_line 为提示首段（含原因）。"""
-    code = str(random.randint(1000, 9999))
-    try:
-        await event.delete()
-        full_name = _get_full_name(event.sender)
-        vmsg = await event.respond(
-            f"【{full_name}】\n\n{intro_line}\n\n"
-            f"👉 您的验证码是： <code>{code}</code>\n\n"
-            f"直接发送上述验证码即可通过（{VERIFY_TIMEOUT}秒内有效）",
-            parse_mode="html",
-        )
-        now = time.time()
-        pending_by_user[(chat_id, event.sender.id)] = {"code": code, "time": now}
-        asyncio.create_task(_delete_msg_after(client, int(chat_id), vmsg.id))
-        print(f"[人机验证] 群{chat_id} | {_get_sender_display(event.sender)} | 待验证({label})")
-    except Exception as e:
-        print(f"[人机验证失败] {e}")
-
-
-async def _handle_verification_result(client, event, chat_id: str, user_id: int, code: str, ok: bool):
-    """处理验证结果（通过或失败）。调用方需确保 event.sender.id == user_id"""
-    if ok:
-        username = getattr(event.sender, "username", None) if event.sender else None
-        full_name = _get_full_name(event.sender)
-        _add_verified_user(user_id, username=username, full_name=full_name)
-        verification_failures.pop((chat_id, user_id), None)  # 清理当前群失败计数
-        verification_blacklist.discard(user_id)  # 验证通过则移出黑名单
-        _save_verified_users()
-        _save_verification_failures()
-        _save_verification_blacklist()
-        pending_by_user.pop((chat_id, user_id), None)
-        try:
-            succ_msg = await event.reply(
-                f"【{full_name}】\n\n"
-                "✓ 验证通过\n\n"
-                "已将您加入白名单，可以正常发言了。"
-            )
-            asyncio.create_task(_delete_msg_after(client, int(chat_id), [event.message.id, succ_msg.id]))
-        except Exception:
-            pass
-    else:
-        count = _increment_verification_failures(chat_id, user_id)
-        _save_verification_failures()
-        try:
-            await event.delete()
-            if count >= VERIFY_FAIL_THRESHOLD:
-                await _restrict_user_and_notify(client, chat_id, user_id, _get_full_name(event.sender))
-            else:
-                left = VERIFY_FAIL_THRESHOLD - count
-                fail_msg = await event.respond(
-                    f"【{_get_full_name(event.sender)}】\n\n验证失败，正确验证码为 <code>{code}</code>。再失败 {left} 次将被限制发言",
-                    parse_mode="html",
-                )
-                asyncio.create_task(_delete_msg_after(client, int(chat_id), [fail_msg.id]))
-        except Exception:
-            pass
+def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
+    """冷却间隔+时间窗口。返回 (本次是否计入, 更新后的时间戳列表, 当前窗口内次数)"""
+    cutoff = now - TRIGGER_WINDOW_SECONDS
+    ts_list = [t for t in (timestamps or []) if t > cutoff]
+    last_ts = ts_list[-1] if ts_list else 0
+    if last_ts and (now - last_ts) < TRIGGER_COOLDOWN_SECONDS:
+        return False, ts_list, len(ts_list)  # 冷却中，不计入
+    ts_list.append(now)
+    return True, ts_list, len(ts_list)
 
 
 def _parse_field_keywords(cfg: dict) -> tuple:
-    """解析单个字段的 exact/match 配置，返回 (exact_list, match_list)"""
     exact = [s.strip() for s in (cfg.get("exact") or []) if s and s.strip()]
     match_raw = [s.strip() for s in (cfg.get("match") or []) if s and s.strip()]
     match_list = []
@@ -657,23 +96,36 @@ def _parse_field_keywords(cfg: dict) -> tuple:
     return exact, match_list
 
 
-def _build_ahocorasick_automaton(match_list: list) -> "ahocorasick.Automaton|None":
-    """从 match 列表中的子串关键词构建 Aho-Corasick 自动机，正则类型跳过"""
+def _build_ac(match_list: list):
     if not AHOCORASICK_AVAILABLE:
         return None
-    str_keywords = [item[1] for item in match_list if item[0] == "str" and item[1]]
-    if not str_keywords:
+    str_kw = [item[1] for item in match_list if item[0] == "str" and item[1]]
+    if not str_kw:
         return None
     automaton = ahocorasick.Automaton()
-    for kw in str_keywords:
-        kw_lower = kw.lower()
-        automaton.add_word(kw_lower, kw_lower)
+    for kw in str_kw:
+        automaton.add_word(kw.lower(), kw.lower())
     automaton.make_automaton()
     return automaton
 
 
-def _load_spam_keywords():
-    """加载垃圾关键词配置，三个字段各自独立，并为 match 子串构建 Aho-Corasick 自动机"""
+def _parse_whitelist_field(fc: dict) -> tuple:
+    """解析白名单字段，返回 (exact, match_list)"""
+    exact = [s.strip() for s in (fc.get("exact") or []) if s and s.strip()]
+    match_raw = [s.strip() for s in (fc.get("match") or []) if s and s.strip()]
+    match_list = []
+    for s in match_raw:
+        if s.startswith("/") and s.endswith("/") and len(s) > 2:
+            try:
+                match_list.append(("regex", re.compile(s[1:-1], re.I)))
+            except re.error:
+                pass
+        else:
+            match_list.append(("str", s.lower()))
+    return exact, match_list
+
+
+def load_spam_keywords():
     global spam_keywords
     if not SPAM_KEYWORDS_PATH.exists():
         return
@@ -681,1009 +133,1828 @@ def _load_spam_keywords():
         with open(SPAM_KEYWORDS_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         for field in ("text", "name", "bio"):
-            field_cfg = cfg.get(field) or {}
-            exact_list, match_list = _parse_field_keywords(field_cfg)
-            spam_keywords[field]["exact"] = exact_list
-            spam_keywords[field]["match"] = match_list
-            spam_keywords[field]["_ac"] = _build_ahocorasick_automaton(match_list)
-            spam_keywords[field]["_regex"] = [item[1] for item in match_list if item[0] == "regex"]
+            fc = cfg.get(field) or {}
+            ex, mt = _parse_field_keywords(fc)
+            spam_keywords[field]["exact"] = ex
+            spam_keywords[field]["match"] = mt
+            spam_keywords[field]["_ac"] = _build_ac(mt)
+            spam_keywords[field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+        wl = cfg.get("whitelist") or {}
+        for field in ("name", "text"):
+            fc = wl.get(field) or {}
+            ex, mt = _parse_whitelist_field(fc)
+            spam_keywords["whitelist"][field]["exact"] = ex
+            spam_keywords["whitelist"][field]["match"] = mt
+            spam_keywords["whitelist"][field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
     except Exception as e:
-        print(f"加载垃圾关键词失败: {e}")
+        print(f"[shared] 加载关键词失败: {e}")
 
 
-def _save_spam_keywords():
-    """保存垃圾关键词到文件"""
-    cfg = {}
-    for field in ("text", "name", "bio"):
-        kw = spam_keywords.get(field) or {}
-        exact_list = kw.get("exact") or []
-        match_list = kw.get("match") or []
-        match_str = []
-        for item in match_list:
-            if item[0] == "str":
-                match_str.append(item[1])
-            else:
-                match_str.append(f"/{item[1].pattern}/")
-        cfg[field] = {"exact": exact_list, "match": match_str}
+def save_spam_keywords():
     try:
+        cfg = {}
+        for field in ("text", "name", "bio"):
+            kw = spam_keywords.get(field) or {}
+            exact = kw.get("exact") or []
+            match = []
+            for x in (kw.get("match") or []):
+                if x[0] == "str":
+                    match.append(x[1])
+                else:
+                    match.append(f"/{x[1].pattern}/")
+            cfg[field] = {"exact": exact, "match": match}
+        wl_cfg = {}
+        for field in ("name", "text"):
+            kw = (spam_keywords.get("whitelist") or {}).get(field) or {}
+            exact = kw.get("exact") or []
+            match = []
+            for x in (kw.get("match") or []):
+                if x[0] == "str":
+                    match.append(x[1])
+                else:
+                    match.append(f"/{x[1].pattern}/")
+            wl_cfg[field] = {"exact": exact, "match": match}
+        cfg["whitelist"] = wl_cfg
         with open(SPAM_KEYWORDS_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"保存垃圾关键词失败: {e}")
+        print(f"[shared] 保存关键词失败: {e}")
 
 
-def _log_bio_call(user_id: int, full_name: str, bio: Optional[str]) -> None:
-    """将一次 bio 接口调用记录追加到 bio_calls.jsonl"""
-    try:
-        record = {
-            "time": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "user_id": user_id,
-            "full_name": full_name or "",
-            "bio": bio if bio is not None else "",
-        }
-        with open(BIO_CALLS_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[bio 调用记录失败] {e}")
+def _is_in_keyword_whitelist(field: str, value: str) -> bool:
+    """检查 value 是否命中白名单（精确/子串/正则），命中则不应加入垃圾关键词"""
+    if field not in ("name", "text") or not (value or "").strip():
+        return False
+    wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
+    vl = (value or "").strip().lower()
+    for ex in (wl.get("exact") or []):
+        if vl == (ex or "").strip().lower():
+            return True
+    for x in (wl.get("match") or []):
+        if x[0] == "str":
+            if (x[1] or "").lower() in vl:
+                return True
+        elif x[0] == "regex" and x[1].search(value or ""):
+            return True
+    return False
 
 
-async def _get_sender_bio_cached(client, user_id: int) -> Optional[str]:
-    """获取用户简介，带 24 小时缓存；未命中时排队，两次调用间隔至少 60 秒；遇 FloodWait 按 retry_after 重试"""
-    global _last_bio_call_time
-    now = time.time()
-    if user_id in bio_cache:
-        cached_bio, expire = bio_cache[user_id]
-        if now < expire:
-            return cached_bio
-        bio_cache.pop(user_id, None)
-    try:
-        async with bio_call_lock:
-            # 等待期间可能已有其他协程为该用户填了缓存，入锁后再次检查
-            now = time.time()
-            if user_id in bio_cache:
-                cached_bio, expire = bio_cache[user_id]
-                if now < expire:
-                    return cached_bio
-                bio_cache.pop(user_id, None)
-            # 距上次调用至少 60 秒，否则等待
-            elapsed = now - _last_bio_call_time
-            if elapsed < BIO_CALL_INTERVAL:
-                wait = BIO_CALL_INTERVAL - elapsed
-                if VERBOSE:
-                    print(f"[bio 限流] 等待 {wait:.1f}s 后调用")
-                await asyncio.sleep(wait)
-            # 等待后再次检查缓存（前一个排队者可能已为该用户写入）
-            now = time.time()
-            if user_id in bio_cache:
-                cached_bio, expire = bio_cache[user_id]
-                if now < expire:
-                    return cached_bio
-                bio_cache.pop(user_id, None)
-            # get_entity + GetFullUserRequest，遇 FloodWait (429) 按 retry_after 等待后重试
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    user_entity = await client.get_entity(user_id)
-                    full = await client(GetFullUserRequest(user_entity))
-                    break
-                except FloodWaitError as e:
-                    wait_sec = getattr(e, "seconds", 60) or 60
-                    if attempt < max_retries - 1:
-                        if VERBOSE:
-                            print(f"[bio FloodWait] 等待 {wait_sec}s 后重试 ({attempt + 1}/{max_retries})")
-                        await asyncio.sleep(wait_sec)
-                    else:
-                        if VERBOSE:
-                            print(f"[bio FloodWait] 重试 {max_retries} 次后仍限流: {e}")
-                        return None
-            else:
-                return None
-            if full and getattr(full, "full_user", None):
-                bio = (getattr(full.full_user, "about", None) or "").strip() or None
-            else:
-                bio = None
-            # 更新上次调用时间（在 lock 内，保证下一个排队者看到）
-            _last_bio_call_time = time.time()
-            full_name = (
-                (getattr(user_entity, "first_name", None) or "").strip()
-                + " "
-                + (getattr(user_entity, "last_name", None) or "").strip()
-            ).strip() or ""
-            _log_bio_call(user_id, full_name, bio)
-        bio_cache[user_id] = (bio, time.time() + BIO_CACHE_TTL)
-        return bio
-    except Exception as e:
-        if VERBOSE:
-            print(f"[获取简介失败] {e}")
-        return None
+def _keyword_exists_in_field(field: str, keyword: str, as_exact: bool, is_regex: bool) -> bool:
+    """检查关键词是否已存在于 exact 或 match"""
+    if field not in ("text", "name", "bio"):
+        return False
+    kw = spam_keywords.get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    if as_exact:
+        return kw_lower in [s.lower() for s in (kw.get("exact") or [])]
+    if is_regex:
+        try:
+            pat = keyword.strip()
+            if pat.startswith("/") and pat.endswith("/"):
+                pat = pat[1:-1]
+            rx = re.compile(pat, re.I)
+            for x in (kw.get("match") or []):
+                if x[0] == "regex" and x[1].pattern == rx.pattern:
+                    return True
+        except re.error:
+            pass
+        return False
+    return kw_lower in [s.lower() for s in (x[1] for x in (kw.get("match") or []) if x[0] == "str")]
 
 
-def _check_field_spam(kw_cfg: dict, value: str) -> Optional[str]:
-    """检查单个字段是否命中关键词（exact / Aho-Corasick 子串 / 正则）"""
-    if not value:
-        return None
-    value_lower = value.lower()
-    exact_list = kw_cfg.get("exact") or []
-    for kw in exact_list:
-        if value_lower == kw.lower():
-            return kw
-    ac = kw_cfg.get("_ac")
-    if ac is not None:
-        for _end, matched in ac.iter(value_lower):
-            return matched
-    else:
-        # pyahocorasick 未安装时回退到子串遍历
-        for item in kw_cfg.get("match") or []:
-            if item[0] == "str" and item[1] in value_lower:
-                return item[1]
-    for regex in kw_cfg.get("_regex") or []:
-        if regex.search(value):
-            return regex.pattern
-    return None
-
-
-def _check_spam(text: str, first_name: str, last_name: str, sender_bio: Optional[str]) -> Optional[str]:
-    """
-    检查是否命中垃圾关键词。三个字段各自独立配置关键词：
-    - text: 消息文本
-    - name: first_name + last_name 组合
-    - bio: 简介
-    每个字段只检查自己的 exact/match，返回命中的关键词。
-    子串匹配使用 Aho-Corasick 算法，关键词数量增加时性能稳定。
-    """
-    msg_text = (text or "").strip()
-    full_name = ((first_name or "").strip() + " " + (last_name or "").strip()).strip()
-    bio = (sender_bio or "").strip()
-    field_values = {"text": msg_text, "name": full_name, "bio": bio}
-    for field, value in field_values.items():
-        kw_cfg = spam_keywords.get(field) or {}
-        hit = _check_field_spam(kw_cfg, value)
-        if hit:
-            return hit
-    return None
-
-
-def _check_spam_name_bio(first_name: str, last_name: str, sender_bio: Optional[str]) -> Optional[str]:
-    """
-    检查 name 或 bio 是否命中垃圾关键词（用于人机验证）。
-    返回命中的关键词，如果未命中则返回 None。使用 Aho-Corasick 做子串匹配。
-    """
-    full_name = ((first_name or "").strip() + " " + (last_name or "").strip()).strip()
-    bio = (sender_bio or "").strip()
-    for field, value in (("name", full_name), ("bio", bio)):
-        kw_cfg = spam_keywords.get(field) or {}
-        hit = _check_field_spam(kw_cfg, value)
-        if hit:
-            return hit
-    return None
-
-
-def _check_ai_trigger(
-    text: str,
-    reply_to_msg,
-    bot_id: int,
-    bot_username: Optional[str],
-) -> tuple[bool, str, Optional[str]]:
-    """
-    检查是否触发 AI 回复。
-    唤醒：霜刃，/验证官，/@机器人/回复机器人
-    返回 (是否触发, 用户问题, 被回复的机器人消息文本或 None)
+def _parse_keyword_input(text: str) -> tuple[bool, str, bool]:
+    """解析用户输入：(as_exact, normalized_keyword, is_regex)
+    - 直接输入如 加V -> match(子串)
+    - / 前缀如 /加微信 或 / 加微信 -> exact(精确)
+    - /正则/ 如 /加微.*/ -> match(regex)
     """
     t = (text or "").strip()
     if not t:
-        return False, "", None
-    query = ""
-    replied_bot_text: Optional[str] = None
-    # 霜刃，
-    if t.startswith("霜刃，"):
-        query = t[3:].strip()
-    # 验证官，
-    elif t.startswith("验证官，"):
-        query = t[4:].strip()
-    # @提及
-    elif bot_username and f"@{bot_username}".lower() in t.lower():
-        query = re.sub(rf"@{re.escape(bot_username)}\s*", "", t, flags=re.IGNORECASE).strip()
-    # 回复机器人：将被回复的机器人消息内容一并送入 KIMI
-    elif reply_to_msg and getattr(reply_to_msg, "sender_id", None) == bot_id:
-        query = t
-        replied_bot_text = (reply_to_msg.text or reply_to_msg.message or "").strip() or None
+        return False, "", False
+    if t.startswith("/") and t.endswith("/") and len(t) > 2:
+        inner = t[1:-1]
+        if any(c in inner for c in ".^$*+?{}[]|()"):
+            try:
+                re.compile(inner)
+                return False, t, True  # regex match
+            except re.error:
+                pass
+        return True, inner, False  # /加微信/ 视为 exact
+    if t.startswith("/"):
+        return True, t.lstrip("/").strip(), False  # exact
+    return False, t, False  # match (子串)
+
+
+def add_spam_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    """as_exact: None=自动(is_regex时match否则exact), True=exact, False=match"""
+    if field not in ("text", "name", "bio"):
+        return False
+    kw = spam_keywords[field]
+    kw_lower = (keyword or "").strip().lower()
+    use_exact = as_exact if as_exact is not None else (not is_regex)
+    if is_regex:
+        if not (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2):
+            return False
+        try:
+            rx = re.compile(keyword[1:-1], re.I)
+        except re.error:
+            return False
+        for x in (kw.get("match") or []):
+            if x[0] == "regex" and x[1].pattern == rx.pattern:
+                return True
+        kw["match"] = (kw.get("match") or []) + [("regex", rx)]
+        kw["_regex"] = (kw.get("_regex") or []) + [rx]
+    elif use_exact:
+        if kw_lower in [s.lower() for s in (kw.get("exact") or [])]:
+            return True
+        kw["exact"] = (kw.get("exact") or []) + [keyword.strip()]
     else:
-        return False, "", None
-    if not query:
-        query = "你好，有什么可以帮你的？"
-    return True, query, replied_bot_text
+        for x in (kw.get("match") or []):
+            if x[0] == "str" and x[1].lower() == kw_lower:
+                return True
+        kw["match"] = (kw.get("match") or []) + [("str", keyword.strip().lower())]
+    kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    return True
 
 
-async def _call_kimi_single_turn(user_message: str, replied_bot_text: Optional[str] = None) -> str:
-    """单轮调用 KIMI，无历史。若 replied_bot_text 存在则一并送入"""
-    if not KIMI_API_KEY:
-        return "未配置 AI（OPENAI_API_KEY）"
+def remove_spam_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    if field not in ("text", "name", "bio"):
+        return False
+    if as_exact is None:
+        as_exact = not is_regex
+    kw = spam_keywords[field]
+    kw_lower = (keyword or "").strip().lower()
+    if is_regex:
+        pat = (keyword or "").strip()
+        if pat.startswith("/") and pat.endswith("/"):
+            pat = pat[1:-1]
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error:
+            return False
+        mt = [x for x in (kw.get("match") or []) if not (x[0] == "regex" and x[1].pattern == rx.pattern)]
+        if len(mt) == len(kw.get("match") or []):
+            return False
+        kw["match"] = mt
+        kw["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+    elif as_exact:
+        ex = [s for s in (kw.get("exact") or []) if s.lower() != kw_lower]
+        if len(ex) == len(kw.get("exact") or []):
+            return False
+        kw["exact"] = ex
+    else:
+        mt = [x for x in (kw.get("match") or []) if not (x[0] == "str" and x[1].lower() == kw_lower)]
+        if len(mt) == len(kw.get("match") or []):
+            return False
+        kw["match"] = mt
+        kw["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+    kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    return True
+
+
+def _check_field(kw_cfg: dict, value: str) -> Optional[str]:
+    if not value:
+        return None
+    vl = value.lower()
+    for kw in (kw_cfg.get("exact") or []):
+        if vl == kw.lower():
+            return kw
+    ac = kw_cfg.get("_ac")
+    if ac:
+        for _, m in ac.iter(vl):
+            return m
+    for rx in (kw_cfg.get("_regex") or []):
+        if rx.search(value):
+            return rx.pattern
+    return None
+
+
+def check_spam_text(text: str) -> Optional[str]:
+    return _check_field(spam_keywords.get("text") or {}, text or "")
+
+
+def check_spam_name(first_name: str, last_name: str) -> Optional[str]:
+    name = ((first_name or "") + " " + (last_name or "")).strip()
+    return _check_field(spam_keywords.get("name") or {}, name)
+
+
+def load_verified_users():
+    global verified_users, verified_users_details, join_times
+    if not VERIFIED_USERS_PATH.exists():
+        return
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL)
-        content = user_message
-        if replied_bot_text:
-            content = f"【用户回复的机器人上一条消息】\n{replied_bot_text}\n\n【用户本次说的话】\n{user_message}"
-        messages = [
-            {"role": "system", "content": "你是一个冷酷的女杀手，沉默寡言。你的老板是小熊。回答控制在15字以内，尽量一句话。复杂问题时可回复\"不知道\"，\"小助理，你来回答\"，\"......\"，\"无可奉告\""},
-            {"role": "user", "content": content},
-        ]
-        resp = client.chat.completions.create(
-            model=KIMI_MODEL,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.7,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        return out or "（无回复）"
+        with open(VERIFIED_USERS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("users") or []
+        verified_users.clear()
+        for u in raw:
+            uid = int(u) if isinstance(u, (int, str)) and str(u).isdigit() else None
+            if uid:
+                verified_users.add(uid)
+        details = data.get("details") or {}
+        join_t = data.get("join_times") or {}
+        verified_users_details.clear()
+        join_times.clear()
+        for k, v in details.items():
+            uid = int(k) if str(k).isdigit() else None
+            if uid and isinstance(v, dict):
+                verified_users_details[uid] = v
+        for k, t in join_t.items():
+            uid = int(k) if str(k).isdigit() else None
+            if uid and t:
+                join_times[uid] = t
     except Exception as e:
-        return f"AI 调用异常：{e}"
+        print(f"[shared] 加载白名单失败: {e}")
+
+
+def _verification_failures_ent_to_timestamps(ent) -> list:
+    """将旧格式 {count, first_ts} 或新格式 {timestamps} 转为时间戳列表"""
+    if isinstance(ent, dict) and "timestamps" in ent:
+        return list(ent.get("timestamps") or [])
+    if isinstance(ent, dict) and "first_ts" in ent:
+        first = ent.get("first_ts", 0)
+        cnt = int(ent.get("count", 1))
+        return [first] * cnt
+    return []
+
+
+def load_verification_failures():
+    global verification_failures
+    if not VERIFICATION_FAILURES_PATH.exists():
+        return
+    try:
+        with open(VERIFICATION_FAILURES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        verification_failures.clear()
+        now = time.time()
+        for k, v in (data.get("failures") or {}).items():
+            parts = str(k).split(":", 1)
+            if len(parts) != 2 or not parts[1].isdigit():
+                continue
+            key = (parts[0], int(parts[1]))
+            ts_list = _verification_failures_ent_to_timestamps(v)
+            ts_list = [t for t in ts_list if now - t <= VERIFY_FAILURES_RETENTION_SECONDS]
+            if ts_list:
+                verification_failures[key] = {"timestamps": ts_list}
+    except Exception as e:
+        print(f"[shared] 加载失败计数失败: {e}")
+
+
+def load_verification_blacklist():
+    global verification_blacklist
+    verification_blacklist = set()
+    if not VERIFICATION_BLACKLIST_PATH.exists():
+        return
+    try:
+        with open(VERIFICATION_BLACKLIST_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for u in data.get("users") or []:
+            uid = int(u) if isinstance(u, (int, str)) and str(u).isdigit() else None
+            if uid:
+                verification_blacklist.add(uid)
+    except Exception as e:
+        print(f"[shared] 加载黑名单失败: {e}")
+
+
+def chat_allowed(chat_id: str, target_ids: set) -> bool:
+    return bool(target_ids and str(chat_id) in target_ids)
+
+
+def is_admin(user_id: int, admin_ids: set) -> bool:
+    return not admin_ids or user_id in admin_ids
+
+
+def add_verified_user(user_id: int, username: str = None, full_name: str = None):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    verified_users.add(user_id)
+    verified_users_details[user_id] = {
+        "user_id": user_id, "username": username, "full_name": full_name or "用户",
+        "join_time": join_times.get(user_id), "verify_time": now,
+    }
+
+
+def save_verified_users():
+    try:
+        data = {
+            "users": list(verified_users),
+            "details": {str(u): v for u, v in verified_users_details.items()},
+            "join_times": {str(u): t for u, t in join_times.items()},
+        }
+        with open(VERIFIED_USERS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[shared] 保存白名单失败: {e}")
+
+
+def increment_verification_failures(chat_id: str, user_id: int) -> int:
+    """验证码错误计数，冷却+窗口内 5 次即限制。返回当前窗口内次数。"""
+    key = (chat_id, user_id)
+    now = time.time()
+    ent = verification_failures.get(key)
+    ts_list = _verification_failures_ent_to_timestamps(ent) if ent else []
+    ts_list = [t for t in ts_list if now - t <= VERIFY_FAILURES_RETENTION_SECONDS]
+    should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, now)
+    if should_count:
+        verification_failures[key] = {"timestamps": new_ts}
+    return cnt
+
+
+def save_verification_failures():
+    try:
+        now = time.time()
+        to_save = {}
+        for (c, u), v in verification_failures.items():
+            ts_list = _verification_failures_ent_to_timestamps(v)
+            ts_list = [t for t in ts_list if now - t <= VERIFY_FAILURES_RETENTION_SECONDS]
+            if ts_list:
+                to_save[f"{c}:{u}"] = {"timestamps": ts_list}
+        with open(VERIFICATION_FAILURES_PATH, "w", encoding="utf-8") as f:
+            json.dump({"failures": to_save}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[shared] 保存失败计数失败: {e}")
+
+
+def add_to_blacklist(user_id: int):
+    verification_blacklist.add(user_id)
+    verified_users.discard(user_id)
+    verified_users_details.pop(user_id, None)
+
+
+def _record_key(chat_id: str, message_id: int) -> str:
+    return f"{chat_id}:{message_id}"
+
+
+def load_verification_records():
+    global _verification_records
+    _verification_records = {}
+    if not VERIFICATION_RECORDS_PATH.exists():
+        return
+    try:
+        with open(VERIFICATION_RECORDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _verification_records = data.get("records") or {}
+    except Exception as e:
+        print(f"[shared] 加载验证记录失败: {e}")
+
+
+def save_verification_records():
+    try:
+        items = list(_verification_records.items())
+        if len(items) > 10000:
+            items = sorted(items, key=lambda x: (x[1].get("started_at") or ""), reverse=True)[:10000]
+            _verification_records.clear()
+            _verification_records.update(dict(items))
+        with open(VERIFICATION_RECORDS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"records": _verification_records}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[shared] 保存验证记录失败: {e}")
+
+
+def _serialize_message_body(msg) -> dict | None:
+    """将 PTB Message 序列化为可 JSON 存储的完整消息体"""
+    if msg is None:
+        return None
+    try:
+        body = {
+            "message_id": getattr(msg, "message_id", None),
+            "date": getattr(msg, "date", None),
+            "text": (getattr(msg, "text", None) or "")[:20],
+            "caption": (getattr(msg, "caption", None) or "")[:20],
+        }
+        if body.get("date"):
+            body["date"] = body["date"].isoformat() if hasattr(body["date"], "isoformat") else str(body["date"])
+        chat = getattr(msg, "chat", None)
+        if chat:
+            body["chat"] = {"id": getattr(chat, "id", None), "type": getattr(chat, "type", None)}
+        user = getattr(msg, "from_user", None)
+        if user:
+            body["from_user"] = {
+                "id": getattr(user, "id", None),
+                "first_name": getattr(user, "first_name", None),
+                "last_name": getattr(user, "last_name", None),
+                "username": getattr(user, "username", None),
+            }
+        entities = getattr(msg, "entities", None) or []
+        body["entities"] = [
+            {"type": str(getattr(e, "type", None)), "offset": getattr(e, "offset", 0), "length": getattr(e, "length", 0),
+             **({"url": getattr(e, "url", None)} if hasattr(e, "url") and getattr(e, "url") else {})}
+            for e in entities
+        ]
+        cap_entities = getattr(msg, "caption_entities", None) or []
+        body["caption_entities"] = [
+            {"type": str(getattr(e, "type", None)), "offset": getattr(e, "offset", 0), "length": getattr(e, "length", 0),
+             **({"url": getattr(e, "url", None)} if hasattr(e, "url") and getattr(e, "url") else {})}
+            for e in cap_entities
+        ]
+        reply = getattr(msg, "reply_to_message", None)
+        if reply:
+            body["reply_to_message_id"] = getattr(reply, "message_id", None)
+        return body
+    except Exception as e:
+        print(f"[PTB] 序列化消息体失败: {e}")
+        return None
+
+
+def add_verification_record(
+    chat_id: str, message_id: int, user_id: int,
+    full_name: str, username: str, trigger_reason: str,
+    msg_preview: str = "", initial_status: str = "pending",
+    hit_keyword: str = "", raw_message_body: dict | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    k = _record_key(chat_id, message_id)
+    rec = {
+        "chat_id": chat_id, "message_id": message_id,
+        "user_id": user_id, "full_name": full_name or "用户", "username": username or "",
+        "trigger_reason": trigger_reason, "status": initial_status,
+        "started_at": now, "msg_preview": (msg_preview or "")[:200],
+    }
+    if hit_keyword:
+        rec["hit_keyword"] = hit_keyword
+    if raw_message_body is not None:
+        rec["raw_body"] = raw_message_body
+    _verification_records[k] = rec
+
+
+def update_verification_record(chat_id: str, message_id: int, status: str, fail_count: int = None) -> None:
+    k = _record_key(chat_id, message_id)
+    if k not in _verification_records:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _verification_records[k]["status"] = status
+    _verification_records[k]["updated_at"] = now
+    if fail_count is not None:
+        _verification_records[k]["fail_count"] = fail_count
+
+
+def get_verification_record(chat_id: str, message_id: int) -> dict | None:
+    k = _record_key(chat_id, message_id)
+    return _verification_records.get(k)
+
+
+def save_verification_blacklist():
+    try:
+        with open(VERIFICATION_BLACKLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump({"users": list(verification_blacklist)}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[shared] 保存黑名单失败: {e}")
+
+
+def sync_lottery_winners() -> tuple[int, str]:
+    if os.name == "nt":
+        return 0, "抽奖同步仅适用于 Linux/Ubuntu，Windows 下已跳过"
+    db_path = LOTTERY_DB_PATH
+    if not db_path or not Path(db_path).exists():
+        return 0, "lottery.db 不存在"
+    added = 0
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        user_col = None
+        for t in ("winners", "lottery_winners", "lottery_entries", "participants"):
+            if t not in tables:
+                continue
+            cur.execute(f"PRAGMA table_info({t})")
+            cols = [r[1].lower() for r in cur.fetchall()]
+            for c in ("user_id", "telegram_id", "uid", "user"):
+                if c in cols:
+                    user_col = c
+                    break
+            if user_col:
+                cur.execute(f"SELECT DISTINCT {user_col} FROM {t}")
+                for row in cur.fetchall():
+                    uid = row[0]
+                    if uid is not None:
+                        try:
+                            uid = int(uid)
+                            if uid not in verified_users and uid not in verification_blacklist:
+                                add_verified_user(uid, None, "抽奖中奖")
+                                added += 1
+                        except (TypeError, ValueError):
+                            pass
+                break
+        conn.close()
+        if user_col is None:
+            return 0, "未找到兼容的抽奖表结构"
+        if added > 0:
+            save_verified_users()
+        return added, f"同步 {added} 个中奖用户" if added else "无新中奖用户"
+    except sqlite3.OperationalError as e:
+        return 0, f"lottery.db 只读打开失败: {e}"
+    except Exception as e:
+        return 0, f"抽奖同步异常: {e}"
+
+
+# ==================== PTB 霜刃逻辑 ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+GROUP_ID_STR = os.getenv("GROUP_ID", "")
+TARGET_GROUP_IDS = {s.strip() for s in GROUP_ID_STR.split(",") if s.strip()}
+REQUIRED_GROUP_ID = (os.getenv("REQUIRED_GROUP_ID") or os.getenv("REQUIRED_GROUP_IDS") or "").strip()  # 用户必须加入的 B 群（公开群/频道），不在则触发验证；支持 REQUIRED_GROUP_ID 或 REQUIRED_GROUP_IDS
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
+RESTRICTED_USERS_LOG_PATH = _BASE / "restricted_users.jsonl"
+DELETED_CONTENT_LOG_PATH = _BASE / "bio_calls.jsonl"  # 被删除文案记录：time, user_id, full_name, deleted_content
+VERIFY_TIMEOUT = 90
+VERIFY_MSG_DELETE_AFTER = 30
+REQUIRED_GROUP_MSG_DELETE_AFTER = 90  # 入群验证消息 90 秒后自动删除
+REQUIRED_GROUP_RESTRICT_HOURS = float(os.getenv("REQUIRED_GROUP_RESTRICT_HOURS", "24"))  # 未加入 B 群 5 次后限制时长（小时），默认 24 即一天
+VERIFY_RESTRICT_DURATION = 1
+UNBAN_BOT_USERNAME = os.getenv("UNBAN_BOT_USERNAME", "@XHNPBOT")
+KIMI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+KIMI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.moonshot.cn/v1")
+KIMI_MODEL = os.getenv("MODEL_NAME", "moonshot-v1-128k")
+XHCHAT_BOT_USERNAME = (os.getenv("XHCHAT_BOT_USERNAME") or os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
+BOT_NICKNAME = (os.getenv("BOT_NICKNAME") or "").strip()  # 机器人显示昵称，用于消息内容；未配置则用 get_me().first_name
+
+pending_verification = {}
+# 未加入 B 群的触发时间戳，(chat_id, uid) -> [t1,t2,...]，冷却+窗口内 5 次即限制
+_required_group_warn_count: dict[tuple[str, int], list] = {}
+_LINK_RE = re.compile(r"t\.me/c/(\d+)/(\d+)", re.I)
+_LINK_PUBLIC_RE = re.compile(r"t\.me/([a-zA-Z0-9_]+)/(\d+)", re.I)
+_bot_me_cache = None  # get_me() 结果，ExtBot 不允许动态属性
+# B 群信息缓存 (title, link)，通过 get_chat 获取（公开群/频道有 username）
+_required_group_info_cache: tuple[str, str] | None = None
+# 用户是否在 B 群缓存，避免频繁调用 get_chat_member
+_user_in_required_group_cache: dict[tuple[int, str], tuple[bool, float]] = {}
+_USER_IN_GROUP_CACHE_TTL = 86400  # 1 天；白名单用户跳过缓存，确保离开 B 群后立即触发验证
+
+
+async def _is_user_in_required_group(bot, user_id: int, skip_cache: bool = False) -> bool:
+    """判断用户是否在 REQUIRED_GROUP_ID 指定的群中。未配置则返回 True（不限制）。skip_cache=True 时白名单用户每次实时检查。"""
+    if not REQUIRED_GROUP_ID:
+        return True
+    key = (user_id, REQUIRED_GROUP_ID)
+    now = time.time()
+    if not skip_cache and key in _user_in_required_group_cache:
+        cached_val, ts = _user_in_required_group_cache[key]
+        if now - ts <= _USER_IN_GROUP_CACHE_TTL:
+            return cached_val
+    try:
+        member = await bot.get_chat_member(chat_id=int(REQUIRED_GROUP_ID), user_id=user_id)
+        status = getattr(member, "status", "") or ""
+        is_in = status not in ("left", "kicked")
+        _user_in_required_group_cache[key] = (is_in, now)
+        print(f"[PTB] B群检查: uid={user_id} status={status!r} is_in={is_in} skip_cache={skip_cache}")
+        return is_in
+    except Exception as e:
+        print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {REQUIRED_GROUP_ID} 失败: {e}")
+        _user_in_required_group_cache[key] = (False, now)  # 出错视为不在
+        return False
+
+
+async def _get_required_group_info(bot) -> tuple[str, str] | None:
+    """通过 get_chat 获取 B 群标题和链接（公开群/频道有 username）。未配置或获取失败返回 None。"""
+    global _required_group_info_cache
+    if not REQUIRED_GROUP_ID:
+        return None
+    if _required_group_info_cache is not None:
+        return _required_group_info_cache
+    try:
+        chat = await bot.get_chat(chat_id=int(REQUIRED_GROUP_ID))
+        title = (getattr(chat, "title", None) or "").strip() or "指定群组"
+        username = (getattr(chat, "username", None) or "").strip()
+        link = f"https://t.me/{username}" if username else ""
+        _required_group_info_cache = (title, link)
+        return _required_group_info_cache
+    except Exception as e:
+        print(f"[PTB] 获取 B 群 {REQUIRED_GROUP_ID} 信息失败: {e}")
+        return None
+
+
+def _has_url_entity(msg) -> bool:
+    entities = getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or []
+    for e in entities:
+        t = getattr(e, "type", None)
+        if t in (MessageEntityType.URL, MessageEntityType.TEXT_LINK):
+            return True
+    return False
+
+
+def _is_ad_message(msg) -> bool:
+    text = (msg.text or msg.caption or "").strip()
+    return _has_url_entity(msg) and len(text) <= 10
+
+
+async def _is_mention_bot(msg, text: str, bot) -> bool:
+    global _bot_me_cache
+    if _bot_me_cache is None:
+        try:
+            _bot_me_cache = await bot.get_me()
+        except Exception:
+            return False
+    me = _bot_me_cache
+    entities = getattr(msg, "entities", None) or []
+    for e in entities:
+        if getattr(e, "type", None) == MessageEntityType.MENTION:
+            men = (text or "")[e.offset : e.offset + e.length]
+            if men and me.username and men.lower() == f"@{me.username}".lower():
+                return True
+    return False
+
+
+# 含 emoji 检测：Unicode 常见 emoji 范围，预编译正则一次
+_EMOJI_PATTERN = re.compile(
+    r'[\U00002600-\U000027BF\U0001F300-\U0001F5FF\U0001F600-\U0001F64F'
+    r'\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF\U0001F1E0-\U0001F1FF]',
+    re.UNICODE,
+)
+
+
+def _contains_emoji(s: str) -> bool:
+    """检查字符串是否含 Unicode emoji"""
+    return bool(s and _EMOJI_PATTERN.search(s))
+
+
+def _is_reply_to_other_chat(msg, current_chat_id: int) -> bool:
+    reply = getattr(msg, "reply_to_message", None)
+    if not reply:
+        return False
+    if getattr(reply, "forward_origin", None) is not None:
+        return True
+    if getattr(reply, "external_reply", None) is not None:
+        return True
+    return False
+
+
+def _parse_message_link(text: str) -> tuple[str, int] | None:
+    """解析 t.me/c/123/456 格式（私密群），返回 (chat_id_str, msg_id) 或 None"""
+    m = _LINK_RE.search(text or "")
+    if not m:
+        return None
+    short_id, msg_id = m.group(1), m.group(2)
+    try:
+        chat_id = int(f"-100{short_id}")
+        return (str(chat_id), int(msg_id))
+    except ValueError:
+        return None
+
+
+async def _parse_message_link_async(text: str, bot) -> tuple[str, int] | None:
+    """解析链接，支持 t.me/c/123/456 和 t.me/USERNAME/123（公开群）"""
+    # 1. 私密群格式
+    r = _parse_message_link(text)
+    if r:
+        return r
+    # 2. 公开群格式 t.me/XHNPD/1956968
+    m = _LINK_PUBLIC_RE.search(text or "")
+    if not m:
+        return None
+    username, msg_id_str = m.group(1), m.group(2)
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        return (str(chat.id), int(msg_id_str))
+    except Exception:
+        return None
+
+
+def _log_restriction(chat_id: str, user_id: int, full_name: str, action: str, until_date=None):
+    try:
+        until_str = until_date.isoformat() if isinstance(until_date, datetime) else until_date
+        rec = {"time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "chat_id": chat_id,
+               "user_id": user_id, "full_name": full_name or "", "action": action, "until_date": until_str}
+        with open(RESTRICTED_USERS_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[PTB] 记录封禁日志失败: {e}")
+
+
+def _log_deleted_content(user_id: int, full_name: str, deleted_content: str):
+    """记录被删除的文案到 bio_calls.jsonl：time, user_id, full_name, deleted_content"""
+    content = (deleted_content or "").strip()
+    if not content:
+        return
+    try:
+        rec = {
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "user_id": user_id,
+            "full_name": full_name or "",
+            "deleted_content": content[:500],
+        }
+        with open(DELETED_CONTENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[PTB] 记录被删文案失败: {e}")
+
+
+def _schedule_sync_background(func, *args, **kwargs):
+    """将同步 IO 放入后台执行，不阻塞主流程"""
+    def _run():
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            print(f"[PTB] 后台任务失败: {e}")
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _run)
+    except RuntimeError:
+        func(*args, **kwargs)  # 无事件循环时同步执行
+
+
+def _cleanup_expired_message_cache():
+    """删除超过 TTL 的缓存消息"""
+    now = time.time()
+    expired = [k for k, (_, ts) in _last_message_by_user.items() if now - ts > LAST_MESSAGE_CACHE_TTL_SECONDS]
+    for k in expired:
+        del _last_message_by_user[k]
+
+
+def _add_whitelist_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    """白名单添加：管理员限制用户时不录入这些昵称/消息"""
+    if field not in ("name", "text"):
+        return False
+    wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    use_exact = as_exact if as_exact is not None else (not is_regex)
+    if is_regex:
+        if not (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2):
+            return False
+        try:
+            rx = re.compile(keyword[1:-1], re.I)
+        except re.error:
+            return False
+        for x in (wl.get("match") or []):
+            if x[0] == "regex" and x[1].pattern == rx.pattern:
+                return True
+        wl.setdefault("match", []).append(("regex", rx))
+    elif use_exact:
+        if kw_lower in [s.lower() for s in (wl.get("exact") or [])]:
+            return True
+        wl.setdefault("exact", []).append(keyword.strip())
+    else:
+        for x in (wl.get("match") or []):
+            if x[0] == "str" and x[1] == kw_lower:
+                return True
+        wl.setdefault("match", []).append(("str", kw_lower))
+    wl["_regex"] = [x[1] for x in (wl.get("match") or []) if x[0] == "regex"]
+    return True
+
+
+def _remove_whitelist_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    if field not in ("name", "text"):
+        return False
+    wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    use_exact = as_exact if as_exact is not None else (not is_regex)
+    if is_regex:
+        pat = (keyword or "").strip()
+        if pat.startswith("/") and pat.endswith("/"):
+            pat = pat[1:-1]
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error:
+            return False
+        mt = [x for x in (wl.get("match") or []) if not (x[0] == "regex" and x[1].pattern == rx.pattern)]
+        if len(mt) == len(wl.get("match") or []):
+            return False
+        wl["match"] = mt
+    elif use_exact:
+        ex = [s for s in (wl.get("exact") or []) if s.lower() != kw_lower]
+        if len(ex) == len(wl.get("exact") or []):
+            return False
+        wl["exact"] = ex
+    else:
+        mt = [x for x in (wl.get("match") or []) if not (x[0] == "str" and x[1] == kw_lower)]
+        if len(mt) == len(wl.get("match") or []):
+            return False
+        wl["match"] = mt
+    wl["_regex"] = [x[1] for x in (wl.get("match") or []) if x[0] == "regex"]
+    return True
+
+
+def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
+    """管理员（真人）删除并限制/封禁用户时，将昵称加入 name 关键词、被删消息加入 text 关键词。白名单中的不录入。"""
+    name_trimmed = (full_name or "").strip()
+    if name_trimmed and not _is_in_keyword_whitelist("name", name_trimmed):
+        as_exact_name = len(name_trimmed) <= 2
+        if add_spam_keyword("name", name_trimmed, as_exact=as_exact_name):
+            save_spam_keywords()
+            print(f"[PTB] 管理员操作: 已加入 name 关键词 {name_trimmed!r} (exact={as_exact_name})")
+    elif name_trimmed:
+        print(f"[PTB] 管理员操作: 昵称 {name_trimmed!r} 在白名单中，跳过")
+    key = (chat_id, user_id)
+    entry = _last_message_by_user.pop(key, None)
+    msg_text = ""
+    if entry:
+        text_val, ts = entry
+        if time.time() - ts <= LAST_MESSAGE_CACHE_TTL_SECONDS:
+            msg_text = (text_val or "").strip()
+        else:
+            print(f"[PTB] 管理员操作: 用户 {user_id} 消息缓存已过期(>{LAST_MESSAGE_CACHE_TTL_SECONDS//3600}h)，未加入 text 关键词")
+    else:
+        print(f"[PTB] 管理员操作: 用户 {user_id} 无消息缓存(可能仅发过图/贴纸/无文字，或 bot 重启后未收到其新消息)，未加入 text 关键词")
+    if msg_text:
+        _log_deleted_content(user_id, full_name, msg_text)
+        msg_text = msg_text[:200]  # 截断避免过长
+        if not _is_in_keyword_whitelist("text", msg_text):
+            as_exact_text = len(msg_text) <= 2
+            if add_spam_keyword("text", msg_text, as_exact=as_exact_text):
+                save_spam_keywords()
+                print(f"[PTB] 管理员操作: 已加入 text 关键词 {msg_text[:50]!r}... (exact={as_exact_text})")
+        else:
+            print(f"[PTB] 管理员操作: 消息 {msg_text[:50]!r}... 在白名单中，跳过")
+
+
+async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """接收成员状态变更（限制/封禁/踢出）。注意：Bot 必须是群管理员才能收到此更新。"""
+    if not update.chat_member:
+        return
+    cm = update.chat_member
+    chat_id = str(cm.chat.id)
+    user = cm.new_chat_member.user
+    uid = user.id
+    new = cm.new_chat_member
+    old = cm.old_chat_member
+    # 调试：每次收到 chat_member 都打印，便于确认 Bot 是否收到更新
+    print(f"[PTB] chat_member 收到: chat_id={chat_id} uid={uid} old={old.status} new={getattr(new, 'status', type(new).__name__)}")
+    if not chat_allowed(chat_id, TARGET_GROUP_IDS):
+        print(f"[PTB] chat_member 跳过: 群 {chat_id} 不在监控列表")
+        return
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (user.username or f"用户{uid}")
+
+    if new.status == "member" and old.status in ("left", "kicked", "restricted"):
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        join_times[uid] = now_iso
+        if user.is_bot:
+            add_verified_user(uid, user.username, full_name)
+            save_verified_users()
+        return
+
+    if isinstance(new, ChatMemberBanned):
+        print(f"[PTB] 管理员操作: 用户 {uid} 被封禁，加入关键词")
+        _log_restriction(chat_id, uid, full_name, "banned", new.until_date)
+        add_to_blacklist(uid)
+        _add_keywords_from_admin_action(chat_id, uid, full_name)
+        save_verified_users()
+        save_verification_blacklist()
+    elif isinstance(new, ChatMemberRestricted):
+        print(f"[PTB] 管理员操作: 用户 {uid} 被限制，加入关键词")
+        _log_restriction(chat_id, uid, full_name, "restricted", new.until_date)
+        add_to_blacklist(uid)
+        _add_keywords_from_admin_action(chat_id, uid, full_name)
+        save_verified_users()
+        save_verification_blacklist()
+    elif isinstance(new, ChatMemberLeft):
+        if old.status not in ("left", "kicked"):
+            print(f"[PTB] 管理员操作: 用户 {uid} 被踢出，加入关键词")
+            _log_restriction(chat_id, uid, full_name, "kicked", None)
+            add_to_blacklist(uid)
+            _add_keywords_from_admin_action(chat_id, uid, full_name)
+            save_verified_users()
+            save_verification_blacklist()
+
+
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    msg = update.message
+    chat_id = str(msg.chat_id)
+    text = (msg.text or msg.caption or "").strip()
+    if not chat_allowed(chat_id, TARGET_GROUP_IDS):
+        if text and "霜刃" in text:
+            print(f"[PTB] 群 {chat_id} 不在目标列表 {TARGET_GROUP_IDS}，忽略霜刃唤醒")
+        print(f"[PTB] 群消息跳过(无记录): chat_id={chat_id} 不在监控列表")
+        return
+
+    user = msg.from_user
+    if not user:
+        print(f"[PTB] 群消息跳过(无记录): chat_id={chat_id} msg_id={msg.message_id} 无 from_user")
+        return
+    uid = user.id
+    first_name = user.first_name or ""
+    last_name = user.last_name or ""
+
+    # 缓存用户最近消息（必须在所有 return 之前），供管理员删除+限制/封禁时自动加入 text 关键词
+    if text:
+        _last_message_by_user[(chat_id, uid)] = (text[:500], time.time())
+        if len(_last_message_by_user) % 100 == 0:  # 每 100 条消息清理一次过期缓存
+            _cleanup_expired_message_cache()
+
+    # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；白名单用户跳过缓存，确保离开 B 群后立即触发
+    if REQUIRED_GROUP_ID and not (await _is_user_in_required_group(context.bot, uid, skip_cache=(uid in verified_users))):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group)")
+        await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
+        return
+
+    if text and ("霜刃" in text or await _is_mention_bot(msg, text, context.bot)):
+        print(f"[PTB] 收到霜刃唤醒 chat={chat_id} uid={uid} msg_id={msg.message_id} text={text[:50]!r} [霜刃唤醒不建记录]")
+        await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text, first_name, last_name)
+        return
+
+    if uid in verified_users:
+        add_verification_record(
+            chat_id, msg.message_id, uid,
+            f"{first_name} {last_name}".strip(), getattr(user, "username", None) or "",
+            "normal", (text or "")[:200], initial_status="verified_pass",
+            raw_message_body=_serialize_message_body(msg),
+        )
+        save_verification_records()
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} verified_pass")
+        return
+
+    key = (chat_id, uid)
+    if key in pending_verification:
+        pb = pending_verification[key]
+        if time.time() - pb["time"] <= VERIFY_TIMEOUT:
+            ok = text == pb["code"] or text == f"验证码{pb['code']}"
+            msg_id = pb.get("msg_id")
+            if ok:
+                if msg_id is not None:
+                    update_verification_record(chat_id, msg_id, "passed")
+                    save_verification_records()
+                add_verified_user(uid, user.username, f"{first_name} {last_name}".strip())
+                save_verified_users()
+                verification_failures.pop(key, None)
+                verification_blacklist.discard(uid)
+                pending_verification.pop(key, None)
+                print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 验证通过(更新原记录) | 当前验证码消息msg_id={msg.message_id} [验证码消息不单独建记录]")
+                await msg.reply_text(f"【{first_name} {last_name}】\n\n✓ 验证通过\n\n已将您加入白名单，可以正常发言了。")
+            else:
+                cnt = increment_verification_failures(chat_id, uid)
+                save_verification_failures()
+                if cnt >= VERIFY_FAIL_THRESHOLD:
+                    await _restrict_and_notify(context.bot, chat_id, uid, f"{first_name} {last_name}", msg_id)
+                else:
+                    left = VERIFY_FAIL_THRESHOLD - cnt
+                    print(f"[PTB] 群消息: chat_id={chat_id} 验证码错误 msg_id={msg.message_id} [验证码消息不单独建记录]")
+                    await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
+            return
+        pending_verification.pop(key, None)
+
+    if _is_ad_message(msg):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(ad)")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到疑似广告链接，请先完成人机验证。", "ad")
+        return
+    if ENABLE_EMOJI_CHECK and (_contains_emoji(text) or _contains_emoji(f"{first_name} {last_name}".strip())):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(emoji)")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到您的消息或昵称中含有表情符号，请先完成人机验证。", "emoji")
+        return
+    if _is_reply_to_other_chat(msg, int(chat_id)):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(reply_other_chat)")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到引用非本群消息，请先完成人机验证。", "reply_other_chat")
+        return
+
+    hit_text = check_spam_text(text)
+    hit_name = check_spam_name(first_name, last_name)
+    if hit_text:
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(spam_text hit={hit_text})")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到您的消息中含有疑似广告词，请先完成人机验证。", "spam_text", hit_keyword=hit_text)
+        return
+    if hit_name:
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(spam_name hit={hit_name})")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到您昵称中含有疑似广告词，请先完成人机验证。", "spam_name", hit_keyword=hit_name)
+        return
+    if uid in verification_blacklist:
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(blacklist)")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到您的账号疑似广告账号，请先完成人机验证。", "blacklist")
+        return
+
+    add_verified_user(uid, user.username, f"{first_name} {last_name}".strip())
+    save_verified_users()
+    add_verification_record(
+        chat_id, msg.message_id, uid,
+        f"{first_name} {last_name}".strip(), getattr(user, "username", None) or "",
+        "normal", (msg.text or msg.caption or "")[:200],
+        initial_status="whitelist_added",
+        raw_message_body=_serialize_message_body(msg),
+    )
+    save_verification_records()
+    print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} whitelist_added")
+
+
+async def _start_required_group_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str):
+    """未加入 B 群时：删除消息，发送带按钮的警告，冷却+窗口内 5 次后限制"""
+    key = (chat_id, user_id)
+    ts_list = _required_group_warn_count.get(key, [])
+    should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
+    if should_count:
+        _required_group_warn_count[key] = new_ts
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    full_name = f"{first_name} {last_name}".strip() or "用户"
+    deleted_text = (msg.text or msg.caption or "").strip()
+    if deleted_text:
+        _schedule_sync_background(_log_deleted_content, user_id, full_name, deleted_text)
+    add_verification_record(
+        chat_id, msg.message_id, user_id,
+        full_name, getattr(msg.from_user, "username", None) or "",
+        "not_in_required_group", deleted_text[:200],
+        raw_message_body=_serialize_message_body(msg),
+    )
+    _schedule_sync_background(save_verification_records)
+    if not should_count:
+        return  # 冷却期内：已删消息，不发重复警告
+    if cnt >= VERIFY_FAIL_THRESHOLD:
+        add_to_blacklist(user_id)
+        save_verified_users()
+        save_verification_blacklist()
+        await _restrict_and_notify(bot, chat_id, user_id, full_name, msg.message_id, restrict_hours=REQUIRED_GROUP_RESTRICT_HOURS)
+        return
+    rows = []
+    group_info = await _get_required_group_info(bot)
+    if group_info:
+        title, link = group_info
+        if link:
+            rows.append([InlineKeyboardButton(title, url=link)])
+    cb_data = f"reqgrp_unr:{chat_id}:{user_id}"
+    if len(cb_data) <= 64:
+        rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
+    reply_markup = InlineKeyboardMarkup(rows) if rows else None
+    vmsg = await bot.send_message(
+        chat_id=int(chat_id),
+        text=f"【{full_name}】\n\n请先关注如下频道或加入群组后才能发言 。\n\n• 警告({cnt}/{VERIFY_FAIL_THRESHOLD})\n\n本条消息{REQUIRED_GROUP_MSG_DELETE_AFTER}秒后自动删除",
+        reply_markup=reply_markup,
+    )
+    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, REQUIRED_GROUP_MSG_DELETE_AFTER))
+
+
+async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, intro: str, trigger_reason: str = "", hit_keyword: str = ""):
+    code = str(random.randint(1000, 9999))
+    msg_id = msg.message_id
+    msg_preview = (msg.text or msg.caption or "")[:200]
+    raw_body = _serialize_message_body(msg)
+    full_name = f"{first_name} {last_name}".strip() or "用户"
+    if msg_preview.strip():
+        _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    add_verification_record(
+        chat_id, msg_id, user_id,
+        full_name, getattr(msg.from_user, "username", None) or "",
+        trigger_reason, msg_preview, hit_keyword=hit_keyword, raw_message_body=raw_body,
+    )
+    vmsg = await bot.send_message(
+        chat_id=int(chat_id),
+        text=f"【{full_name}】\n\n{intro}\n\n👉 您的验证码是： <code>{code}</code>\n\n"
+             f"直接发送上述验证码即可通过（{VERIFY_TIMEOUT}秒内有效）",
+        parse_mode="HTML",
+    )
+    pending_verification[(chat_id, user_id)] = {"code": code, "time": time.time(), "msg_id": msg_id}
+    _schedule_sync_background(save_verification_records)
+    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, VERIFY_MSG_DELETE_AFTER))
+
+
+async def _delete_after(bot, chat_id: int, msg_id: int, sec: int):
+    await asyncio.sleep(sec)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception:
+        pass
+
+
+async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, first_name: str, last_name: str):
+    global _bot_me_cache
+    if _bot_me_cache is None:
+        try:
+            _bot_me_cache = await bot.get_me()
+        except Exception as ex:
+            print(f"[PTB] 霜刃: get_me 失败，提前返回: {ex}")
+            return
+    me = _bot_me_cache
+    mention_ok = "霜刃" in text
+    if not mention_ok:
+        entities = getattr(msg, "entities", None) or []
+        for e in entities:
+            if getattr(e, "type", None) == MessageEntityType.MENTION:
+                men = (text or "")[e.offset : e.offset + e.length]
+                if men and me.username and men.lower() == f"@{me.username}".lower():
+                    mention_ok = True
+                    break
+    if not mention_ok:
+        return
+    if not KIMI_API_KEY:
+        try:
+            await bot.send_message(
+                chat_id=int(chat_id),
+                text="⚠️ 霜刃 AI 未配置：请在 bytecler/.env 中设置 OPENAI_API_KEY",
+                reply_to_message_id=msg.message_id,
+            )
+        except Exception:
+            pass
+        return
+    try:
+        from openai import AsyncOpenAI
+        print(f"[PTB] 霜刃: 调用 Kimi API model={KIMI_MODEL}")
+        client = AsyncOpenAI(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL)
+        resp = await client.chat.completions.create(
+            model=KIMI_MODEL,
+            messages=[
+                {"role": "system", "content": "你是一个冷酷的女杀手，沉默寡言。你的老板是小熊。回答控制在15字以内，尽量一句话。复杂问题时可回复\"不知道\"，\"小助理，你来回答\"，\"......\"，\"无可奉告\""},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.6,
+            max_tokens=1024,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+        print(f"[PTB] 霜刃: API 返回 len={len(reply)}")
+        if not reply:
+            return
+        # 仅当回复几乎就是「小助理，你来回答」时才转交，避免误判（如回答中顺带提到小助理）
+        handoff_phrase = "小助理，你来回答"
+        is_handoff = reply.strip() == handoff_phrase or (
+            handoff_phrase in reply and len(reply) < 30
+        )
+        if is_handoff:
+            try:
+                _xhbot = _BASE.parent
+                if str(_xhbot) not in sys.path:
+                    sys.path.insert(0, str(_xhbot))
+                from handoff import put_handoff
+                ok = put_handoff(int(chat_id), msg.message_id, text)
+                print(f"[PTB] 霜刃: 已转交小助理")
+            except ImportError as e:
+                print(f"[PTB] 霜刃: handoff 导入失败，改为直接回复: {e}")
+                await bot.send_message(
+                    chat_id=int(chat_id),
+                    text=reply,
+                    reply_to_message_id=msg.message_id,
+                )
+            return
+        await bot.send_message(
+            chat_id=int(chat_id),
+            text=reply,
+            reply_to_message_id=msg.message_id,
+        )
+        print("[PTB] 霜刃: 已发送回复")
+    except Exception as e:
+        print(f"[PTB] 霜刃 AI 唤醒异常: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, msg_id: int = None, restrict_hours: float | None = None):
+    """限制用户发言。restrict_hours 若指定则按小时，否则按 VERIFY_RESTRICT_DURATION 天（验证码失败用）。"""
+    if restrict_hours is not None:
+        until = datetime.now(timezone.utc) + timedelta(hours=restrict_hours) if restrict_hours > 0 else None
+    else:
+        until = datetime.now(timezone.utc) + timedelta(days=VERIFY_RESTRICT_DURATION) if VERIFY_RESTRICT_DURATION > 0 else None
+    try:
+        await bot.restrict_chat_member(
+            chat_id=int(chat_id), user_id=user_id,
+            until_date=until,
+            permissions={"can_send_messages": False, "can_send_media_messages": False},
+        )
+    except Exception as e:
+        print(f"[PTB] 限制用户失败: {e}")
+        return
+    if msg_id is not None:
+        update_verification_record(chat_id, msg_id, "failed_restricted", fail_count=VERIFY_FAIL_THRESHOLD)
+        save_verification_records()
+    add_to_blacklist(user_id)
+    save_verified_users()
+    save_verification_blacklist()
+    verification_failures.pop((chat_id, user_id), None)
+    for k in list(pending_verification):
+        if k[1] == user_id:
+            pending_verification.pop(k, None)
+    try:
+        m = await bot.send_message(
+            chat_id=int(chat_id),
+            text=f"【{full_name}】\n\n验证失败，如有需要，请联系 {UNBAN_BOT_USERNAME} 进行解封",
+        )
+        asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, VERIFY_MSG_DELETE_AFTER))
+    except Exception:
+        pass
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    await update.message.reply_text(
+        "Bytecler 指令（仅私聊有效）\n\n"
+        "• /list — 查看垃圾关键词\n"
+        "• /add_text、/add_name — 多轮添加（直接输入=子串，/前缀=精确，已存在则删除，/cancel 结束）\n"
+        "• /kw_text、/kw_name add/remove — 关键词增删\n"
+        "• /wl_name、/wl_text — 关键词白名单（管理员限制用户时不录入这些昵称/消息）\n"
+        "• bio 简介关键词：暂未启用\n"
+        "• /cancel — 取消当前操作\n"
+        "• /reload — 重载配置\n"
+        "• /verified_stats — 导出用户统计\n"
+        "• 发送群消息链接 — 查看该消息的验证过程\n\n"
+        "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
+    )
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    lines = []
+    for field, label in [("text", "消息"), ("name", "昵称"), ("bio", "简介(暂未启用)")]:
+        kw = spam_keywords.get(field) or {}
+        ex = kw.get("exact") or []
+        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
+        lines.append(f"【{label}】exact: {ex or '无'} | match: {mt or '无'}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    load_spam_keywords()
+    await update.message.reply_text("已重载 spam_keywords.json")
+
+pending_keyword_cmd = {}
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if uid in pending_keyword_cmd:
+        pending_keyword_cmd.pop(uid, None)
+        await update.message.reply_text("已取消")
+    else:
+        await update.message.reply_text("当前无待取消的操作")
+
+async def cmd_kw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_kw(update, context, "text", "消息")
+async def cmd_kw_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_kw(update, context, "name", "昵称")
+async def cmd_kw_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("bio 简介关键词暂未启用")
+
+
+async def cmd_wl_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_wl(update, context, "name", "昵称")
+async def cmd_wl_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_wl(update, context, "text", "消息")
+
+
+async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
+    """白名单管理：add/remove/list。子串=直接输入，精确=/前缀，正则=/正则/"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    args = (context.args or [])
+    if len(args) >= 1 and args[0].lower() == "list":
+        wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
+        ex = wl.get("exact") or []
+        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (wl.get("match") or [])]
+        txt = f"【{label}白名单】\nexact: {ex or '无'}\nmatch: {mt or '无'}"
+        await update.message.reply_text(txt)
+        return
+    if len(args) >= 2:
+        op, kw = args[0].lower(), " ".join(args[1:]).strip()
+        as_exact, kw_norm, is_regex = _parse_keyword_input(kw)
+        kw_for_storage = kw if is_regex else kw_norm  # 正则需保留 /.../ 格式
+        if op == "add" and kw:
+            if _add_whitelist_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
+                save_spam_keywords()
+                await update.message.reply_text(f"已添加「{kw}」到{label}白名单")
+            else:
+                await update.message.reply_text("添加失败（可能已存在或正则无效）")
+        elif op == "remove" and kw:
+            if _remove_whitelist_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
+                save_spam_keywords()
+                await update.message.reply_text(f"已从{label}白名单移除「{kw}」")
+            else:
+                await update.message.reply_text("移除失败（可能不存在）")
+        else:
+            await update.message.reply_text(f"用法: /wl_{field} add 关键词  或  /wl_{field} remove 关键词  或  /wl_{field} list")
+    else:
+        await update.message.reply_text(
+            f"【{label}白名单】管理员限制用户时不录入这些\n"
+            f"add 关键词 — 添加（直接输入=子串，/前缀=精确，/正则/=正则）\n"
+            f"remove 关键词 — 移除\n"
+            f"list — 查看\n"
+            f"例: /wl_{field} add 测试用户"
+        )
+
+
+async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """两段式多轮：直接输入=子串match，/前缀=精确exact，已存在则删除，/cancel 结束"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    pending_keyword_cmd[update.effective_user.id] = {"field": "text", "op": "add", "label": "消息", "multi": True}
+    await update.message.reply_text(
+        "【消息】关键词管理（多轮，/cancel 结束）\n"
+        "• 直接输入如 加V → 子串匹配\n"
+        "• /加微信 或 / 加微信 → 精确匹配"
+    )
+
+async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    pending_keyword_cmd[update.effective_user.id] = {"field": "name", "op": "add", "label": "昵称", "multi": True}
+    await update.message.reply_text(
+        "【昵称】关键词管理（多轮，/cancel 结束）\n"
+        "• 直接输入 → 子串匹配\n"
+        "• /关键词 → 精确匹配"
+    )
+
+async def cmd_add_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("bio 简介关键词暂未启用")
+
+async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    args = (context.args or [])
+    if len(args) >= 2:
+        op, kw = args[0].lower(), " ".join(args[1:]).strip()
+        if op == "add" and kw:
+            is_regex = kw.startswith("/") and kw.endswith("/") and len(kw) > 2
+            if add_spam_keyword(field, kw, is_regex=is_regex):
+                save_spam_keywords()
+                await update.message.reply_text(f"已添加「{kw}」到{label}关键词")
+            else:
+                await update.message.reply_text("添加失败（可能已存在或正则无效）")
+        elif op == "remove" and kw:
+            is_regex = kw.startswith("/") and kw.endswith("/") and len(kw) > 2
+            if remove_spam_keyword(field, kw, is_regex=is_regex):
+                save_spam_keywords()
+                await update.message.reply_text(f"已从{label}关键词移除「{kw}」")
+            else:
+                await update.message.reply_text("移除失败（可能不存在）")
+        else:
+            await update.message.reply_text(f"用法: /kw_{field} add 关键词  或  /kw_{field} remove 关键词")
+    else:
+        await update.message.reply_text(
+            f"【{label}】关键词管理\nadd 关键词 — 添加\nremove 关键词 — 移除\n例: /kw_{field} add 加微信"
+        )
+
+
+async def callback_required_group_unrestrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """自助解禁：点击者若在 B 群，则解除点击者本人的限制"""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("reqgrp_unr:"):
+        return
+    clicker_id = query.from_user.id if query.from_user else 0
+    if not clicker_id:
+        await query.answer("无法识别点击者", show_alert=True)
+        return
+    try:
+        parts = query.data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer("数据格式错误", show_alert=True)
+            return
+        _, chat_id_str, _ = parts
+    except (ValueError, IndexError):
+        await query.answer("解析失败", show_alert=True)
+        return
+    # 每次点击都实时检查，不读缓存（用户可能刚加入 B 群）
+    if not await _is_user_in_required_group(context.bot, clicker_id, skip_cache=True):
+        await query.answer("请先加入指定群组后再点击", show_alert=True)
+        return
+    try:
+        # 解除点击者本人的限制
+        try:
+            perms = ChatPermissions.all_permissions()
+        except (AttributeError, TypeError):
+            perms = {
+                "can_send_messages": True,
+                "can_send_media_messages": True,
+                "can_send_other_messages": True,
+                "can_send_polls": True,
+                "can_add_web_page_previews": True,
+            }
+        await context.bot.restrict_chat_member(
+            chat_id=int(chat_id_str),
+            user_id=clicker_id,
+            permissions=perms,
+        )
+    except Exception as e:
+        err_msg = str(e).lower() if e else ""
+        print(f"[PTB] 自助解禁失败 chat={chat_id_str} uid={clicker_id}: {e}")
+        if "rights" in err_msg or "permission" in err_msg or "admin" in err_msg:
+            tip = "解禁失败，请确认机器人在该群有禁言权限"
+        else:
+            tip = f"解禁失败：{str(e)[:80]}"
+        await query.answer(tip, show_alert=True)
+        return
+    add_verified_user(clicker_id, None, None)
+    verification_blacklist.discard(clicker_id)
+    save_verified_users()
+    save_verification_blacklist()
+    key = (chat_id_str, clicker_id)
+    _required_group_warn_count.pop(key, None)
+    _user_in_required_group_cache.pop((clicker_id, REQUIRED_GROUP_ID), None)
+    await query.answer("已解禁", show_alert=True)
+
+
+async def callback_raw_message_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理「查看原始消息」按钮点击，返回完整消息体"""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("raw_msg:"):
+        return
+    if query.from_user and not is_admin(query.from_user.id, ADMIN_IDS):
+        await query.answer("无权限", show_alert=True)
+        return
+    try:
+        parts = query.data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer("数据格式错误", show_alert=True)
+            return
+        _, chat_id_str, msg_id_str = parts
+        msg_id = int(msg_id_str)
+    except (ValueError, IndexError):
+        await query.answer("解析失败", show_alert=True)
+        return
+    rec = get_verification_record(chat_id_str, msg_id)
+    if not rec or "raw_body" not in rec:
+        await query.answer("无原始消息体", show_alert=True)
+        return
+    raw = rec["raw_body"]
+    body_str = json.dumps(raw, ensure_ascii=False, indent=2)
+    if len(body_str) > 4000:
+        body_str = body_str[:4000] + "\n...(已截断)"
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"<pre>{body_str}</pre>", parse_mode="HTML")
+
+
+async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.effective_chat.type != "private":
+        return
+    user = update.effective_user
+    if not user:
+        return
+    if not is_admin(user.id, ADMIN_IDS):
+        await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
+        return
+    text = (update.message.text or "").strip()
+
+    # 1. 两段式关键词：add_text / add_name / add_bio 的后续输入（多轮、toggle）
+    uid = user.id
+    if uid in pending_keyword_cmd:
+        info = pending_keyword_cmd[uid]
+        field, label, multi = info.get("field"), info.get("label", ""), info.get("multi", False)
+        if not field or not text:
+            if not multi:
+                pending_keyword_cmd.pop(uid, None)
+            await update.message.reply_text("已取消" if not text else "请发送关键词")
+            return
+        as_exact, kw, is_regex = _parse_keyword_input(text)
+        exists = _keyword_exists_in_field(field, kw, as_exact, is_regex)
+        if exists:
+            if remove_spam_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+                save_spam_keywords()
+                await update.message.reply_text(f"已移除「{kw}」")
+            else:
+                await update.message.reply_text("移除失败")
+        else:
+            if add_spam_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+                save_spam_keywords()
+                await update.message.reply_text(f"已添加「{kw}」（{'精确' if as_exact else '子串'}）")
+            else:
+                await update.message.reply_text("添加失败（正则无效？）")
+        if not multi:
+            pending_keyword_cmd.pop(uid, None)
+        else:
+            await update.message.reply_text("继续发送关键词，/cancel 结束")
+        return
+
+    # 2. 群消息链接查询（支持 t.me/c/123/456 和 t.me/USERNAME/123）
+    if text and ("t.me" in text or "telegram" in text.lower()):
+        print(f"[PTB] 验证记录查询: 收到链接 text={text[:80]!r}")
+    parsed = await _parse_message_link_async(text, context.bot)
+    if not parsed:
+        if text and ("t.me" in text or "telegram" in text.lower()):
+            print(f"[PTB] 验证记录查询: 链接解析失败，无法识别格式")
+            await update.message.reply_text(
+                "\n".join([
+                    "❌ 链接解析失败",
+                    "",
+                    "📌 收到的内容",
+                    f"• {text[:100]}{'...' if len(text) > 100 else ''}",
+                    "",
+                    "📌 支持的格式",
+                    "• 私密群: https://t.me/c/1330784088/123",
+                    "• 公开群: https://t.me/XHNPD/123",
+                    "",
+                    "📌 请检查",
+                    "• 是否包含完整 chat 数字或用户名",
+                    "• 是否包含 msg_id",
+                ])
+            )
+        return
+    chat_id_str, msg_id = parsed
+    print(f"[PTB] 验证记录查询: 解析成功 chat_id={chat_id_str} msg_id={msg_id}")
+    in_target = chat_allowed(chat_id_str, TARGET_GROUP_IDS)
+    if not in_target:
+        print(f"[PTB] 验证记录查询: 群 {chat_id_str} 不在监控列表 {TARGET_GROUP_IDS}，该群消息不会被处理")
+    rec = get_verification_record(chat_id_str, msg_id)
+    if not rec:
+        total_records = len(_verification_records)
+        reasons = []
+        if not in_target:
+            reasons.append("群不在监控列表")
+        reasons.append("霜刃唤醒消息(无记录)")
+        reasons.append("非文本/非caption消息(如纯贴纸)")
+        reasons.append("验证码消息(不单独建记录)")
+        print(f"[PTB] 验证记录查询: 未找到 chat_id={chat_id_str} msg_id={msg_id} | 当前记录总数={total_records} | 可能原因: {', '.join(reasons)}")
+        flow_lines = ["📌 流程判断"]
+        if not in_target:
+            flow_lines.append("└─ 群不在监控？ → 是 → 忽略（停在此）")
+        else:
+            flow_lines.extend([
+                "├─ 群不在监控？ → 否 ✓",
+                "├─ 未加入 B 群？ → 否 ✓（有记录则已通过）",
+                "├─ 霜刃唤醒？ → 可能（霜刃不建记录）",
+                "├─ 白名单？ → 可能",
+                "├─ 验证码回复？ → 可能（不单独建记录）",
+                "└─ 其他 → 非文本/纯贴纸等",
+            ])
+        not_found_lines = [
+            "❌ 未找到该消息的验证记录",
+            "",
+            *flow_lines,
+            "",
+            "📌 查询信息",
+            f"• chat_id: {chat_id_str}",
+            f"• msg_id: {msg_id}",
+            f"• 当前记录总数: {total_records}",
+            "",
+            "📌 可能原因（该消息未建记录）",
+        ]
+        if not in_target:
+            not_found_lines.append("• 群不在监控 — 该群未在 GROUP_ID 中，消息不会被处理")
+        not_found_lines.extend([
+            "• 霜刃唤醒 — 含「霜刃」或@霜刃的消息不建记录",
+            "• 非文本消息 — 纯贴纸、纯图(无说明)、语音、视频等不建记录",
+            "• 验证码消息 — 用户发的验证码(对/错)不单独建记录",
+        ])
+        if in_target:
+            not_found_lines.append("")
+            not_found_lines.append("💡 群在监控且链接正确，该消息很可能是：霜刃唤醒 / 纯贴纸或纯图 / 验证码 之一")
+        await update.message.reply_text("\n".join(not_found_lines))
+        return
+    print(f"[PTB] 验证记录查询: 已找到 trigger={rec.get('trigger_reason')} status={rec.get('status')}")
+    trigger = rec.get("trigger_reason", "")
+    rec_status = rec.get("status", "")
+    # 根据 trigger 和 status 重建流程判断
+    flow_parts = []
+    flow_parts.append(("群不在监控？", False, "否 ✓"))
+    if trigger == "not_in_required_group":
+        flow_parts.append(("未加入 B 群？", True, "是 → 触发验证（停在此）"))
+    else:
+        flow_parts.append(("未加入 B 群？", False, "否 ✓"))
+        flow_parts.append(("霜刃唤醒？", False, "否 ✓"))
+        if trigger == "normal" and rec_status == "verified_pass":
+            flow_parts.append(("白名单？", True, "是 → 记录 verified_pass（停在此）"))
+        else:
+            flow_parts.append(("白名单？", False, "否 ✓"))
+            if trigger in ("ad", "emoji", "reply_other_chat", "spam_text", "spam_name", "blacklist"):
+                if rec_status == "passed":
+                    flow_parts.append(("广告/引用/关键词/黑名单？", True, "是 → 触发验证码，用户已通过（停在此）"))
+                elif rec_status == "failed_restricted":
+                    flow_parts.append(("广告/引用/关键词/黑名单？", True, "是 → 触发验证码验证，已限制（停在此）"))
+                else:
+                    flow_parts.append(("广告/引用/关键词/黑名单？", True, "是 → 触发验证码验证（停在此）"))
+            elif rec_status == "whitelist_added":
+                flow_parts.append(("广告/引用/关键词/黑名单？", False, "否 ✓"))
+                flow_parts.append(("直接加白？", True, "是 → whitelist_added（停在此）"))
+            else:
+                flow_parts.append(("广告/引用/关键词/黑名单？", False, "否 ✓"))
+                flow_parts.append(("直接加白？", True, f"是 → {rec_status}（停在此）"))
+    flow_lines = ["📌 流程判断"]
+    for i, (label, is_stop, result) in enumerate(flow_parts):
+        prefix = "└─" if i == len(flow_parts) - 1 else "├─"
+        flow_lines.append(f"{prefix} {label} → {result}")
+    trigger_map = {
+        "spam_text": "消息垃圾关键词", "spam_name": "昵称垃圾关键词",
+        "ad": "广告链接", "emoji": "消息/昵称含表情", "reply_other_chat": "引用非本群消息", "blacklist": "黑名单账号",
+        "not_in_required_group": "未加入指定群组",
+        "normal": "正常消息", "ai_trigger": "霜刃 AI 唤醒",
+    }
+    reason = trigger_map.get(trigger, trigger)
+    status_map = {"pending": "待验证", "passed": "✓ 已通过", "failed_restricted": "✗ 验证失败已限制", "whitelist_added": "✓ 直接加白", "verified_pass": "✓ 白名单正常消息", "ai_replied": "已回复"}
+    status = status_map.get(rec_status, rec_status)
+    uid = rec.get("user_id")
+    try:
+        uid_int = int(uid) if uid is not None else None
+    except (TypeError, ValueError):
+        uid_int = None
+    in_whitelist = uid_int in verified_users if uid_int is not None else False
+    in_blacklist = uid_int in verification_blacklist if uid_int is not None else False
+    uname = rec.get("username", "") or ""
+    wb = "白名单 ✓" if in_whitelist else ("黑名单 ✓" if in_blacklist else "均否")
+    lines = [
+        *flow_lines,
+        "",
+        "📌 用户信息",
+        f"• 昵称: {rec.get('full_name', '')}" + (f" (@{uname})" if uname else " (无用户名)"),
+        f"• user_id: {uid}",
+        f"• 白名单/黑名单: {wb}",
+        f"• 触发原因: {reason}",
+        f"• 状态: {status}",
+    ]
+    reply_markup = None
+    if rec.get("raw_body") is not None:
+        cb_data = f"raw_msg:{chat_id_str}:{msg_id}"
+        if len(cb_data) <= 64:
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("查看原始消息", callback_data=cb_data)]])
+    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup)
+
+
+async def cmd_verified_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    total = len(verified_users)
+    lines = [f"📊 验证通过用户统计\n总用户数: {total}\n"]
+    count = 0
+    for uid in sorted(verified_users, key=lambda u: (verified_users_details.get(u) or {}).get("verify_time") or "", reverse=True):
+        if count >= 20:
+            lines.append(f"\n... 还有 {total - 20} 个用户未显示")
+            break
+        d = verified_users_details.get(uid) or {}
+        lines.append(f"{count+1}. ID:{uid} | @{d.get('username','')} | {d.get('full_name','')}")
+        count += 1
+    await update.message.reply_text("\n".join(lines) if lines else "暂无数据")
+
+
+async def _job_frost_reply(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _xhbot = _BASE.parent
+        if str(_xhbot) not in sys.path:
+            sys.path.insert(0, str(_xhbot))
+        from handoff import take_frost_reply_handoff
+        req = take_frost_reply_handoff()
+        if not req:
+            return
+        chat_id = req["chat_id"]
+        reply_to_id = req["reply_to_message_id"]
+        if chat_id and str(chat_id) not in TARGET_GROUP_IDS:
+            return
+        await context.bot.send_message(
+            chat_id=chat_id, text="......",
+            reply_to_message_id=reply_to_id,
+        )
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[PTB] frost_reply 处理失败: {e}")
+
+
+def _is_sync_success(msg: str) -> bool:
+    """判断抽奖同步是否成功（非跳过/失败/异常）。Windows 下会跳过，返回失败"""
+    return ("同步" in msg and "个中奖用户" in msg) or "无新中奖用户" in msg
+
+
+async def _send_sync_result_to_groups(bot, added: int, msg: str):
+    """抽奖同步完成后向监控群发送结果文案"""
+    success = _is_sync_success(msg)
+    if success:
+        sync_msg = f"任务执行完毕，已歼灭{added} 人" if added > 0 else "任务执行中"
+    else:
+        sync_msg = "任务失败，立即撤退"
+    for gid in TARGET_GROUP_IDS:
+        if gid:
+            try:
+                await bot.send_message(chat_id=int(gid), text=sync_msg)
+            except Exception as e:
+                print(f"[PTB] 抽奖同步结果群发失败 chat_id={gid}: {e}")
+
+
+async def _job_lottery_sync(context: ContextTypes.DEFAULT_TYPE):
+    added, msg = sync_lottery_winners()
+    print(f"[PTB] 抽奖同步: {msg}")
+    await _send_sync_result_to_groups(context.bot, added, msg)
+
+
+async def _post_init_send_hello(application: Application):
+    # 设置 Bot 菜单命令
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "启动"),
+            BotCommand("help", "帮助"),
+            BotCommand("list", "查看关键词"),
+            BotCommand("add_text", "添加消息关键词"),
+            BotCommand("add_name", "添加昵称关键词"),
+            BotCommand("reload", "重载配置"),
+            BotCommand("verified_stats", "用户统计"),
+            BotCommand("cancel", "取消操作"),
+        ])
+    except Exception as e:
+        print(f"[PTB] 设置菜单命令失败: {e}")
+    for gid in TARGET_GROUP_IDS:
+        if gid:
+            try:
+                await application.bot.send_message(chat_id=int(gid), text="你好")
+            except Exception as e:
+                print(f"[PTB] 群发你好失败 chat_id={gid}: {e}")
+    added, msg = sync_lottery_winners()
+    print(f"[PTB] 抽奖同步: {msg}")
+    await _send_sync_result_to_groups(application.bot, added, msg)
+    try:
+        me = await application.bot.get_me()
+        print(f"[PTB] 霜刃 @{me.username} 已就绪，监控群: {list(TARGET_GROUP_IDS)}")
+    except Exception as e:
+        print(f"[PTB] 获取 bot 信息失败: {e}")
+
+
+def _ptb_main():
+    """同步的 PTB main（run_polling 阻塞）"""
+    if not BOT_TOKEN:
+        print("请配置 BOT_TOKEN，编辑 bytecler/.env")
+        return
+    if "你的" in BOT_TOKEN or ("Token" in BOT_TOKEN and ":" not in BOT_TOKEN) or len(BOT_TOKEN) < 40:
+        print("❌ 检测到无效 token，请配置真实 Bot Token")
+        return
+    load_spam_keywords()
+    load_verified_users()
+    load_verification_failures()
+    load_verification_blacklist()
+    load_verification_records()
+
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init_send_hello).build()
+    globals()["_ptb_app"] = app
+
+    async def _error_handler(update, context):
+        err = getattr(context, "error", None)
+        print(f"[PTB] Handler 异常: {err}")
+    app.add_error_handler(_error_handler)
+
+    # 显式指定 CHAT_MEMBER（其他成员状态变更），非 MY_CHAT_MEMBER（Bot 自身状态）
+    app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER))
+    # 分两个 handler 避免 filters.TEXT | filters.CAPTION 在某些 PTB 版本的兼容性问题
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_message_handler))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.CAPTION, group_message_handler))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("verified_stats", cmd_verified_stats))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("kw_text", cmd_kw_text))
+    app.add_handler(CommandHandler("kw_name", cmd_kw_name))
+    app.add_handler(CommandHandler("kw_bio", cmd_kw_bio))
+    app.add_handler(CommandHandler("wl_name", cmd_wl_name))
+    app.add_handler(CommandHandler("wl_text", cmd_wl_text))
+    app.add_handler(CommandHandler("add_text", cmd_add_text))
+    app.add_handler(CommandHandler("add_name", cmd_add_name))
+    app.add_handler(CommandHandler("add_bio", cmd_add_bio))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
+    app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
+    app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
+
+    jq = app.job_queue
+    if jq:
+        jq.run_repeating(_job_frost_reply, interval=2, first=2)
+        jq.run_daily(_job_lottery_sync, time=dt_time(4, 0))
+
+    # 必须显式包含 chat_member，Telegram 默认不推送此类型
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+def stop_bytecler():
+    """停止霜刃 PTB（供 main.py Ctrl+C 时优雅退出）"""
+    app_ref = globals().get("_ptb_app")
+    if app_ref:
+        try:
+            app_ref.stop()
+        except Exception:
+            pass
 
 
 async def main():
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await client.start(bot_token=BOT_TOKEN)
-
-    me = await client.get_me()
-    print(f"已登录: {me.first_name} (ID: {me.id})")
-    if not TARGET_GROUP_IDS:
-        print("警告: 未配置 GROUP_ID")
-    else:
-        print(f"仅作用于群: {TARGET_GROUP_IDS}")
-
-    _load_spam_keywords()
-    _load_verified_users()
-    _load_verification_failures()
-    _load_verification_blacklist()
-
-    # 启动时全量对比抽奖数据库，增量写入白名单，并在群中发通知
-    try:
-        db_path = Path(LOTTERY_DB_PATH)
-        db_exists = db_path.exists() if db_path.is_absolute() else (Path.cwd() / db_path).exists()
-        print(f"[抽奖同步] LOTTERY_DB_PATH={LOTTERY_DB_PATH} exists={db_exists} cwd={Path.cwd()}")
-        if not db_exists:
-            print(f"[抽奖同步] 数据库文件不存在，跳过同步。可设置环境变量 LOTTERY_DB_PATH 指定路径")
-            _sync_startup_msg = "任务失败，立即撤退"
-        else:
-            success, new_count, err = await asyncio.to_thread(_sync_lottery_to_verified, True)
-            if success:
-                _load_verified_users()
-                print(f"[抽奖同步] 启动全量同步完成，新增 {new_count} 人")
-                _sync_startup_msg = "任务执行完毕"
-            else:
-                print(f"[抽奖同步] 启动全量同步失败: {err}")
-                _sync_startup_msg = "任务失败，立即撤退"
-        for gid in TARGET_GROUP_IDS:
-            try:
-                await client.send_message(int(gid), _sync_startup_msg)
-            except Exception as e:
-                print(f"[抽奖同步] 群{gid} 发送失败: {e}")
-    except Exception as e:
-        import traceback
-        print(f"[抽奖同步] 启动全量同步异常: {e}")
-        traceback.print_exc()
-        for gid in TARGET_GROUP_IDS:
-            try:
-                await client.send_message(int(gid), "任务失败，立即撤退")
-            except Exception:
-                pass
-
-    # 设置快捷命令（输入框左侧 / 菜单）
-    await client(SetBotCommandsRequest(
-        scope=BotCommandScopeDefault(),
-        lang_code="zh",
-        commands=[
-            BotCommand(command="list", description="查看关键词"),
-            BotCommand(command="kw_text", description="消息关键词管理"),
-            BotCommand(command="kw_name", description="昵称关键词管理"),
-            BotCommand(command="kw_bio", description="简介关键词管理"),
-            BotCommand(command="start", description="启动"),
-            BotCommand(command="help", description="帮助"),
-            BotCommand(command="cancel", description="取消操作"),
-            BotCommand(command="reload", description="重载配置"),
-            BotCommand(command="verified_stats", description="导出验证用户统计"),
-        ],
-    ))
-
-    def _add_to_blacklist_and_save(user_id: int):
-        """将用户加入黑名单并保存，同时从白名单移除（避免黑白名单同时存在）"""
-        verification_blacklist.add(user_id)
-        _save_verification_blacklist()
-        verified_users.discard(user_id)
-        verified_users_details.pop(user_id, None)
-        _save_verified_users()
-
-    # 监控：管理员限制或封禁用户时，将用户加入黑名单
-    @client.on(events.Raw)
-    async def on_raw_update(update):
-        if isinstance(update, UpdateChannelParticipant) and isinstance(
-            getattr(update, "new_participant", None), ChannelParticipantBanned
-        ):
-            chat_id = str(-1000000000000 - update.channel_id)
-            if _chat_allowed(chat_id):
-                _add_to_blacklist_and_save(update.user_id)
-                if VERBOSE:
-                    print(f"[黑名单] 用户 {update.user_id} 被限制/封禁，已加入黑名单: 群{chat_id}")
-
-    # 有机器人入群时，自动加入白名单（仅入群事件触发，保证所有机器人都在白名单里）
-    @client.on(events.ChatAction)
-    async def on_chat_action(event):
-        if event.user_kicked:
-            chat_peer = getattr(event, "chat_peer", None)
-            if isinstance(chat_peer, PeerChannel):
-                chat_id = str(-1000000000000 - chat_peer.channel_id)
-            else:
-                chat_id = str(getattr(event, "chat_id", None) or "")
-            if chat_id and _chat_allowed(chat_id):
-                for uid in (event.user_ids or []):
-                    _add_to_blacklist_and_save(uid)
-                    if VERBOSE:
-                        print(f"[黑名单] 用户 {uid} 被踢出，已加入黑名单: 群{chat_id}")
-            return
-        if not (event.user_added or event.user_joined):
-            return
-        chat_peer = getattr(event, "chat_peer", None)
-        if isinstance(chat_peer, PeerChannel):
-            chat_id = str(-1000000000000 - chat_peer.channel_id)
-        else:
-            chat_id = str(getattr(event, "chat_id", None) or "")
-        if not chat_id or not _chat_allowed(chat_id):
-            return
-        now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        for uid in (event.user_ids or []):
-            join_times[uid] = now_iso
-            try:
-                user = await event.client.get_entity(uid)
-                if getattr(user, "bot", False):
-                    _add_verified_user(
-                        uid,
-                        username=getattr(user, "username", None),
-                        full_name=_get_full_name(user),
-                    )
-                    if VERBOSE:
-                        print(f"[入群] 机器人 {uid} 已加入 verified_users: 群{chat_id}")
-            except Exception:
-                pass
-        _save_verified_users()
-
-    # 启动时向群发送你好
-    if TARGET_GROUP_IDS:
-        print("你好")
-        for gid in TARGET_GROUP_IDS:
-            try:
-                chat = await client.get_entity(int(gid))
-                name = getattr(chat, "title", None) or getattr(chat, "name", "") or gid
-                print(f"  群: {name} (ID: {gid})")
-                await client.send_message(int(gid), "你好")
-            except Exception as e:
-                print(f"  群{gid} 发送失败: {e}")
-
-    @client.on(events.NewMessage)
-    async def on_message(event):
-        chat = await event.get_chat()
-        if not chat:
-            return
-        chat_id = str(getattr(event, "chat_id", None) or getattr(chat, "id", chat))
-        if not _chat_allowed(chat_id):
-            return
-
-        text = (event.message.text or event.message.message or "").strip()
-
-        # 过期验证清理
-        for cid, uid in _clean_expired_verifications():
-            count = _increment_verification_failures(cid, uid)
-            _save_verification_failures()
-            if count >= VERIFY_FAIL_THRESHOLD:
-                await _restrict_user_and_notify(event.client, cid, uid)
-        if event.sender and (chat_id, event.sender.id) in pending_by_user:
-            pb = pending_by_user[(chat_id, event.sender.id)]
-            if time.time() - pb["time"] <= VERIFY_TIMEOUT:
-                ok = text == pb["code"] or text == f"验证码{pb['code']}"
-                await _handle_verification_result(event.client, event, chat_id, event.sender.id, pb["code"], ok)
-                return
-
-        if not event.sender:
-            return
-        uid = event.sender.id
-
-        # 1. 白名单成员（按用户，多群通用）：检查 AI 触发，否则直接通过
-        if uid in verified_users:
-            # AI 唤醒：霜刃，/验证官，/@机器人/回复机器人
-            if text:
-                reply_msg = await event.get_reply_message() if event.message.reply_to else None
-                triggered, query, replied_bot_text = _check_ai_trigger(
-                    text, reply_msg, me.id, getattr(me, "username", None)
-                )
-                if triggered and KIMI_API_KEY:
-                    try:
-                        reply_text = await _call_kimi_single_turn(query, replied_bot_text)
-                        await event.reply(reply_text)
-                        # 霜刃说「小助理，你来回答」时，小助理收不到（Telegram 不转发 bot→bot）
-                        # 写入 handoff，由小助理轮询代为回复
-                        rt = (reply_text or "").strip().rstrip("。.！？!? ")
-                        if "小助理" in rt and "你来回答" in rt:
-                            try:
-                                from handoff import put_handoff
-                                if reply_msg and getattr(reply_msg, "sender_id", None) != me.id:
-                                    q_text = (reply_msg.text or reply_msg.message or "").strip()
-                                    if q_text:
-                                        reply_to_id = reply_msg.id
-                                        put_handoff(int(chat_id), reply_to_id, q_text)
-                                    else:
-                                        put_handoff(int(chat_id), event.message.id, query)
-                                else:
-                                    put_handoff(int(chat_id), event.message.id, query)
-                            except Exception as he:
-                                print(f"[handoff] 写入失败: {he}")
-                        if VERBOSE:
-                            print(f"[AI] 群{chat_id} | {_get_sender_display(event.sender)} | 已回复")
-                    except Exception as e:
-                        print(f"[AI 失败] {e}")
-                        try:
-                            await event.reply(f"AI 调用失败：{e}")
-                        except Exception:
-                            pass
-                    return
-            msg_type = get_message_type(event.message)
-            if VERBOSE:
-                print(f"[消息] 群{chat_id} | {_get_sender_display(event.sender)} | {msg_type} | {text[:40]}...")
-            else:
-                print(f"[消息] 群{chat_id} | {_get_sender_display(event.sender)} | {msg_type}")
-            return
-
-        # 2. 非白名单：等待 2s，若消息在 2s 内已被删除则结束流程，否则进入广告判定
-        await asyncio.sleep(2)
-        try:
-            still = await event.client.get_messages(event.chat_id, ids=event.message.id)
-            if not still:
-                return  # 消息已不存在（如已被删除），流程结束
-            msg = still[0] if isinstance(still, list) else still
-            if msg is None or getattr(msg, "deleted", False):
-                return  # 消息已被删除，流程结束
-        except Exception:
-            return  # 无法获取消息（如已删除），流程结束
-
-        # 3. 广告判定（网页且文本≤10）→ 进入人机验证
-        msg_type = get_message_type(event.message)
-        if msg_type == "webpage" and len(text) <= 10:
-            await _start_verification(
-                event.client, event, chat_id,
-                "⚠️ 检测到您的消息中含有疑似广告，请先完成人机验证。",
-                "广告",
-            )
-            return
-
-        # 3.5 引用非本群消息判定 → 进入人机验证
-        reply_to = getattr(event.message, "reply_to", None)
-        if reply_to:
-            reply_peer = getattr(reply_to, "reply_to_peer_id", None)
-            if reply_peer is not None:
-                try:
-                    if isinstance(reply_peer, PeerChannel):
-                        reply_chat_id = str(-1000000000000 - reply_peer.channel_id)
-                    elif isinstance(reply_peer, PeerChat):
-                        reply_chat_id = str(-reply_peer.chat_id)
-                    else:
-                        reply_chat_id = None  # PeerUser 等其它类型暂不处理
-                    if reply_chat_id and reply_chat_id != str(chat_id):
-                        await _start_verification(
-                            event.client, event, chat_id,
-                            "⚠️ 检测到您引用了非本群消息，疑似广告，请先完成人机验证。",
-                            "引用",
-                        )
-                        return
-                except Exception:
-                    pass
-
-        # 4. 发言 text 关键词判定 → 进入人机验证
-        text_matched_kw = _check_spam(text, "", "", None)
-        if text_matched_kw:
-            await _start_verification(
-                event.client, event, chat_id,
-                "⚠️ 检测到您的消息中含有疑似广告词，请先完成人机验证。",
-                "文本",
-            )
-            return
-
-        # 5. 人机验证：先仅检查昵称关键词（不调 bio）
-        first_name = getattr(event.sender, "first_name", None) or ""
-        last_name = getattr(event.sender, "last_name", None) or ""
-        name_matched_kw = _check_spam_name_bio(first_name, last_name, None)
-        if name_matched_kw:
-            await _start_verification(
-                event.client, event, chat_id,
-                "⚠️ 检测到您昵称中含有疑似广告词，请先完成人机验证。",
-                "昵称",
-            )
-            return
-
-        # 6. 调取 bio 前：若在黑名单中（按用户），不调用 bio，直接进入验证码流程
-        if uid in verification_blacklist:
-            await _start_verification(
-                event.client, event, chat_id,
-                "⚠️ 检测到您的账号疑似广告账号，请先完成人机验证。",
-                "黑名单",
-            )
-            return
-
-        # 7. 未在黑名单：调取 bio，进行简介关键词 / 简介链接验证
-        sender_bio = await _get_sender_bio_cached(event.client, event.sender.id)
-        bio_matched_kw = _check_spam_name_bio("", "", sender_bio)
-        bio_has_link = _bio_needs_verification(sender_bio)
-        if bio_matched_kw:
-            await _start_verification(
-                event.client, event, chat_id,
-                "⚠️ 检测到您简介中含有疑似广告词，请先完成人机验证。",
-                "简介",
-            )
-            return
-        if bio_has_link:
-            await _start_verification(
-                event.client, event, chat_id,
-                "⚠️ 简介中有链接，疑似广告，请先完成人机验证。",
-                "简介",
-            )
-            return
-
-        # 8. 简介也无问题：加入白名单，后续发言不再重复检验
-        username = getattr(event.sender, "username", None)
-        full_name = _get_full_name(event.sender)
-        _add_verified_user(uid, username=username, full_name=full_name)
-        _save_verified_users()
-
-        msg_type = get_message_type(event.message)
-        if VERBOSE:
-            print(f"[消息] 群{chat_id} | {_get_sender_display(event.sender)} | {msg_type} | {text[:40]}...")
-        else:
-            print(f"[消息] 群{chat_id} | {_get_sender_display(event.sender)} | {msg_type}")
-
-    @client.on(events.NewMessage(pattern=r"^/start"))
-    async def cmd_start(event):
-        if not event.is_private:
-            return
-        if event.sender and event.sender.id in pending_keyword_cmd:
-            pending_keyword_cmd.pop(event.sender.id, None)
-            await event.reply("已退出关键词管理。\n\nBytecler 群消息监控机器人\n发送 /help 查看完整指令")
-        else:
-            await event.reply("Bytecler 群消息监控机器人\n发送 /help 查看完整指令")
-
-    _MSG_LINK_RE = re.compile(
-        r"https?://t\.me/c/(\d+)/(\d+)|https?://t\.me/([a-zA-Z0-9_]+)/(\d+)"
-    )
-
-    async def _simulate_verification(client, msg, chat_id: str) -> str:
-        """根据消息模拟霜刃的验证流程，返回验证过程描述"""
-        lines = []
-        sender = getattr(msg, "sender", None)
-        if not sender:
-            return "无法获取发送者"
-        uid = getattr(sender, "id", None)
-        if uid is None:
-            return "无法获取用户 ID"
-        text = (msg.text or msg.message or "").strip()
-        first_name = getattr(sender, "first_name", None) or ""
-        last_name = getattr(sender, "last_name", None) or ""
-        full_name = (first_name + " " + last_name).strip() or "用户"
-        username = getattr(sender, "username", None)
-
-        lines.append(f"【消息链接验证】")
-        lines.append(f"用户: {full_name} (@{username or '无'}) ID:{uid}")
-        lines.append(f"群: {chat_id}")
-        lines.append(f"消息: {text[:80]}{'...' if len(text) > 80 else ''}")
-        lines.append("")
-
-        if not _chat_allowed(chat_id):
-            lines.append("→ 该群不在监控范围内，跳过")
-            return "\n".join(lines)
-
-        if uid in verified_users:
-            lines.append("→ 白名单用户，直接通过")
-            return "\n".join(lines)
-
-        lines.append("→ 非白名单，进入验证流程：")
-        msg_type = get_message_type(msg)
-        lines.append(f"  1. 消息类型: {msg_type}")
-
-        if msg_type == "webpage" and len(text) <= 10:
-            lines.append("  2. 判定: 网页+短文本 → 人机验证（广告）")
-            return "\n".join(lines)
-
-        reply_to = getattr(msg, "reply_to", None)
-        if reply_to:
-            reply_peer = getattr(reply_to, "reply_to_peer_id", None)
-            if reply_peer is not None:
-                try:
-                    if isinstance(reply_peer, PeerChannel):
-                        reply_chat_id = str(-1000000000000 - reply_peer.channel_id)
-                    elif isinstance(reply_peer, PeerChat):
-                        reply_chat_id = str(-reply_peer.chat_id)
-                    else:
-                        reply_chat_id = None
-                    if reply_chat_id and reply_chat_id != str(chat_id):
-                        lines.append("  2. 判定: 引用非本群消息 → 人机验证（引用）")
-                        return "\n".join(lines)
-                except Exception:
-                    pass
-
-        text_matched = _check_spam(text, "", "", None)
-        if text_matched:
-            lines.append(f"  2. 判定: 文本关键词命中「{text_matched}」→ 人机验证（文本）")
-            return "\n".join(lines)
-
-        name_matched = _check_spam_name_bio(first_name, last_name, None)
-        if name_matched:
-            lines.append(f"  2. 判定: 昵称关键词命中「{name_matched}」→ 人机验证（昵称）")
-            return "\n".join(lines)
-
-        if uid in verification_blacklist:
-            lines.append("  2. 判定: 黑名单用户 → 人机验证（黑名单）")
-            return "\n".join(lines)
-
-        bio = await _get_sender_bio_cached(client, uid)
-        bio_matched = _check_spam_name_bio("", "", bio)
-        if bio_matched:
-            lines.append(f"  2. 判定: 简介关键词命中「{bio_matched}」→ 人机验证（简介）")
-            return "\n".join(lines)
-        if _bio_needs_verification(bio):
-            lines.append("  2. 判定: 简介含链接 → 人机验证（简介）")
-            return "\n".join(lines)
-
-        lines.append("  2. 全部通过 → 加入白名单")
-        return "\n".join(lines)
-
-    @client.on(events.NewMessage)
-    async def on_private_msg_link(event):
-        """私聊中输入群消息链接（如 https://t.me/xxx/123 或 t.me/c/ channelid/123），返回霜刃的验证过程"""
-        if not event.is_private or not event.sender:
-            return
-        text = (event.message.text or event.message.message or "").strip()
-        if not text:
-            return
-        m = _MSG_LINK_RE.search(text)
-        if not m:
-            return
-        try:
-            if m.group(1) is not None:
-                channel_id = int(m.group(1))
-                msg_id = int(m.group(2))
-                entity = -1000000000000 - channel_id
-            else:
-                entity = m.group(3)
-                msg_id = int(m.group(4))
-            msg = await event.client.get_messages(entity, ids=msg_id)
-            if not msg:
-                await event.reply("无法获取该消息（可能已删除或无权访问）")
-                return
-            msg = msg[0] if isinstance(msg, list) else msg
-            chat_id = str(getattr(msg, "chat_id", None) or entity)
-            out = await _simulate_verification(event.client, msg, chat_id)
-            cb_data = f"vjson:{getattr(msg, 'chat_id', entity)}:{msg.id}"[:64]
-            await event.reply(out, buttons=[[Button.inline("查看原始 JSON", cb_data.encode())]])
-        except Exception as e:
-            await event.reply(f"解析失败: {e}")
-
-    @client.on(events.CallbackQuery)
-    async def on_verify_json_callback(event):
-        """点击「查看原始 JSON」按钮，返回消息的 JSON"""
-        data = event.data
-        if not isinstance(data, bytes) or not data.startswith(b"vjson:"):
-            return
-        try:
-            parts = data.decode().split(":", 2)
-            if len(parts) != 3:
-                return
-            _, chat_id_str, msg_id_str = parts
-            entity = int(chat_id_str)
-            msg_id = int(msg_id_str)
-            msg = await event.client.get_messages(entity, ids=msg_id)
-            if not msg:
-                await event.answer("无法获取该消息", alert=True)
-                return
-            msg = msg[0] if isinstance(msg, list) else msg
-            msg_dict = msg.to_dict()
-            for key in ("message", "text"):
-                if key in msg_dict and isinstance(msg_dict[key], str) and len(msg_dict[key]) > 100:
-                    msg_dict[key] = msg_dict[key][:100] + "..."
-            def _drop_none(obj):
-                if obj is None or isinstance(obj, bytes):
-                    return None
-                if isinstance(obj, dict):
-                    return {k: v for k, v in ((k, _drop_none(v)) for k, v in obj.items()) if v is not None}
-                if isinstance(obj, list):
-                    return [x for x in (_drop_none(item) for item in obj) if x is not None]
-                return obj
-            def _json_default(o):
-                if isinstance(o, datetime):
-                    return o.isoformat()
-                if isinstance(o, bytes):
-                    return f"<bytes len={len(o)}>"
-                raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
-            msg_dict = _drop_none(msg_dict)
-            out = json.dumps(msg_dict, ensure_ascii=False, indent=2, default=_json_default)
-            if len(out) > 4000:
-                out = out[:4000] + "\n\n... (已截断)"
-            await event.answer()
-            peer = getattr(event, "chat_id", None) or getattr(event, "sender_id", None)
-            if peer is not None:
-                await event.client.send_message(peer, out)
-        except Exception as e:
-            await event.answer(f"解析失败: {e}", alert=True)
-
-    @client.on(events.NewMessage(pattern=r"^/help"))
-    async def cmd_help(event):
-        if not event.is_private:
-            return
-        admin_hint = "（需配置 ADMIN_IDS 环境变量限制权限）" if ADMIN_IDS else ""
-        msg = f"""Bytecler 指令（仅私聊有效）{admin_hint}
-
-• /list — 查看垃圾关键词
-• /kw_text, /kw_name, /kw_bio — 关键词管理（发送则切换添加/删除，/cancel 或 /start 退出）
-• /cancel — 取消当前操作
-• /reload — 从文件重载关键词
-• /verified_stats — 导出用户统计
-• 发送群消息链接 — 返回该消息的验证过程（如 https://t.me/xxx/123）
-
-关键词格式：子串匹配直接输入；精确匹配用 / 前缀，如 / 加微信
-"""
-        await event.reply(msg)
-
-    @client.on(events.NewMessage(pattern=r"^/list"))
-    async def cmd_list(event):
-        if not event.is_private or not event.sender:
-            return
-        if not _is_admin(event.sender.id):
-            await event.reply("无权限")
-            return
-        lines = []
-        for field, label in [("text", "消息"), ("name", "昵称"), ("bio", "简介")]:
-            kw = spam_keywords.get(field) or {}
-            ex = kw.get("exact") or []
-            mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
-            lines.append(f"【{label}】exact: {ex or '无'} | match: {mt or '无'}")
-        lines.append("")
-        lines.append("管理: /kw_text /kw_name /kw_bio 进入模式后输入关键词切换")
-        await event.reply("\n".join(lines))
-
-    @client.on(events.NewMessage(pattern=r"^/reload"))
-    async def cmd_reload(event):
-        if not event.is_private or not event.sender:
-            return
-        if not _is_admin(event.sender.id):
-            await event.reply("无权限")
-            return
-        pending_keyword_cmd.pop(event.sender.id, None)
-        _load_spam_keywords()
-        await event.reply("已重载 spam_keywords.json")
-
-    @client.on(events.NewMessage(pattern=r"^/verified_stats"))
-    async def cmd_verified_stats(event):
-        """显示验证通过用户统计：user_id, username, full_name, 入群时间, 验证通过时间"""
-        if not event.is_private or not event.sender:
-            if event.is_private is False and event.sender:
-                await event.reply("该命令仅在私聊中有效。")
-            return
-        if not _is_admin(event.sender.id):
-            await event.reply("无权限")
-            return
-        try:
-            total = len(verified_users)
-            has_join_time = sum(1 for uid in verified_users if (verified_users_details.get(uid) or {}).get("join_time"))
-
-            lines = [f"📊 验证通过用户统计（按用户，多群通用）\n"]
-            lines.append(f"总用户数: {total}")
-            lines.append(f"有入群时间记录: {has_join_time}")
-            lines.append(f"\n用户列表（按验证时间倒序，显示前20个）:")
-            count = 0
-            def _sort_key(uid):
-                d = verified_users_details.get(uid) or {}
-                return d.get("verify_time") or "0000-00-00"
-            for uid in sorted(verified_users, key=_sort_key, reverse=True):
-                if count >= 20:
-                    lines.append(f"\n... 还有 {total - 20} 个用户未显示")
-                    break
-                d = verified_users_details.get(uid) or {}
-                user_id = d.get("user_id") or uid
-                username = d.get("username") or "无"
-                full_name = d.get("full_name") or "用户"
-                join_time = d.get("join_time") or "未知"
-                verify_time = d.get("verify_time") or "未知"
-
-                if join_time and join_time != "未知":
-                    try:
-                        dt = datetime.fromisoformat(join_time.replace("Z", "+00:00"))
-                        join_time = dt.strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        pass
-                if verify_time and verify_time != "未知":
-                    try:
-                        dt = datetime.fromisoformat(verify_time.replace("Z", "+00:00"))
-                        verify_time = dt.strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        pass
-
-                lines.append(f"{count + 1}. ID:{user_id} | @{username} | {full_name}")
-                lines.append(f"   入群: {join_time} | 验证: {verify_time}")
-                count += 1
-
-            msg = "\n".join(lines)
-            if len(msg) > 4000:
-                msg = msg[:4000] + "\n\n... (消息过长，已截断)"
-
-            await event.reply(msg)
-        except Exception as e:
-            await event.reply(f"统计失败: {e}")
-
-    @client.on(events.NewMessage(pattern=r"^/cancel"))
-    async def cmd_cancel(event):
-        if not event.is_private or not event.sender:
-            return
-        if event.sender.id in pending_keyword_cmd:
-            pending_keyword_cmd.pop(event.sender.id, None)
-            await event.reply("已取消")
-        else:
-            await event.reply("当前无待完成的操作")
-
-    def _do_toggle(field: str, kw_type: str, keyword: str) -> str:
-        """存在则删，不存在则添"""
-        kw_cfg = spam_keywords[field]
-        if kw_type == "exact":
-            if keyword in kw_cfg["exact"]:
-                kw_cfg["exact"].remove(keyword)
-                _save_spam_keywords()
-                return f"❌ 已删除 exact: {keyword}"
-            kw_cfg["exact"].append(keyword)
-            _save_spam_keywords()
-            return f"✅ 已添加 exact: {keyword}"
-        # match
-        existing = [(x[0], x[1] if x[0] == "str" else f"/{x[1].pattern}/") for x in kw_cfg["match"]]
-        key_str = keyword if (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2) else keyword.lower()
-        for i, item in enumerate(kw_cfg["match"]):
-            cmp = item[1] if item[0] == "str" else f"/{item[1].pattern}/"
-            if cmp == key_str:
-                kw_cfg["match"].pop(i)
-                _save_spam_keywords()
-                return f"❌ 已删除 match: {keyword}"
-        if keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2:
-            kw_cfg["match"].append(("regex", re.compile(keyword[1:-1], re.I)))
-        else:
-            kw_cfg["match"].append(("str", keyword.lower()))
-        _save_spam_keywords()
-        return f"✅ 已添加 match: {keyword}"
-
-    async def _handle_kw_mode(event, field: str):
-        """进入关键词管理模式"""
-        if not event.is_private or not event.sender:
-            return
-        if not _is_admin(event.sender.id):
-            await event.reply("无权限")
-            return
-        label = {"text": "消息", "name": "昵称", "bio": "简介"}[field]
-        pending_keyword_cmd[event.sender.id] = {"field": field, "time": time.time()}
-        await event.reply(
-            f"【{label}关键词】管理模式\n"
-            "发送关键词：已存在则删除，不存在则添加。\n"
-            "子串匹配直接输入，精确匹配用 / 前缀，如：/ 加微信\n"
-            "输入 /cancel 或 /start 退出"
-        )
-
-    @client.on(events.NewMessage)
-    async def on_pending_keyword_input(event):
-        """关键词管理模式：收到用户输入则切换添加/删除，保持模式直到 /cancel 或 /start"""
-        if not event.is_private or not event.sender:
-            return
-        if not _is_admin(event.sender.id):
-            return
-        text = (event.message.text or "").strip()
-        if text.startswith("/") and (len(text) < 2 or text[1] != " "):
-            return
-        user_id = event.sender.id
-        if user_id not in pending_keyword_cmd:
-            return
-        now = time.time()
-        if now - pending_keyword_cmd[user_id]["time"] > PENDING_KEYWORD_TIMEOUT:
-            pending_keyword_cmd.pop(user_id, None)
-            await event.reply("操作已超时，请重新发送命令")
-            return
-        field = pending_keyword_cmd[user_id]["field"]
-        pending_keyword_cmd[user_id]["time"] = now
-        if text.startswith("/ ") and len(text) > 2:
-            kw_type, keyword = "exact", text[2:].strip()
-        else:
-            kw_type, keyword = "match", text
-        if not keyword:
-            await event.reply("关键词不能为空")
-            return
-        msg = _do_toggle(field, kw_type, keyword)
-        await event.reply(msg)
-
-    for f in ["text", "name", "bio"]:
-        @client.on(events.NewMessage(pattern=rf"^/kw_{re.escape(f)}"))
-        async def _kw_handler(event, field=f):
-            await _handle_kw_mode(event, field)
-
-    async def periodic_heartbeat():
-        n = 0
-        while True:
-            await asyncio.sleep(300)
-            n += 1
-            print(f"[ heartbeat ] 运行中 (第{n}次)")
-
-    async def frost_reply_poller():
-        """小助理回复含「霜刃」时收不到，轮询 handoff 代为发送「......」"""
-        while True:
-            await asyncio.sleep(2)
-            try:
-                from handoff import take_frost_reply_handoff
-                while True:
-                    req = take_frost_reply_handoff()
-                    if not req:
-                        break
-                    try:
-                        await client(SetTypingRequest(peer=req["chat_id"], action=SendMessageTypingAction()))
-                    except Exception:
-                        pass
-                    await asyncio.sleep(10)
-                    try:
-                        await client(SetTypingRequest(peer=req["chat_id"], action=SendMessageTypingAction()))
-                    except Exception:
-                        pass
-                    await asyncio.sleep(5)
-                    try:
-                        await client.send_message(
-                            req["chat_id"],
-                            "......",
-                            reply_to=req["reply_to_message_id"],
-                        )
-                    except Exception as send_err:
-                        await client.send_message(req["chat_id"], "......")
-                    print(f"[霜刃代为回复] 群{req['chat_id']} reply_to={req['reply_to_message_id']}")
-            except Exception as e:
-                print(f"[frost_reply_poller] {e}")
-
-    _sync_last_run_date = [None]  # [date_str] 避免同一天多次执行
-
-    async def sync_lottery_scheduler():
-        """每日凌晨 SYNC_LOTTERY_HOUR 点执行抽奖白名单同步，并在群中发通知"""
-        while True:
-            await asyncio.sleep(60)
-            now = datetime.now()
-            if now.hour != SYNC_LOTTERY_HOUR:
-                continue
-            today = now.strftime("%Y-%m-%d")
-            if _sync_last_run_date[0] == today:
-                continue
-            _sync_last_run_date[0] = today
-            try:
-                success, new_count, err = await asyncio.to_thread(_sync_lottery_to_verified)
-                if success:
-                    _load_verified_users()
-                    msg = "任务执行完毕"
-                else:
-                    msg = "任务失败，立即撤退"
-                print(f"[抽奖同步] success={success} new={new_count} err={err}")
-                for gid in TARGET_GROUP_IDS:
-                    try:
-                        await client.send_message(int(gid), msg)
-                    except Exception as e:
-                        print(f"[抽奖同步] 群{gid} 发送失败: {e}")
-            except Exception as e:
-                print(f"[抽奖同步] 异常: {e}")
-                for gid in TARGET_GROUP_IDS:
-                    try:
-                        await client.send_message(int(gid), "任务失败，立即撤退")
-                    except Exception:
-                        pass
-
-    asyncio.create_task(periodic_heartbeat())
-    asyncio.create_task(frost_reply_poller())
-    asyncio.create_task(sync_lottery_scheduler())
-    print("机器人已启动，等待消息...")
-    print("提示: 若收不到消息，请在 @BotFather 对机器人执行 /setprivacy 选择 Disable 关闭隐私模式")
-    await client.run_until_disconnected()
+    """main.py 需 asyncio.run(main())"""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _ptb_main)
 
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        print("请配置 BOT_TOKEN")
-        exit(1)
-    asyncio.run(main())
+    import signal
+    _orig_signal = signal.signal
+    def _our_signal(signum, handler):
+        if signum == signal.SIGINT:
+            return _orig_signal(signum, lambda s, f: os._exit(0))
+        return _orig_signal(signum, handler)
+    signal.signal = _our_signal
+    signal.signal(signal.SIGINT, lambda s, f: None)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        os._exit(0)
