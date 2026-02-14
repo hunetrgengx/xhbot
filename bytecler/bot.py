@@ -607,12 +607,29 @@ def sync_lottery_winners() -> tuple[int, str]:
     if not db_path or not Path(db_path).exists():
         return 0, "lottery.db 不存在"
     added = 0
+    collected: set[int] = set()
+    found_compatible = False
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cur = conn.cursor()
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [r[0] for r in cur.fetchall()]
-        user_col = None
+
+        def add_from_table(tbl: str, col: str):
+            nonlocal found_compatible
+            found_compatible = True
+            cur.execute(f"SELECT DISTINCT {col} FROM {tbl}")
+            for row in cur.fetchall():
+                if row[0] is not None:
+                    try:
+                        uid = int(row[0])
+                        if uid not in verified_users and uid not in verification_blacklist and uid not in collected:
+                            add_verified_user(uid, None, "抽奖中奖")
+                            collected.add(uid)
+                    except (TypeError, ValueError):
+                        pass
+
+        # 1. 兼容表：winners, lottery_winners, lottery_entries, participants
         for t in ("winners", "lottery_winners", "lottery_entries", "participants"):
             if t not in tables:
                 continue
@@ -620,23 +637,47 @@ def sync_lottery_winners() -> tuple[int, str]:
             cols = [r[1].lower() for r in cur.fetchall()]
             for c in ("user_id", "telegram_id", "uid", "user"):
                 if c in cols:
-                    user_col = c
+                    add_from_table(t, c)
                     break
-            if user_col:
-                cur.execute(f"SELECT DISTINCT {user_col} FROM {t}")
+
+        # 2. user_participations 表（参与抽奖用户）
+        if "user_participations" in tables:
+            cur.execute("PRAGMA table_info(user_participations)")
+            cols = [r[1].lower() for r in cur.fetchall()]
+            if "user_id" in cols:
+                add_from_table("user_participations", "user_id")
+
+        # 3. lotteries.winners 列（JSON 数组，如 [8317097354, 7696931296, ...]）
+        if "lotteries" in tables:
+            cur.execute("PRAGMA table_info(lotteries)")
+            cols = [r[1].lower() for r in cur.fetchall()]
+            if "winners" in cols:
+                found_compatible = True
+                cur.execute("SELECT winners FROM lotteries WHERE winners IS NOT NULL AND winners != ''")
                 for row in cur.fetchall():
-                    uid = row[0]
-                    if uid is not None:
-                        try:
-                            uid = int(uid)
-                            if uid not in verified_users and uid not in verification_blacklist:
-                                add_verified_user(uid, None, "抽奖中奖")
-                                added += 1
-                        except (TypeError, ValueError):
-                            pass
-                break
+                    try:
+                        uids = json.loads(row[0])
+                        for uid in (uids or []):
+                            try:
+                                uid = int(uid)
+                                if uid not in verified_users and uid not in verification_blacklist and uid not in collected:
+                                    add_verified_user(uid, None, "抽奖中奖")
+                                    collected.add(uid)
+                            except (TypeError, ValueError):
+                                pass
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+        # 4. group_publish_whitelist 表
+        if "group_publish_whitelist" in tables:
+            cur.execute("PRAGMA table_info(group_publish_whitelist)")
+            cols = [r[1].lower() for r in cur.fetchall()]
+            if "user_id" in cols:
+                add_from_table("group_publish_whitelist", "user_id")
+
         conn.close()
-        if user_col is None:
+        added = len(collected)
+        if not found_compatible:
             return 0, "未找到兼容的抽奖表结构"
         if added > 0:
             save_verified_users()
