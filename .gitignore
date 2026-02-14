@@ -33,3 +33,5 @@ bytecler/spam_keywords.json
 bytecler/verified_users.*.json
 /tongbu.py
 /update.py
+/忽略/tongbu.py
+/忽略/update.py
