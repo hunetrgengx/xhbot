@@ -1371,7 +1371,9 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("无权限")
         return
     load_spam_keywords()
-    await update.message.reply_text("已重载 spam_keywords.json")
+    load_verified_users()
+    load_verification_blacklist()
+    await update.message.reply_text("已重载 spam_keywords、白名单、黑名单")
 
 pending_keyword_cmd = {}
 
@@ -1819,17 +1821,29 @@ async def _job_frost_reply(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _is_sync_success(msg: str) -> bool:
-    """判断抽奖同步是否成功（非跳过/失败/异常）。Windows 下会跳过，返回失败"""
+    """判断抽奖同步是否成功"""
     return ("同步" in msg and "个中奖用户" in msg) or "无新中奖用户" in msg
+
+
+def _get_sync_fail_msg(msg: str) -> str:
+    """根据失败原因返回对应文案，便于查找具体原因"""
+    if "lottery.db 不存在" in msg:
+        return "目标已丢失，任务失败，立即撤退"
+    if "未找到兼容的抽奖表结构" in msg:
+        return "目标已变，任务更改"
+    if "lottery.db 只读打开失败" in msg or "只读打开失败" in msg:
+        return "目标无法接近，任务暂停"
+    if "Windows 下已跳过" in msg or "仅适用于 Linux" in msg:
+        return "任务窗口期已过，立即撤退"
+    return "任务失败，立即撤退"
 
 
 async def _send_sync_result_to_groups(bot, added: int, msg: str):
     """抽奖同步完成后向监控群发送结果文案"""
-    success = _is_sync_success(msg)
-    if success:
+    if _is_sync_success(msg):
         sync_msg = f"任务执行完毕，已歼灭{added} 人" if added > 0 else "任务执行中"
     else:
-        sync_msg = "任务失败，立即撤退"
+        sync_msg = _get_sync_fail_msg(msg)
     for gid in TARGET_GROUP_IDS:
         if gid:
             try:
