@@ -1939,10 +1939,9 @@ def stop_bytecler():
             pass
 
 
-async def main():
-    """main.py 需 asyncio.run(main())"""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _ptb_main)
+def main():
+    """直接在主线程运行，PTB run_polling 的 add_signal_handler 必须在主线程"""
+    _ptb_main()
 
 
 if __name__ == "__main__":
@@ -1955,6 +1954,6 @@ if __name__ == "__main__":
     signal.signal = _our_signal
     signal.signal(signal.SIGINT, lambda s, f: None)
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         os._exit(0)
