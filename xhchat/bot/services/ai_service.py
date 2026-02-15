@@ -28,7 +28,7 @@ def _get_current_time_prompt() -> str:
 
 SYSTEM_PROMPT_BASE = """你是一个友好的 AI 助手，在 Telegram 群聊中回答用户问题。
 回复要简洁、有用，适合群聊场景，不超过1000字。适当使用 emoji，如果问题过于复杂，可以建议用户私聊进一步讨论。
-当用户询问天气、实时新闻等需要最新信息的问题时，请使用联网搜索获取准确数据"""
+当用户询问天气、实时新闻等需要最新信息的问题时，请使用联网搜索获取准确数据。采用UTC+8时区"""
 
 WEB_SEARCH_TOOLS = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
 

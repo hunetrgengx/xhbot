@@ -2068,7 +2068,7 @@ def _ptb_main():
     jq = app.job_queue
     if jq:
         jq.run_repeating(_job_frost_reply, interval=2, first=2)
-        jq.run_daily(_job_lottery_sync, time=dt_time(4, 0))
+        jq.run_daily(_job_lottery_sync, time=dt_time(20, 0))  # 20:00 UTC = 北京时间凌晨 4 点
 
     # 必须显式包含 chat_member，Telegram 默认不推送此类型
     app.run_polling(allowed_updates=Update.ALL_TYPES)
