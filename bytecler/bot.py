@@ -1463,7 +1463,7 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "选择要配置的自动删除时间：\n\n"
         f"• 1、关联群验证 — 「请先关注频道或加入群组」警告消息，当前 {req_sec} 秒后删除\n"
-        f"• 2、人机验证 — 验证码/验证失败提示消息，当前 {verify_sec} 秒后删除"
+        f"• 2、人机验证 — 5 次命中后展示的提示文案，当前 {verify_sec} 秒后删除"
     )
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1703,7 +1703,7 @@ async def callback_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = _get_required_group_msg_delete_after()
         key = "required_group_msg_delete_after"
     elif typ == "verify":
-        label = "人机验证"
+        label = "人机验证（5 次命中后提示文案）"
         current = _get_verify_msg_delete_after()
         key = "verify_msg_delete_after"
     else:
