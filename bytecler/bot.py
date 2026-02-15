@@ -47,6 +47,7 @@ VERIFICATION_FAILURES_PATH = _path("verification_failures.json")
 VERIFICATION_BLACKLIST_PATH = _path("verification_blacklist.json")
 VERIFICATION_RECORDS_PATH = _path("verification_records.json")
 SYNC_LOTTERY_CHECKPOINT_PATH = _path("sync_lottery_checkpoint.json")
+SETTIME_CONFIG_PATH = _path("settime_config.json")
 LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 
 spam_keywords = {"text": {"exact": [], "match": [], "_ac": None, "_regex": []},
@@ -699,7 +700,41 @@ RESTRICTED_USERS_LOG_PATH = _BASE / "restricted_users.jsonl"
 DELETED_CONTENT_LOG_PATH = _BASE / "bio_calls.jsonl"  # 被删除文案记录：time, user_id, full_name, deleted_content
 VERIFY_TIMEOUT = 90
 VERIFY_MSG_DELETE_AFTER = 30
-REQUIRED_GROUP_MSG_DELETE_AFTER = 90  # 入群验证消息 90 秒后自动删除
+REQUIRED_GROUP_MSG_DELETE_AFTER = 90  # 入群验证消息 90 秒后自动删除；可通过 /settime 配置
+
+_settime_config: dict = {}  # {"required_group_msg_delete_after": 90, "verify_msg_delete_after": 30}
+
+
+def _load_settime_config():
+    global _settime_config
+    try:
+        if SETTIME_CONFIG_PATH.exists():
+            with open(SETTIME_CONFIG_PATH, "r", encoding="utf-8") as f:
+                _settime_config = json.load(f)
+        else:
+            _settime_config = {}
+    except Exception as e:
+        print(f"[PTB] 加载 settime 配置失败: {e}")
+        _settime_config = {}
+
+
+def _get_required_group_msg_delete_after() -> int:
+    return int(_settime_config.get("required_group_msg_delete_after", REQUIRED_GROUP_MSG_DELETE_AFTER))
+
+
+def _get_verify_msg_delete_after() -> int:
+    return int(_settime_config.get("verify_msg_delete_after", VERIFY_MSG_DELETE_AFTER))
+
+
+def _save_settime_config():
+    try:
+        with open(SETTIME_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_settime_config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[PTB] 保存 settime 配置失败: {e}")
+
+
+_load_settime_config()
 REQUIRED_GROUP_RESTRICT_HOURS = float(os.getenv("REQUIRED_GROUP_RESTRICT_HOURS", "24"))  # 未加入 B 群 5 次后限制时长（小时），默认 24 即一天
 VERIFY_RESTRICT_DURATION = 1
 UNBAN_BOT_USERNAME = os.getenv("UNBAN_BOT_USERNAME", "@XHNPBOT")
@@ -1212,10 +1247,10 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     reply_markup = InlineKeyboardMarkup(rows) if rows else None
     vmsg = await bot.send_message(
         chat_id=int(chat_id),
-        text=f"【{full_name}】\n\n请先关注如下频道或加入群组后才能发言 。\n\n• 警告({cnt}/{VERIFY_FAIL_THRESHOLD})\n\n本条消息{REQUIRED_GROUP_MSG_DELETE_AFTER}秒后自动删除",
+        text=f"【{full_name}】\n\n请先关注如下频道或加入群组后才能发言 。\n\n• 警告({cnt}/{VERIFY_FAIL_THRESHOLD})\n\n本条消息{_get_required_group_msg_delete_after()}秒后自动删除",
         reply_markup=reply_markup,
     )
-    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, REQUIRED_GROUP_MSG_DELETE_AFTER))
+    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, _get_required_group_msg_delete_after(), user_msg_id=msg.message_id))
 
 
 async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, intro: str, trigger_reason: str = "", hit_keyword: str = ""):
@@ -1243,11 +1278,17 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     )
     pending_verification[(chat_id, user_id)] = {"code": code, "time": time.time(), "msg_id": msg_id}
     _schedule_sync_background(save_verification_records)
-    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, VERIFY_MSG_DELETE_AFTER))
+    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after()))
 
 
-async def _delete_after(bot, chat_id: int, msg_id: int, sec: int):
+async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None):
+    """sec 秒后删除 msg_id；若提供 user_msg_id，先尝试删除用户消息（90s 重试未删掉的触发消息）"""
     await asyncio.sleep(sec)
+    if user_msg_id is not None:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=user_msg_id)
+        except Exception:
+            pass
     try:
         await bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except Exception:
@@ -1364,7 +1405,7 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
             chat_id=int(chat_id),
             text=f"【{full_name}】\n\n验证失败，如有需要，请联系 {UNBAN_BOT_USERNAME} 进行解封",
         )
-        asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, VERIFY_MSG_DELETE_AFTER))
+        asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, _get_verify_msg_delete_after()))
     except Exception:
         pass
 
@@ -1379,31 +1420,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
-        "• /list — 查看垃圾关键词\n"
         "• /add_text、/add_name — 多轮添加（直接输入=子串，/前缀=精确，已存在则删除，/cancel 结束）\n"
+        "• /cancel — 取消当前操作\n"
+        "• /help — 本帮助\n"
+        "• /reload — 重载配置\n"
+        "• /start — 启动\n"
+        "• /settime — 配置关联群验证/人机验证消息自动删除时间\n"
         "• /kw_text、/kw_name add/remove — 关键词增删\n"
         "• /wl_name、/wl_text — 关键词白名单（管理员限制用户时不录入这些昵称/消息）\n"
-        "• bio 简介关键词：暂未启用\n"
-        "• /cancel — 取消当前操作\n"
-        "• /reload — 重载配置\n"
-        "• /verified_stats — 导出用户统计\n"
         "• 发送群消息链接 — 查看该消息的验证过程\n\n"
         "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
     )
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
-        return
-    lines = []
-    for field, label in [("text", "消息"), ("name", "昵称"), ("bio", "简介(暂未启用)")]:
-        kw = spam_keywords.get(field) or {}
-        ex = kw.get("exact") or []
-        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
-        lines.append(f"【{label}】exact: {ex or '无'} | match: {mt or '无'}")
-    await update.message.reply_text("\n".join(lines))
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not update.effective_user:
@@ -1417,6 +1444,28 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("已重载 spam_keywords、白名单、黑名单")
 
 pending_keyword_cmd = {}
+pending_settime_cmd = {}  # uid -> {"type": "required_group"|"verify"}
+
+
+async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """配置关联群验证/人机验证消息自动删除时间"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    req_sec = _get_required_group_msg_delete_after()
+    verify_sec = _get_verify_msg_delete_after()
+    rows = [
+        [InlineKeyboardButton("1、关联群验证", callback_data="settime:required_group")],
+        [InlineKeyboardButton("2、人机验证", callback_data="settime:verify")],
+    ]
+    text = (
+        "选择要配置的自动删除时间：\n\n"
+        f"• 1、关联群验证 — 「请先关注频道或加入群组」警告消息，当前 {req_sec} 秒后删除\n"
+        f"• 2、人机验证 — 验证码/验证失败提示消息，当前 {verify_sec} 秒后删除"
+    )
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not update.effective_user:
@@ -1424,6 +1473,9 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid in pending_keyword_cmd:
         pending_keyword_cmd.pop(uid, None)
+        await update.message.reply_text("已取消")
+    elif uid in pending_settime_cmd:
+        pending_settime_cmd.pop(uid, None)
         await update.message.reply_text("已取消")
     else:
         await update.message.reply_text("当前无待取消的操作")
@@ -1492,7 +1544,7 @@ async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
-    pending_keyword_cmd[update.effective_user.id] = {"field": "text", "op": "add", "label": "消息", "multi": True}
+    pending_keyword_cmd[update.effective_user.id] = {"field": "text", "op": "add", "label": "消息", "multi": True, "timestamp": time.time()}
     await update.message.reply_text(
         "【消息】关键词管理（多轮，/cancel 结束）\n"
         "• 直接输入如 加V → 子串匹配\n"
@@ -1635,6 +1687,34 @@ async def callback_raw_message_button(update: Update, context: ContextTypes.DEFA
     await query.message.reply_text(f"<pre>{body_str}</pre>", parse_mode="HTML")
 
 
+async def callback_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 /settime 的选项回调"""
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data
+    user = query.from_user
+    if not user or not is_admin(user.id, ADMIN_IDS):
+        await query.answer("无权限", show_alert=True)
+        return
+    typ = data.split(":", 1)[1]
+    if typ == "required_group":
+        label = "关联群验证"
+        current = _get_required_group_msg_delete_after()
+        key = "required_group_msg_delete_after"
+    elif typ == "verify":
+        label = "人机验证"
+        current = _get_verify_msg_delete_after()
+        key = "verify_msg_delete_after"
+    else:
+        await query.answer("未知选项", show_alert=True)
+        return
+    pending_settime_cmd[user.id] = {"type": typ, "key": key, "label": label}
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"【{label}】当前 {current} 秒后自动删除。请发送数字设置新值（如 90）：")
+
+
 async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_chat.type != "private":
         return
@@ -1646,10 +1726,37 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         return
     text = (update.message.text or "").strip()
 
-    # 1. 两段式关键词：add_text / add_name / add_bio 的后续输入（多轮、toggle）
+    # 0. /settime 的后续输入：等待数字
     uid = user.id
+    if uid in pending_settime_cmd:
+        info = pending_settime_cmd.pop(uid, None)
+        if not info:
+            return
+        try:
+            val = int(text)
+            if val < 5 or val > 86400:
+                await update.message.reply_text("请输入 5～86400 之间的数字（秒）")
+                pending_settime_cmd[uid] = info  # 恢复，让用户重试
+                return
+        except ValueError:
+            await update.message.reply_text("请输入有效数字（如 90）")
+            pending_settime_cmd[uid] = info
+            return
+        key = info["key"]
+        label = info["label"]
+        _settime_config[key] = val
+        _save_settime_config()
+        await update.message.reply_text(f"已设置【{label}】自动删除时间为 {val} 秒")
+        return
+
+    # 1. 两段式关键词：add_text / add_name / add_bio 的后续输入（多轮、toggle）
+    PENDING_KEYWORD_TIMEOUT = 120  # 等待关键词状态 120 秒后超时
     if uid in pending_keyword_cmd:
         info = pending_keyword_cmd[uid]
+        if (time.time() - info.get("timestamp", 0)) > PENDING_KEYWORD_TIMEOUT:
+            pending_keyword_cmd.pop(uid, None)
+            await update.message.reply_text("已超时，请重新发送 /add_text 或 /add_name")
+            return
         field, label, multi = info.get("field"), info.get("label", ""), info.get("multi", False)
         if not field or not text:
             if not multi:
@@ -1667,13 +1774,16 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         else:
             if add_spam_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
                 save_spam_keywords()
-                await update.message.reply_text(f"已添加「{kw}」（{'精确' if as_exact else '子串'}）")
+                reply = f"已添加「{kw}」（{'精确' if as_exact else '子串'}）"
+                if multi:
+                    reply += "。继续发送关键词，/cancel 结束"
+                await update.message.reply_text(reply)
             else:
                 await update.message.reply_text("添加失败（正则无效？）")
         if not multi:
             pending_keyword_cmd.pop(uid, None)
         else:
-            await update.message.reply_text("继续发送关键词，/cancel 结束")
+            info["timestamp"] = time.time()  # 刷新超时时间
         return
 
     # 2. 群消息链接查询（支持 t.me/c/123/456 和 t.me/USERNAME/123）
@@ -1819,25 +1929,6 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text("\n".join(lines), reply_markup=reply_markup)
 
 
-async def cmd_verified_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not update.effective_user:
-        return
-    if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
-        return
-    total = len(verified_users)
-    lines = [f"📊 验证通过用户统计\n总用户数: {total}\n"]
-    count = 0
-    for uid in sorted(verified_users, key=lambda u: (verified_users_details.get(u) or {}).get("verify_time") or "", reverse=True):
-        if count >= 20:
-            lines.append(f"\n... 还有 {total - 20} 个用户未显示")
-            break
-        d = verified_users_details.get(uid) or {}
-        lines.append(f"{count+1}. ID:{uid} | @{d.get('username','')} | {d.get('full_name','')}")
-        count += 1
-    await update.message.reply_text("\n".join(lines) if lines else "暂无数据")
-
-
 async def _job_frost_reply(context: ContextTypes.DEFAULT_TYPE):
     try:
         _xhbot = _BASE.parent
@@ -1903,14 +1994,13 @@ async def _post_init_send_hello(application: Application):
     # 设置 Bot 菜单命令
     try:
         await application.bot.set_my_commands([
-            BotCommand("start", "启动"),
-            BotCommand("help", "帮助"),
-            BotCommand("list", "查看关键词"),
             BotCommand("add_text", "添加消息关键词"),
             BotCommand("add_name", "添加昵称关键词"),
-            BotCommand("reload", "重载配置"),
-            BotCommand("verified_stats", "用户统计"),
             BotCommand("cancel", "取消操作"),
+            BotCommand("help", "帮助"),
+            BotCommand("reload", "重载配置"),
+            BotCommand("start", "启动"),
+            BotCommand("settime", "配置自动删除时间"),
         ])
     except Exception as e:
         print(f"[PTB] 设置菜单命令失败: {e}")
@@ -1959,9 +2049,7 @@ def _ptb_main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.CAPTION, group_message_handler))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("reload", cmd_reload))
-    app.add_handler(CommandHandler("verified_stats", cmd_verified_stats))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("kw_text", cmd_kw_text))
     app.add_handler(CommandHandler("kw_name", cmd_kw_name))
@@ -1972,7 +2060,9 @@ def _ptb_main():
     app.add_handler(CommandHandler("add_name", cmd_add_name))
     app.add_handler(CommandHandler("add_bio", cmd_add_bio))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
+    app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
+    app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))
     app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
 
     jq = app.job_queue
