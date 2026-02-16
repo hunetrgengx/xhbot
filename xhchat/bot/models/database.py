@@ -66,6 +66,13 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS global_config (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -272,6 +279,28 @@ def has_sticker(file_id: str) -> bool:
     row = conn.execute("SELECT 1 FROM sticker_pool WHERE file_id = ?", (file_id,)).fetchone()
     conn.close()
     return row is not None
+
+
+def get_global_config(key: str) -> str | None:
+    """获取全局配置项，不存在返回 None"""
+    conn = get_connection()
+    row = conn.execute("SELECT value FROM global_config WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row and row["value"] else None
+
+
+def set_global_config(key: str, value: str) -> None:
+    """设置全局配置项"""
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO global_config (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """,
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
 
 
 def _utc_now() -> str:

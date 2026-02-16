@@ -47,7 +47,7 @@ _default_model = "moonshot-v1-128k" if AI_PROVIDER == "kimi" else "gpt-4o-mini"
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", _default_base_url)
 MODEL_NAME = os.getenv("MODEL_NAME", _default_model)
 
-# Kimi 联网搜索（天气、实时信息等，每次搜索约 ￥0.03）
+# Kimi 联网搜索（天气、实时信息等，每次搜索约 ￥0.03）。可在私聊用 /web_search 覆盖
 ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() in ("true", "1", "yes")
 
 # 自定义设定（所有人对话都会遵循）

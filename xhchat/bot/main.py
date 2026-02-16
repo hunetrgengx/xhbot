@@ -15,18 +15,20 @@ from config.settings import AI_PROVIDER, OPENAI_BASE_URL, TELEGRAM_BOT_TOKEN
 from telegram.ext import CallbackQueryHandler
 
 from bot.models.database import init_db
-from bot.handlers.start import cmd_start, cmd_newchat
+from bot.handlers.start import cmd_start, cmd_newchat, cmd_help
 from bot.handlers.chat import handle_message, handle_sticker_reply_to_bot
 from bot.handlers.admin import (
     cmd_settings,
     cmd_set_model,
     cmd_set_prompt,
+    cmd_web_search,
     cmd_cancel,
     cmd_reset_prompt,
     cmd_reset_model,
     cmd_getsticker,
     cmd_tiezhi,
     callback_set_model,
+    callback_web_search,
 )
 from bot.handlers.xh import cmd_xhadd, cmd_xhdel, cmd_xhset
 from bot.handlers.warn import cmd_warn
@@ -57,10 +59,12 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).job_queue(None).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("newchat", cmd_newchat))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set_model", cmd_set_model))
     app.add_handler(CommandHandler("set_prompt", cmd_set_prompt))
+    app.add_handler(CommandHandler("web_search", cmd_web_search))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("reset_prompt", cmd_reset_prompt))
     app.add_handler(CommandHandler("reset_model", cmd_reset_model))
@@ -71,6 +75,7 @@ def main():
     app.add_handler(CommandHandler("tz", cmd_tiezhi))
     app.add_handler(CommandHandler("warn", cmd_warn))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern="^model:"))
+    app.add_handler(CallbackQueryHandler(callback_web_search, pattern="^web_search:"))
     # 暖群：group -1 先执行，监听管理员发言
     app.add_handler(
         MessageHandler(

@@ -18,6 +18,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 回复我的消息继续对话\n"
         "• 回复我并发送贴纸，我会用贴纸回复\n\n"
         "【命令】\n"
+        "/help - 查看全部命令\n"
         "/newchat - 清除对话历史\n"
         "/settings - 查看/切换模型、设定\n\n"
         "【贴纸池】（私聊，仅管理员）\n"
@@ -29,6 +30,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(text)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """显示帮助信息"""
+    text = (
+        "📖 小助理 命令帮助\n\n"
+        "【对话】\n"
+        "/newchat — 清除对话历史\n"
+        "/settings — 查看/切换模型、设定\n"
+        "/web_search — 联网搜索开关（私聊）\n\n"
+        "【配置】（私聊/群组）\n"
+        "/set_model — 切换模型\n"
+        "/set_prompt — 设置自定义设定\n"
+        "/reset_prompt — 重置设定\n"
+        "/reset_model — 重置模型\n"
+        "/cancel — 取消当前操作\n\n"
+        "【贴纸】\n"
+        "/tz — 贴纸管理（添加/删除）\n"
+        "/getsticker — 获取贴纸 file_id（私聊）\n\n"
+        "【管理】（指定群组）\n"
+        "/xhadd — 添加设定\n"
+        "/xhdel — 删除设定\n"
+        "/xhset — 显示设定列表\n"
+        "/warn — 警告用户"
+    )
+    await update.message.reply_text(text)
 
 
 async def cmd_newchat(update: Update, context: ContextTypes.DEFAULT_TYPE):

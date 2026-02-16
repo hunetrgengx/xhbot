@@ -8,6 +8,7 @@ from config.settings import (
     AI_PROVIDER,
     CUSTOM_PROMPT_FILE,
     CUSTOM_SYSTEM_PROMPT,
+    ENABLE_WEB_SEARCH,
     MODEL_NAME,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
@@ -135,6 +136,15 @@ def get_ai_config(chat_id: int) -> dict:
         "api_key": OPENAI_API_KEY,
         "use_web_search": AI_PROVIDER == "kimi",
     }
+
+
+def get_use_web_search() -> bool:
+    """联网搜索开关：优先读数据库（私聊 /web_search 设置），否则用 .env 的 ENABLE_WEB_SEARCH"""
+    from bot.models.database import get_global_config
+    val = get_global_config("use_web_search")
+    if val is not None:
+        return val.lower() in ("true", "1", "yes")
+    return ENABLE_WEB_SEARCH
 
 
 def get_preset_list() -> list[tuple[str, str]]:

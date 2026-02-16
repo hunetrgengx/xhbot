@@ -11,7 +11,7 @@ try:
 except ImportError:
     ZoneInfo = None
 
-from config.settings import ENABLE_WEB_SEARCH
+from bot.services.group_config import get_use_web_search
 
 
 def _get_client(base_url: str, api_key: str) -> OpenAI:
@@ -121,7 +121,7 @@ def chat_completion(
     base_url = cfg["base_url"]
     api_key = cfg["api_key"]
     model = cfg["model_name"]
-    use_web_search = cfg["use_web_search"] and ENABLE_WEB_SEARCH
+    use_web_search = cfg["use_web_search"] and get_use_web_search()
 
     # Ollama 本地可接受任意 api_key
     if cfg["ai_provider"] == "ollama":

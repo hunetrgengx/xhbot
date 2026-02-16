@@ -5,13 +5,14 @@ from telegram.ext import ContextTypes
 from config.settings import BOT_OWNER_ID
 from bot.models.database import (
     set_group_settings,
+    set_global_config,
     add_sticker,
     remove_sticker_by_index,
     remove_sticker_by_file_id,
     has_sticker,
 )
 from bot.models.database import get_sticker_ids as db_get_sticker_ids
-from bot.services.group_config import get_ai_config, get_custom_prompt, get_preset_list, PRESET_MODELS
+from bot.services.group_config import get_ai_config, get_custom_prompt, get_preset_list, get_use_web_search, PRESET_MODELS
 
 
 def _is_owner(update: Update) -> bool:
@@ -41,6 +42,48 @@ async def _ensure_group(update: Update) -> bool:
     return True
 
 
+async def _ensure_private(update: Update) -> bool:
+    """确保在私聊中"""
+    if update.effective_chat.type != "private":
+        if update.message:
+            await update.message.reply_text("此命令请在私聊中使用。")
+        return False
+    return True
+
+
+async def cmd_web_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """联网搜索开关（仅私聊、仅所有者）"""
+    if not await _check_owner(update, context):
+        return
+    if not await _ensure_private(update):
+        return
+    on = get_use_web_search()
+    keyboard = [
+        [InlineKeyboardButton("✅ 开启", callback_data="web_search:on")],
+        [InlineKeyboardButton("❌ 关闭", callback_data="web_search:off")],
+    ]
+    status = "已开启" if on else "已关闭"
+    await update.message.reply_text(
+        f"🔍 联网搜索（天气、实时新闻等）\n\n当前状态：{status}\n\n点击下方按钮切换：",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def callback_web_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理联网搜索开关回调"""
+    if not _is_owner(update):
+        await update.callback_query.answer("❌ 权限不足。", show_alert=True)
+        return
+    query = update.callback_query
+    if not query.data or not query.data.startswith("web_search:"):
+        return
+    val = query.data.split(":", 1)[1]
+    set_global_config("use_web_search", "true" if val == "on" else "false")
+    status = "已开启" if val == "on" else "已关闭"
+    await query.answer(f"联网搜索 {status}")
+    await query.edit_message_text(f"🔍 联网搜索\n\n当前状态：{status}")
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看当前群配置"""
     if not await _check_owner(update, context):
@@ -50,7 +93,14 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 私聊用全局
         cfg = get_ai_config(0)
         custom = get_custom_prompt(0)
-        text = f"📋 当前为私聊，使用全局配置\n\n模型：{cfg['ai_provider']} / {cfg['model_name']}\n自定义设定：{'已设置' if custom else '未设置'}"
+        web_on = get_use_web_search()
+        text = (
+            f"📋 当前为私聊，使用全局配置\n\n"
+            f"模型：{cfg['ai_provider']} / {cfg['model_name']}\n"
+            f"自定义设定：{'已设置' if custom else '未设置'}\n"
+            f"联网搜索：{'✅ 开启' if web_on else '❌ 关闭'}\n\n"
+            f"/web_search — 切换联网搜索"
+        )
         await update.message.reply_text(text)
         return
 
