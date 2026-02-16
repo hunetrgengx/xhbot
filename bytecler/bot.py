@@ -1154,7 +1154,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 else:
                     left = VERIFY_FAIL_THRESHOLD - cnt
                     print(f"[PTB] 群消息: chat_id={chat_id} 验证码错误 msg_id={msg.message_id} [验证码消息不单独建记录]")
-                    await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+                    vmsg = await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
+                    asyncio.create_task(_delete_after(context.bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after(), user_msg_id=msg.message_id))
             return
         pending_verification.pop(key, None)
 
@@ -2069,6 +2074,9 @@ def _ptb_main():
     if jq:
         jq.run_repeating(_job_frost_reply, interval=2, first=2)
         jq.run_daily(_job_lottery_sync, time=dt_time(20, 0))  # 20:00 UTC = 北京时间凌晨 4 点
+        print("[PTB] 定时任务已注册：抽奖同步 每日 20:00 UTC（北京时间 4:00）")
+    else:
+        print("[PTB] ⚠️ job_queue 为 None，定时任务未注册。请执行: pip install 'python-telegram-bot[job-queue]'")
 
     # 必须显式包含 chat_member，Telegram 默认不推送此类型
     app.run_polling(allowed_updates=Update.ALL_TYPES)
