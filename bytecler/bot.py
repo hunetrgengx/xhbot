@@ -48,6 +48,7 @@ VERIFICATION_BLACKLIST_PATH = _path("verification_blacklist.json")
 VERIFICATION_RECORDS_PATH = _path("verification_records.json")
 SYNC_LOTTERY_CHECKPOINT_PATH = _path("sync_lottery_checkpoint.json")
 SETTIME_CONFIG_PATH = _path("settime_config.json")
+BGROUP_CONFIG_PATH = _path("bgroup_config.json")  # 每群单独配置 B 群（仅一个）：{ "chat_id": "b_id" }，无全局
 LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 
 spam_keywords = {"text": {"exact": [], "match": [], "_ac": None, "_regex": []},
@@ -692,8 +693,12 @@ def sync_lottery_winners() -> tuple[int, str]:
 # ==================== PTB 霜刃逻辑 ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROUP_ID_STR = os.getenv("GROUP_ID", "")
-TARGET_GROUP_IDS = {s.strip() for s in GROUP_ID_STR.split(",") if s.strip()}
-REQUIRED_GROUP_ID = (os.getenv("REQUIRED_GROUP_ID") or os.getenv("REQUIRED_GROUP_IDS") or "").strip()  # 用户必须加入的 B 群（公开群/频道），不在则触发验证；支持 REQUIRED_GROUP_ID 或 REQUIRED_GROUP_IDS
+_ENV_GROUP_IDS = {s.strip() for s in GROUP_ID_STR.split(",") if s.strip()}
+# 霜刃可用群 = 环境变量 + target_groups.json 中通过 /add_group 添加的
+TARGET_GROUP_IDS: set = set()
+TARGET_GROUPS_PATH = _path("target_groups.json")
+# 全局 B 群（未配置群级时使用）；群级配置见 bgroup_config.json、/set_bgroup
+REQUIRED_GROUP_ID = (os.getenv("REQUIRED_GROUP_ID") or os.getenv("REQUIRED_GROUP_IDS") or "").strip()
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
 RESTRICTED_USERS_LOG_PATH = _BASE / "restricted_users.jsonl"
@@ -735,6 +740,190 @@ def _save_settime_config():
 
 
 _load_settime_config()
+
+_bgroup_config: dict = {}  # chat_id_str -> str | None（仅一个 B 群，None 表示不校验）
+
+
+def _load_bgroup_config():
+    global _bgroup_config
+    try:
+        if BGROUP_CONFIG_PATH.exists():
+            with open(BGROUP_CONFIG_PATH, "r", encoding="utf-8") as f:
+                _bgroup_config = json.load(f)
+        else:
+            _bgroup_config = {}
+    except Exception as e:
+        print(f"[PTB] 加载 B 群配置失败: {e}")
+        _bgroup_config = {}
+
+
+def _save_bgroup_config():
+    try:
+        with open(BGROUP_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_bgroup_config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[PTB] 保存 B 群配置失败: {e}")
+
+
+def get_bgroup_ids_for_chat(chat_id: str) -> list:
+    """获取某群的 B 群 ID（仅一个）。无全局配置，未设置或设为空则返回 [] 表示不校验。"""
+    val = _bgroup_config.get(str(chat_id))
+    if val is None:
+        return []
+    s = str(val).strip()
+    if not s or not s.lstrip("-").isdigit():
+        return []
+    return [s]
+
+
+def set_bgroup_for_chat(chat_id: str, b_id: str | None) -> bool:
+    """设置某群的 B 群。b_id: 群 ID 字符串，None/空 表示不校验（删除配置）。"""
+    cid = str(chat_id)
+    if b_id is None or (isinstance(b_id, str) and not b_id.strip()):
+        if cid in _bgroup_config:
+            del _bgroup_config[cid]
+            _save_bgroup_config()
+            return True
+        return False
+    s = str(b_id).strip()
+    if not s or not s.lstrip("-").isdigit():
+        return False
+    _bgroup_config[cid] = s
+    _save_bgroup_config()
+    return True
+
+
+async def _resolve_bgroup_input(bot, raw: str) -> str | None:
+    """解析 B 群输入：@channel、https://t.me/xxx、-1001234567890。返回 chat_id 字符串或 None。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.lstrip("-").isdigit():
+        return raw
+    if raw.startswith("@"):
+        try:
+            chat = await bot.get_chat(raw)
+            return str(chat.id)
+        except Exception:
+            return None
+    m = re.search(r"t\.me/c/(\d+)", raw, re.I)
+    if m:
+        num = m.group(1)
+        if num.isdigit():
+            return str(-1000000000000 - int(num))
+    m = re.search(r"t\.me/([a-zA-Z0-9_]+)", raw, re.I)
+    if m:
+        username = m.group(1)
+        if username.lower() != "c":
+            try:
+                chat = await bot.get_chat(f"@{username}")
+                return str(chat.id)
+            except Exception:
+                pass
+    return None
+
+
+_load_bgroup_config()
+
+
+def _load_target_groups():
+    """加载通过 /add_group 添加的群 ID，合并到 TARGET_GROUP_IDS"""
+    global TARGET_GROUP_IDS
+    TARGET_GROUP_IDS = set(_ENV_GROUP_IDS)
+    try:
+        if TARGET_GROUPS_PATH.exists():
+            with open(TARGET_GROUPS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for g in (data.get("groups") or []):
+                s = str(g).strip()
+                if s and s.lstrip("-").isdigit():
+                    TARGET_GROUP_IDS.add(s)
+    except Exception as e:
+        print(f"[PTB] 加载 target_groups 失败: {e}")
+
+
+def _save_target_groups():
+    """保存 target_groups（仅 /add_group 添加的，不含 env）"""
+    try:
+        extra = [g for g in TARGET_GROUP_IDS if g not in _ENV_GROUP_IDS]
+        with open(TARGET_GROUPS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"groups": sorted(extra)}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[PTB] 保存 target_groups 失败: {e}")
+
+
+def _add_target_group(gid: str) -> bool:
+    """添加群到监控列表，返回是否为新添加"""
+    gid = str(gid).strip()
+    if not gid or not gid.lstrip("-").isdigit():
+        return False
+    if gid in TARGET_GROUP_IDS:
+        return False
+    TARGET_GROUP_IDS.add(gid)
+    _save_target_groups()
+    return True
+
+
+def _group_id_to_link(gid: str) -> str:
+    """将群 ID 转为可点击链接。公开群需通过 get_chat 获取 username。"""
+    gid = str(gid).strip()
+    if gid.startswith("-100") and len(gid) > 4:
+        return f"https://t.me/c/{gid[4:]}"
+    return f"https://t.me/c/{gid}"  # fallback
+
+
+async def _get_group_display_info(bot, gid: str) -> tuple[str, str]:
+    """获取群展示信息：(title, link)。失败时返回 (gid, _group_id_to_link(gid))"""
+    try:
+        chat = await bot.get_chat(chat_id=int(gid))
+        title = (getattr(chat, "title", None) or "").strip() or gid
+        username = (getattr(chat, "username", None) or "").strip()
+        link = f"https://t.me/{username}" if username else _group_id_to_link(gid)
+        return (title, link)
+    except Exception:
+        return (gid, _group_id_to_link(gid))
+
+
+def _escape_html(s: str) -> str:
+    """HTML 转义，用于 Telegram parse_mode=HTML"""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def _resolve_group_input(bot, raw: str) -> str | None:
+    """解析群输入：@群、https://t.me/xxx、-1001234567890。返回 chat_id 字符串或 None。仅支持群/超级群。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.lstrip("-").isdigit():
+        return raw
+    if raw.startswith("@"):
+        try:
+            chat = await bot.get_chat(raw)
+            if getattr(chat, "type", "") in ("group", "supergroup"):
+                return str(chat.id)
+        except Exception:
+            pass
+        return None
+    m = re.search(r"t\.me/c/(\d+)", raw, re.I)
+    if m:
+        num = m.group(1)
+        if num.isdigit():
+            return str(-1000000000000 - int(num))
+    m = re.search(r"t\.me/([a-zA-Z0-9_]+)", raw, re.I)
+    if m:
+        username = m.group(1)
+        if username.lower() != "c":
+            try:
+                chat = await bot.get_chat(f"@{username}")
+                if getattr(chat, "type", "") in ("group", "supergroup"):
+                    return str(chat.id)
+            except Exception:
+                pass
+    return None
+
+
+_load_target_groups()
+
 REQUIRED_GROUP_RESTRICT_HOURS = float(os.getenv("REQUIRED_GROUP_RESTRICT_HOURS", "24"))  # 未加入 B 群 5 次后限制时长（小时），默认 24 即一天
 VERIFY_RESTRICT_DURATION = 1
 UNBAN_BOT_USERNAME = os.getenv("UNBAN_BOT_USERNAME", "@XHNPBOT")
@@ -750,53 +939,66 @@ _required_group_warn_count: dict[tuple[str, int], list] = {}
 _LINK_RE = re.compile(r"t\.me/c/(\d+)/(\d+)", re.I)
 _LINK_PUBLIC_RE = re.compile(r"t\.me/([a-zA-Z0-9_]+)/(\d+)", re.I)
 _bot_me_cache = None  # get_me() 结果，ExtBot 不允许动态属性
-# B 群信息缓存 (title, link)，通过 get_chat 获取（公开群/频道有 username）
-_required_group_info_cache: tuple[str, str] | None = None
-# 用户是否在 B 群缓存，避免频繁调用 get_chat_member
+# B 群信息缓存：b_group_id -> (title, link, ts)，TTL 1 天
+_required_group_info_cache: dict[str, tuple[str, str, float]] = {}
+_REQUIRED_GROUP_INFO_CACHE_TTL = 86400
+# 用户是否在 B 群缓存，(user_id, b_group_id) -> (is_in, ts)
 _user_in_required_group_cache: dict[tuple[int, str], tuple[bool, float]] = {}
-_USER_IN_GROUP_CACHE_TTL = 86400  # 1 天；白名单用户跳过缓存，确保离开 B 群后立即触发验证
+_USER_IN_GROUP_CACHE_TTL = 86400  # 「在」时缓存 1 天
+_USER_IN_GROUP_CACHE_TTL_NOT_IN = 10  # 「不在」时仅缓存 10 秒
 
 
-async def _is_user_in_required_group(bot, user_id: int, skip_cache: bool = False) -> bool:
-    """判断用户是否在 REQUIRED_GROUP_ID 指定的群中。未配置则返回 True（不限制）。skip_cache=True 时白名单用户每次实时检查。"""
-    if not REQUIRED_GROUP_ID:
+async def _is_user_in_required_group(bot, user_id: int, chat_id: str, skip_cache: bool = False) -> bool:
+    """判断用户是否在指定群的 B 群中（任一即可）。未配置则返回 True（不限制）。"""
+    b_ids = get_bgroup_ids_for_chat(chat_id)
+    if not b_ids:
         return True
-    key = (user_id, REQUIRED_GROUP_ID)
+    for b_id in b_ids:
+        key = (user_id, b_id)
+        now = time.time()
+        if not skip_cache and key in _user_in_required_group_cache:
+            cached_val, ts = _user_in_required_group_cache[key]
+            ttl = _USER_IN_GROUP_CACHE_TTL if cached_val else _USER_IN_GROUP_CACHE_TTL_NOT_IN
+            if now - ts <= ttl:
+                if cached_val:
+                    return True
+                continue
+        try:
+            member = await bot.get_chat_member(chat_id=int(b_id), user_id=user_id)
+            status = getattr(member, "status", "") or ""
+            is_in = status not in ("left", "kicked")
+            _user_in_required_group_cache[key] = (is_in, now)
+            print(f"[PTB] B群检查: uid={user_id} b_id={b_id} status={status!r} is_in={is_in} skip_cache={skip_cache}")
+            if is_in:
+                return True
+        except Exception as e:
+            print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {b_id} 失败: {e}")
+            return True  # 接口报错或异常时，默认用户在 B 群，不限制
+    return False
+
+
+async def _get_required_group_buttons(bot, chat_id: str) -> list[tuple[str, str]]:
+    """获取某群的 B 群按钮列表 [(title, link), ...]，公开群/频道有 username 才有 link。"""
+    b_ids = get_bgroup_ids_for_chat(chat_id)
+    if not b_ids:
+        return []
+    result = []
     now = time.time()
-    if not skip_cache and key in _user_in_required_group_cache:
-        cached_val, ts = _user_in_required_group_cache[key]
-        if now - ts <= _USER_IN_GROUP_CACHE_TTL:
-            return cached_val
-    try:
-        member = await bot.get_chat_member(chat_id=int(REQUIRED_GROUP_ID), user_id=user_id)
-        status = getattr(member, "status", "") or ""
-        is_in = status not in ("left", "kicked")
-        _user_in_required_group_cache[key] = (is_in, now)
-        print(f"[PTB] B群检查: uid={user_id} status={status!r} is_in={is_in} skip_cache={skip_cache}")
-        return is_in
-    except Exception as e:
-        print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {REQUIRED_GROUP_ID} 失败: {e}")
-        _user_in_required_group_cache[key] = (False, now)  # 出错视为不在
-        return False
-
-
-async def _get_required_group_info(bot) -> tuple[str, str] | None:
-    """通过 get_chat 获取 B 群标题和链接（公开群/频道有 username）。未配置或获取失败返回 None。"""
-    global _required_group_info_cache
-    if not REQUIRED_GROUP_ID:
-        return None
-    if _required_group_info_cache is not None:
-        return _required_group_info_cache
-    try:
-        chat = await bot.get_chat(chat_id=int(REQUIRED_GROUP_ID))
-        title = (getattr(chat, "title", None) or "").strip() or "指定群组"
-        username = (getattr(chat, "username", None) or "").strip()
-        link = f"https://t.me/{username}" if username else ""
-        _required_group_info_cache = (title, link)
-        return _required_group_info_cache
-    except Exception as e:
-        print(f"[PTB] 获取 B 群 {REQUIRED_GROUP_ID} 信息失败: {e}")
-        return None
+    for b_id in b_ids:
+        cached = _required_group_info_cache.get(b_id)
+        if cached and len(cached) >= 3 and (now - cached[2]) <= _REQUIRED_GROUP_INFO_CACHE_TTL:
+            result.append((cached[0], cached[1]))
+            continue
+        try:
+            chat = await bot.get_chat(chat_id=int(b_id))
+            title = (getattr(chat, "title", None) or "").strip() or f"群组 {b_id}"
+            username = (getattr(chat, "username", None) or "").strip()
+            link = f"https://t.me/{username}" if username else ""
+            _required_group_info_cache[b_id] = (title, link, now)
+            result.append((title, link))
+        except Exception as e:
+            print(f"[PTB] 获取 B 群 {b_id} 信息失败: {e}")
+    return result
 
 
 def _has_url_entity(msg) -> bool:
@@ -1101,6 +1303,28 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     first_name = user.first_name or ""
     last_name = user.last_name or ""
 
+    # 0. /setlimit 的后续输入
+    key = (chat_id, uid)
+    if key in pending_setlimit:
+        info = pending_setlimit[key]
+        if (time.time() - info.get("timestamp", 0)) > PENDING_SETLIMIT_TIMEOUT:
+            pending_setlimit.pop(key, None)
+            await update.message.reply_text("已超时，请重新发送 /setlimit")
+            return
+        pending_setlimit.pop(key, None)
+        if not text:
+            await update.message.reply_text("请输入 B 群/频道，或 /cancel 取消")
+            pending_setlimit[key] = {"timestamp": time.time()}
+            return
+        b_id = await _resolve_bgroup_input(context.bot, text)
+        if b_id:
+            set_bgroup_for_chat(chat_id, b_id)
+            await update.message.reply_text(f"已设置 B 群：{b_id}\n用户需加入才能发言")
+        else:
+            await update.message.reply_text("解析失败，请发送 @频道、https://t.me/xxx 或 -1001234567890")
+            pending_setlimit[key] = {"timestamp": time.time()}
+        return
+
     # 缓存用户最近消息（必须在所有 return 之前），供管理员删除+限制/封禁时自动加入 text 关键词
     if text:
         _last_message_by_user[(chat_id, uid)] = (text[:500], time.time())
@@ -1108,7 +1332,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             _cleanup_expired_message_cache()
 
     # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；白名单用户跳过缓存，确保离开 B 群后立即触发
-    if REQUIRED_GROUP_ID and not (await _is_user_in_required_group(context.bot, uid, skip_cache=(uid in verified_users))):
+    if get_bgroup_ids_for_chat(chat_id) and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group)")
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
@@ -1139,6 +1363,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 if msg_id is not None:
                     update_verification_record(chat_id, msg_id, "passed")
                     save_verification_records()
+                else:
+                    print(f"[PTB] 警告: 验证通过但 msg_id 为空，跳过记录更新 chat_id={chat_id} uid={uid}")
                 add_verified_user(uid, user.username, f"{first_name} {last_name}".strip())
                 save_verified_users()
                 verification_failures.pop(key, None)
@@ -1210,8 +1436,18 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} whitelist_added")
 
 
+def _cleanup_required_group_warn_count():
+    """清理 _required_group_warn_count 中已过期的 key（窗口外的不再计入）"""
+    now = time.time()
+    cutoff = now - TRIGGER_WINDOW_SECONDS
+    expired = [k for k, ts_list in _required_group_warn_count.items() if not ts_list or max(ts_list) <= cutoff]
+    for k in expired:
+        _required_group_warn_count.pop(k, None)
+
+
 async def _start_required_group_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str):
     """未加入 B 群时：删除消息，发送带按钮的警告，冷却+窗口内 5 次后限制"""
+    _cleanup_required_group_warn_count()
     key = (chat_id, user_id)
     ts_list = _required_group_warn_count.get(key, [])
     should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
@@ -1241,9 +1477,7 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         await _restrict_and_notify(bot, chat_id, user_id, full_name, msg.message_id, restrict_hours=REQUIRED_GROUP_RESTRICT_HOURS)
         return
     rows = []
-    group_info = await _get_required_group_info(bot)
-    if group_info:
-        title, link = group_info
+    for title, link in await _get_required_group_buttons(bot, chat_id):
         if link:
             rows.append([InlineKeyboardButton(title, url=link)])
     cb_data = f"reqgrp_unr:{chat_id}:{user_id}"
@@ -1415,6 +1649,80 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
         pass
 
 
+PENDING_SETLIMIT_TIMEOUT = 120
+pending_setlimit: dict[tuple[str, int], dict] = {}  # (chat_id, uid) -> {timestamp}
+
+
+async def _is_group_admin_can_promote(bot, chat_id: int, user_id: int) -> bool:
+    """判断用户是否为群管理员且拥有「可添加管理员」权限（仅此类可配置 B 群）"""
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for a in admins:
+            if a.user.id != user_id:
+                continue
+            if getattr(a, "status", "") == "creator":
+                return True
+            return getattr(a, "can_promote_members", False) is True
+        return False
+    except Exception:
+        return False
+
+
+def _format_setlimit_prompt(chat_id: str) -> str:
+    """生成 /setlimit 的提示文案"""
+    ids = get_bgroup_ids_for_chat(chat_id)
+    if ids:
+        cur = f"当前 B 群/频道：{ids[0]}"
+        clear_hint = "\n/clearlimit — 删除此配置（不校验 B 群）"
+    else:
+        cur = "当前未配置 B 群（不校验）"
+        clear_hint = ""
+    return (
+        f"{cur}{clear_hint}\n\n"
+        "请发送 B 群/频道（支持 @形式、https://t.me/xxx、-1001234567890）\n"
+        "120 秒内有效，/cancel 取消"
+    )
+
+
+async def cmd_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """群内配置 B 群：显示当前并等待输入"""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("请在群内使用此命令")
+        return
+    chat_id = str(update.effective_chat.id)
+    uid = update.effective_user.id
+    if not chat_allowed(chat_id, TARGET_GROUP_IDS):
+        await update.message.reply_text("本群不在监控列表")
+        return
+    if not await _is_group_admin_can_promote(context.bot, int(chat_id), uid):
+        await update.message.reply_text("仅拥有「可添加管理员」权限的管理员可配置")
+        return
+    pending_setlimit[(chat_id, uid)] = {"timestamp": time.time()}
+    await update.message.reply_text(_format_setlimit_prompt(chat_id))
+
+
+async def cmd_clearlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """删除本群 B 群配置"""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    chat_id = str(update.effective_chat.id)
+    uid = update.effective_user.id
+    if not chat_allowed(chat_id, TARGET_GROUP_IDS):
+        return
+    if not await _is_group_admin_can_promote(context.bot, int(chat_id), uid):
+        await update.message.reply_text("仅拥有「可添加管理员」权限的管理员可配置")
+        return
+    pending_setlimit.pop((chat_id, uid), None)
+    if set_bgroup_for_chat(chat_id, None):
+        await update.message.reply_text("已删除 B 群配置，本群不再校验")
+    else:
+        await update.message.reply_text("本群未配置 B 群")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
@@ -1426,11 +1734,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
         "• /add_text、/add_name — 多轮添加（直接输入=子串，/前缀=精确，已存在则删除，/cancel 结束）\n"
+        "• /add_group — 添加霜刃可用群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
         "• /cancel — 取消当前操作\n"
         "• /help — 本帮助\n"
         "• /reload — 重载配置\n"
         "• /start — 启动\n"
         "• /settime — 配置关联群验证/人机验证消息自动删除时间\n"
+        "• 群内 /setlimit — 配置本群 B 群/频道（需加入才能发言），仅拥有「可添加管理员」权限的管理员可配置；/clearlimit 删除\n"
         "• /kw_text、/kw_name add/remove — 关键词增删\n"
         "• /wl_name、/wl_text — 关键词白名单（管理员限制用户时不录入这些昵称/消息）\n"
         "• 发送群消息链接 — 查看该消息的验证过程\n\n"
@@ -1446,10 +1756,40 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_spam_keywords()
     load_verified_users()
     load_verification_blacklist()
-    await update.message.reply_text("已重载 spam_keywords、白名单、黑名单")
+    _load_bgroup_config()
+    _load_target_groups()
+    await update.message.reply_text("已重载 spam_keywords、白名单、黑名单、B群配置、监控群列表")
 
 pending_keyword_cmd = {}
 pending_settime_cmd = {}  # uid -> {"type": "required_group"|"verify"}
+pending_add_group: dict[int, dict] = {}  # uid -> {timestamp}，/add_group 两段式
+PENDING_ADD_GROUP_TIMEOUT = 120
+
+
+async def cmd_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """私聊添加霜刃可用群：@群、https://t.me/xxx、-100xxxxxxxxxx"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    uid = update.effective_user.id
+    pending_add_group[uid] = {"timestamp": time.time()}
+    cur = list(TARGET_GROUP_IDS) if TARGET_GROUP_IDS else []
+    if cur:
+        lines = ["当前监控群："]
+        for gid in sorted(cur):
+            title, link = await _get_group_display_info(context.bot, gid)
+            lines.append(f"• <a href=\"{link}\">{_escape_html(title)}</a> ({gid})")
+        hint = "\n".join(lines)
+    else:
+        hint = "当前无监控群（请先在 .env 配置 GROUP_ID 或通过本命令添加）"
+    await update.message.reply_text(
+        f"{hint}\n\n"
+        "请发送要添加的群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
+        "120 秒内有效，/cancel 取消",
+        parse_mode="HTML",
+    )
 
 
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,10 +1813,21 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not update.effective_user:
+    if not update.effective_user:
         return
     uid = update.effective_user.id
-    if uid in pending_keyword_cmd:
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+    key = (chat_id, uid)
+    if key in pending_setlimit:
+        pending_setlimit.pop(key, None)
+        await update.message.reply_text("已取消")
+        return
+    if update.effective_chat.type != "private":
+        return
+    if uid in pending_add_group:
+        pending_add_group.pop(uid, None)
+        await update.message.reply_text("已取消")
+    elif uid in pending_keyword_cmd:
         pending_keyword_cmd.pop(uid, None)
         await update.message.reply_text("已取消")
     elif uid in pending_settime_cmd:
@@ -1562,7 +1913,7 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
-    pending_keyword_cmd[update.effective_user.id] = {"field": "name", "op": "add", "label": "昵称", "multi": True}
+    pending_keyword_cmd[update.effective_user.id] = {"field": "name", "op": "add", "label": "昵称", "multi": True, "timestamp": time.time()}
     await update.message.reply_text(
         "【昵称】关键词管理（多轮，/cancel 结束）\n"
         "• 直接输入 → 子串匹配\n"
@@ -1622,7 +1973,7 @@ async def callback_required_group_unrestrict(update: Update, context: ContextTyp
         await query.answer("解析失败", show_alert=True)
         return
     # 每次点击都实时检查，不读缓存（用户可能刚加入 B 群）
-    if not await _is_user_in_required_group(context.bot, clicker_id, skip_cache=True):
+    if not await _is_user_in_required_group(context.bot, clicker_id, chat_id_str, skip_cache=True):
         await query.answer("请先加入指定群组后再点击", show_alert=True)
         return
     try:
@@ -1657,7 +2008,8 @@ async def callback_required_group_unrestrict(update: Update, context: ContextTyp
     save_verification_blacklist()
     key = (chat_id_str, clicker_id)
     _required_group_warn_count.pop(key, None)
-    _user_in_required_group_cache.pop((clicker_id, REQUIRED_GROUP_ID), None)
+    for b_id in get_bgroup_ids_for_chat(chat_id_str):
+        _user_in_required_group_cache.pop((clicker_id, b_id), None)
     await query.answer("已解禁", show_alert=True)
 
 
@@ -1714,7 +2066,7 @@ async def callback_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.answer("未知选项", show_alert=True)
         return
-    pending_settime_cmd[user.id] = {"type": typ, "key": key, "label": label}
+    pending_settime_cmd[user.id] = {"type": typ, "key": key, "label": label, "timestamp": time.time()}
     await query.answer()
     await query.edit_message_reply_markup(reply_markup=None)
     await query.message.reply_text(f"【{label}】当前 {current} 秒后自动删除。请发送数字设置新值（如 90）：")
@@ -1729,11 +2081,47 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     if not is_admin(user.id, ADMIN_IDS):
         await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
         return
+    uid = user.id
     text = (update.message.text or "").strip()
 
-    # 0. /settime 的后续输入：等待数字
-    uid = user.id
+    # 0. /add_group 的后续输入：等待群标识（120 秒超时）
+    if uid in pending_add_group:
+        info = pending_add_group[uid]
+        if (time.time() - info.get("timestamp", 0)) > PENDING_ADD_GROUP_TIMEOUT:
+            pending_add_group.pop(uid, None)
+            await update.message.reply_text("已超时，请重新发送 /add_group")
+            return
+        pending_add_group.pop(uid, None)
+        if not text:
+            await update.message.reply_text("请输入群或频道（@群、https://t.me/xxx 或 -100xxxxxxxxxx），或 /cancel 取消")
+            pending_add_group[uid] = {"timestamp": time.time()}
+            return
+        gid = await _resolve_group_input(context.bot, text)
+        if gid:
+            title, link = await _get_group_display_info(context.bot, gid)
+            if _add_target_group(gid):
+                await update.message.reply_text(
+                    f"已添加 <a href=\"{link}\">{_escape_html(title)}</a>",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"<a href=\"{link}\">{_escape_html(title)}</a> 已在监控列表中",
+                    parse_mode="HTML",
+                )
+        else:
+            await update.message.reply_text("解析失败，请发送 @群、https://t.me/xxx 或 -100xxxxxxxxxx")
+            pending_add_group[uid] = {"timestamp": time.time()}
+        return
+
+    # 1. /settime 的后续输入：等待数字（120 秒超时）
+    PENDING_SETTIME_TIMEOUT = 120
     if uid in pending_settime_cmd:
+        info = pending_settime_cmd[uid]
+        if (time.time() - info.get("timestamp", 0)) > PENDING_SETTIME_TIMEOUT:
+            pending_settime_cmd.pop(uid, None)
+            await update.message.reply_text("已超时，请重新发送 /settime 选择要设置的项")
+            return
         info = pending_settime_cmd.pop(uid, None)
         if not info:
             return
@@ -1791,9 +2179,10 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             info["timestamp"] = time.time()  # 刷新超时时间
         return
 
-    # 2. 群消息链接查询（支持 t.me/c/123/456 和 t.me/USERNAME/123）
-    if text and ("t.me" in text or "telegram" in text.lower()):
-        print(f"[PTB] 验证记录查询: 收到链接 text={text[:80]!r}")
+    # 2. 群消息链接查询（支持 t.me/c/123/456 和 t.me/USERNAME/123），仅在有链接特征时解析
+    if not (text and ("t.me" in text or "telegram" in text.lower())):
+        return
+    print(f"[PTB] 验证记录查询: 收到链接 text={text[:80]!r}")
     parsed = await _parse_message_link_async(text, context.bot)
     if not parsed:
         if text and ("t.me" in text or "telegram" in text.lower()):
@@ -2001,11 +2390,13 @@ async def _post_init_send_hello(application: Application):
         await application.bot.set_my_commands([
             BotCommand("add_text", "添加消息关键词"),
             BotCommand("add_name", "添加昵称关键词"),
+            BotCommand("add_group", "添加霜刃可用群"),
             BotCommand("cancel", "取消操作"),
             BotCommand("help", "帮助"),
             BotCommand("reload", "重载配置"),
             BotCommand("start", "启动"),
             BotCommand("settime", "配置自动删除时间"),
+            BotCommand("setlimit", "群内配置B群"),
         ])
     except Exception as e:
         print(f"[PTB] 设置菜单命令失败: {e}")
@@ -2065,6 +2456,9 @@ def _ptb_main():
     app.add_handler(CommandHandler("add_name", cmd_add_name))
     app.add_handler(CommandHandler("add_bio", cmd_add_bio))
     app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
+    app.add_handler(CommandHandler("clearlimit", cmd_clearlimit))
+    app.add_handler(CommandHandler("add_group", cmd_add_group))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
     app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))

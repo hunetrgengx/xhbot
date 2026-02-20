@@ -30,6 +30,8 @@ bytecler/verification_blacklist.json
 bytecler/verification_records.json
 bytecler/bio_calls.jsonl
 bytecler/spam_keywords.json
+bytecler/bgroup_config.json
+bytecler/target_groups.json
 bytecler/verified_users.*.json
 /tongbu.py
 /update.py
