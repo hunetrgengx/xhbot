@@ -2440,6 +2440,9 @@ def _ptb_main():
 
     # 显式指定 CHAT_MEMBER（其他成员状态变更），非 MY_CHAT_MEMBER（Bot 自身状态）
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER))
+    # 群内 /setlimit、/clearlimit 必须在 group_message_handler 之前注册，否则会被 TEXT 匹配抢先消费
+    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
+    app.add_handler(CommandHandler("clearlimit", cmd_clearlimit))
     # 分两个 handler 避免 filters.TEXT | filters.CAPTION 在某些 PTB 版本的兼容性问题
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.CAPTION, group_message_handler))
@@ -2456,8 +2459,6 @@ def _ptb_main():
     app.add_handler(CommandHandler("add_name", cmd_add_name))
     app.add_handler(CommandHandler("add_bio", cmd_add_bio))
     app.add_handler(CommandHandler("settime", cmd_settime))
-    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
-    app.add_handler(CommandHandler("clearlimit", cmd_clearlimit))
     app.add_handler(CommandHandler("add_group", cmd_add_group))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
