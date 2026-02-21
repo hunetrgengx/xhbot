@@ -26,7 +26,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
     ],
-    force=True  # 强制重新配置，避免重复配置
+    force=True  # 强制重新配置，避免重复配置1
 )
 
 # 创建日志记录器

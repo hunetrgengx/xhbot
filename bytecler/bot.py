@@ -73,6 +73,7 @@ TRIGGER_COOLDOWN_SECONDS = int(os.getenv("TRIGGER_COOLDOWN_SECONDS", "15"))
 TRIGGER_WINDOW_SECONDS = int(os.getenv("TRIGGER_WINDOW_SECONDS", "1200"))  # 20 分钟
 # 含 emoji 的消息/昵称触发验证，0/false 关闭
 ENABLE_EMOJI_CHECK = os.getenv("ENABLE_EMOJI_CHECK", "1").lower() not in ("0", "false", "no")
+ENABLE_STICKER_CHECK = os.getenv("ENABLE_STICKER_CHECK", "1").lower() not in ("0", "false", "no")
 
 
 def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
@@ -1032,6 +1033,19 @@ async def _is_mention_bot(msg, text: str, bot) -> bool:
     return False
 
 
+async def _is_frost_trigger(msg, text: str, bot) -> bool:
+    """判断是否触发霜刃 AI：以「霜刃，」开头、@提及霜刃、或回复霜刃的消息"""
+    if (text or "").strip().startswith("霜刃，"):
+        return True
+    if await _is_mention_bot(msg, text or "", bot):
+        return True
+    reply = getattr(msg, "reply_to_message", None)
+    if reply and getattr(reply, "from_user", None):
+        if reply.from_user.id == bot.id:
+            return True
+    return False
+
+
 # 含 emoji 检测：Unicode 常见 emoji 范围，预编译正则一次
 _EMOJI_PATTERN = re.compile(
     r'[\U00002600-\U000027BF\U0001F300-\U0001F5FF\U0001F600-\U0001F64F'
@@ -1290,7 +1304,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = str(msg.chat_id)
     text = (msg.text or msg.caption or "").strip()
     if not chat_allowed(chat_id, TARGET_GROUP_IDS):
-        if text and "霜刃" in text:
+        if text and await _is_frost_trigger(msg, text, context.bot):
             print(f"[PTB] 群 {chat_id} 不在目标列表 {TARGET_GROUP_IDS}，忽略霜刃唤醒")
         print(f"[PTB] 群消息跳过(无记录): chat_id={chat_id} 不在监控列表")
         return
@@ -1337,9 +1351,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
 
-    if text and ("霜刃" in text or await _is_mention_bot(msg, text, context.bot)):
+    if await _is_frost_trigger(msg, text or "", context.bot):
         print(f"[PTB] 收到霜刃唤醒 chat={chat_id} uid={uid} msg_id={msg.message_id} text={text[:50]!r} [霜刃唤醒不建记录]")
-        await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text, first_name, last_name)
+        await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text or "", first_name, last_name)
         return
 
     if uid in verified_users:
@@ -1387,7 +1401,21 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     vmsg = await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
                     asyncio.create_task(_delete_after(context.bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after(), user_msg_id=msg.message_id))
             return
+        # 超时 = 未完成验证，计 1 次失败，杜绝「间隔发违禁词」规避限制
+        cnt = increment_verification_failures(chat_id, uid)
+        save_verification_failures()
+        msg_id = pb.get("msg_id")
+        if cnt >= VERIFY_FAIL_THRESHOLD:
+            await _restrict_and_notify(context.bot, chat_id, uid, f"{first_name} {last_name}", msg_id)
+            pending_verification.pop(key, None)
+            return
         pending_verification.pop(key, None)
+
+    if ENABLE_STICKER_CHECK and getattr(msg, "sticker", None):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(sticker)")
+        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                  "⚠️ 检测到您发送了贴纸，请先完成人机验证。", "sticker")
+        return
 
     if _is_ad_message(msg):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(ad)")
@@ -1535,25 +1563,16 @@ async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: O
 
 
 async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, first_name: str, last_name: str):
-    global _bot_me_cache
-    if _bot_me_cache is None:
-        try:
-            _bot_me_cache = await bot.get_me()
-        except Exception as ex:
-            print(f"[PTB] 霜刃: get_me 失败，提前返回: {ex}")
-            return
-    me = _bot_me_cache
-    mention_ok = "霜刃" in text
-    if not mention_ok:
-        entities = getattr(msg, "entities", None) or []
-        for e in entities:
-            if getattr(e, "type", None) == MessageEntityType.MENTION:
-                men = (text or "")[e.offset : e.offset + e.length]
-                if men and me.username and men.lower() == f"@{me.username}".lower():
-                    mention_ok = True
-                    break
-    if not mention_ok:
-        return
+    # 由 _is_frost_trigger 保证已触发，此处仅提取 query
+    if text.strip().startswith("霜刃，"):
+        query = text[3:].strip() or "你好"
+    else:
+        query = (text or "").strip() or "继续"
+    # 若是通过回复霜刃唤醒，将霜刃被回复的那条消息一并发给 AI 作为上下文
+    replied_frost_text = None
+    reply_to = getattr(msg, "reply_to_message", None)
+    if reply_to and getattr(reply_to, "from_user", None) and reply_to.from_user.id == bot.id:
+        replied_frost_text = (reply_to.text or reply_to.caption or "").strip()
     if not KIMI_API_KEY:
         try:
             await bot.send_message(
@@ -1568,12 +1587,15 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
         from openai import AsyncOpenAI
         print(f"[PTB] 霜刃: 调用 Kimi API model={KIMI_MODEL}")
         client = AsyncOpenAI(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL)
+        messages = [
+            {"role": "system", "content": "你是一个冷酷的女杀手，沉默寡言。你的老板是小熊。回答严格控制在15字以内，尽量一句话。复杂或不好回复的问题可以回复：小助理，你来回答"},
+        ]
+        if replied_frost_text:
+            messages.append({"role": "assistant", "content": replied_frost_text})
+        messages.append({"role": "user", "content": query})
         resp = await client.chat.completions.create(
             model=KIMI_MODEL,
-            messages=[
-                {"role": "system", "content": "你是一个冷酷的女杀手，沉默寡言。你的老板是小熊。回答控制在15字以内，尽量一句话。复杂问题时可回复\"不知道\"，\"小助理，你来回答\"，\"......\"，\"无可奉告\""},
-                {"role": "user", "content": text},
-            ],
+            messages=messages,
             temperature=0.6,
             max_tokens=1024,
         )
@@ -1592,7 +1614,7 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
                 if str(_xhbot) not in sys.path:
                     sys.path.insert(0, str(_xhbot))
                 from handoff import put_handoff
-                ok = put_handoff(int(chat_id), msg.message_id, text)
+                ok = put_handoff(int(chat_id), msg.message_id, query)
                 print(f"[PTB] 霜刃: 已转交小助理")
             except ImportError as e:
                 print(f"[PTB] 霜刃: handoff 导入失败，改为直接回复: {e}")
@@ -2246,7 +2268,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         if not in_target:
             not_found_lines.append("• 群不在监控 — 该群未在 GROUP_ID 中，消息不会被处理")
         not_found_lines.extend([
-            "• 霜刃唤醒 — 含「霜刃」或@霜刃的消息不建记录",
+            "• 霜刃唤醒 — 以「霜刃，」开头、@霜刃、或回复霜刃的消息不建记录",
             "• 非文本消息 — 纯贴纸、纯图(无说明)、语音、视频等不建记录",
             "• 验证码消息 — 用户发的验证码(对/错)不单独建记录",
         ])
@@ -2289,7 +2311,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         flow_lines.append(f"{prefix} {label} → {result}")
     trigger_map = {
         "spam_text": "消息垃圾关键词", "spam_name": "昵称垃圾关键词",
-        "ad": "广告链接", "emoji": "消息/昵称含表情", "reply_other_chat": "引用非本群消息", "blacklist": "黑名单账号",
+        "ad": "广告链接", "emoji": "消息/昵称含表情", "sticker": "贴纸", "reply_other_chat": "引用非本群消息", "blacklist": "黑名单账号",
         "not_in_required_group": "未加入指定群组",
         "normal": "正常消息", "ai_trigger": "霜刃 AI 唤醒",
     }
@@ -2446,6 +2468,7 @@ def _ptb_main():
     # 分两个 handler 避免 filters.TEXT | filters.CAPTION 在某些 PTB 版本的兼容性问题
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.CAPTION, group_message_handler))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.Sticker.ALL, group_message_handler))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("reload", cmd_reload))
