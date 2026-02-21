@@ -1610,6 +1610,11 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
         )
         if is_handoff:
             try:
+                await bot.send_message(
+                    chat_id=int(chat_id),
+                    text=handoff_phrase,
+                    reply_to_message_id=msg.message_id,
+                )
                 _xhbot = _BASE.parent
                 if str(_xhbot) not in sys.path:
                     sys.path.insert(0, str(_xhbot))
