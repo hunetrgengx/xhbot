@@ -1047,9 +1047,10 @@ async def _is_frost_trigger(msg, text: str, bot) -> bool:
 
 
 # 含 emoji 检测：Unicode 常见 emoji 范围，预编译正则一次
+# 补充 U+1F200-1F2FF（Enclosed Ideographic Supplement，含 🈳🈶🈷️ 等）
 _EMOJI_PATTERN = re.compile(
-    r'[\U00002600-\U000027BF\U0001F300-\U0001F5FF\U0001F600-\U0001F64F'
-    r'\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF\U0001F1E0-\U0001F1FF]',
+    r'[\U00002600-\U000027BF\U0001F200-\U0001F2FF\U0001F300-\U0001F5FF'
+    r'\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF\U0001F1E0-\U0001F1FF]',
     re.UNICODE,
 )
 
@@ -1345,8 +1346,10 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if len(_last_message_by_user) % 100 == 0:  # 每 100 条消息清理一次过期缓存
             _cleanup_expired_message_cache()
 
-    # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；白名单用户跳过缓存，确保离开 B 群后立即触发
-    if get_bgroup_ids_for_chat(chat_id) and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
+    # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；仅检验真实用户，机器人/频道消息跳过；白名单用户跳过缓存，确保离开 B 群后立即触发
+    is_bot = getattr(user, "is_bot", False)
+    is_channel_msg = getattr(msg, "sender_chat", None) is not None  # 频道/匿名管理员以群身份发的消息
+    if get_bgroup_ids_for_chat(chat_id) and not is_bot and not is_channel_msg and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group)")
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
@@ -1414,7 +1417,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if ENABLE_STICKER_CHECK and getattr(msg, "sticker", None):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(sticker)")
         await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到您发送了贴纸，请先完成人机验证。", "sticker")
+                                  "⚠️ 检测到有疑似广告风险，请先完成人机验证。", "sticker")
         return
 
     if _is_ad_message(msg):
