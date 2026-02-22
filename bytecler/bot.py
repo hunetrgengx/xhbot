@@ -74,6 +74,8 @@ TRIGGER_WINDOW_SECONDS = int(os.getenv("TRIGGER_WINDOW_SECONDS", "1200"))  # 20 
 # 含 emoji 的消息/昵称触发验证，0/false 关闭
 ENABLE_EMOJI_CHECK = os.getenv("ENABLE_EMOJI_CHECK", "1").lower() not in ("0", "false", "no")
 ENABLE_STICKER_CHECK = os.getenv("ENABLE_STICKER_CHECK", "1").lower() not in ("0", "false", "no")
+# 霜刃 AI 回复 N 秒后自动删除，0 表示不删除
+FROST_REPLY_DELETE_AFTER = int(os.getenv("FROST_REPLY_DELETE_AFTER", "0") or "0")
 
 
 def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
@@ -1314,6 +1316,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not user:
         print(f"[PTB] 群消息跳过(无记录): chat_id={chat_id} msg_id={msg.message_id} 无 from_user")
         return
+    # 关联频道发帖同步到群时，sender_chat 为频道；频道无法完成人机验证，直接跳过全部处理
+    if getattr(msg, "sender_chat", None) is not None:
+        return
+    # 机器人消息不参与验证逻辑，避免霜刃回复被误触发
+    if getattr(user, "is_bot", False):
+        return
     uid = user.id
     first_name = user.first_name or ""
     last_name = user.last_name or ""
@@ -1346,10 +1354,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if len(_last_message_by_user) % 100 == 0:  # 每 100 条消息清理一次过期缓存
             _cleanup_expired_message_cache()
 
-    # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；仅检验真实用户，机器人/频道消息跳过；白名单用户跳过缓存，确保离开 B 群后立即触发
+    # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；仅检验真实用户，机器人跳过；白名单用户跳过缓存，确保离开 B 群后立即触发（频道消息已在上方提前 return）
     is_bot = getattr(user, "is_bot", False)
-    is_channel_msg = getattr(msg, "sender_chat", None) is not None  # 频道/匿名管理员以群身份发的消息
-    if get_bgroup_ids_for_chat(chat_id) and not is_bot and not is_channel_msg and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
+    if get_bgroup_ids_for_chat(chat_id) and not is_bot and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group)")
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
@@ -1397,10 +1404,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 else:
                     left = VERIFY_FAIL_THRESHOLD - cnt
                     print(f"[PTB] 群消息: chat_id={chat_id} 验证码错误 msg_id={msg.message_id} [验证码消息不单独建记录]")
-                    try:
-                        await msg.delete()
-                    except Exception:
-                        pass
+                    await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "verify_wrong_code", retries=2)
                     vmsg = await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
                     asyncio.create_task(_delete_after(context.bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after(), user_msg_id=msg.message_id))
             return
@@ -1484,10 +1488,7 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
     if should_count:
         _required_group_warn_count[key] = new_ts
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, "required_group_trigger", retries=2)  # 立即删除用户触发消息，重试应对偶发失败
     full_name = f"{first_name} {last_name}".strip() or "用户"
     deleted_text = (msg.text or msg.caption or "").strip()
     if deleted_text:
@@ -1531,10 +1532,7 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     full_name = f"{first_name} {last_name}".strip() or "用户"
     if msg_preview.strip():
         _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview)
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2)  # 立即删除，重试应对偶发失败
     add_verification_record(
         chat_id, msg_id, user_id,
         full_name, getattr(msg.from_user, "username", None) or "",
@@ -1551,18 +1549,31 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after()))
 
 
+def _log_delete_failure(chat_id, msg_id: int, label: str, e: Exception):
+    """删除失败时输出日志，便于排查（常见原因：Bot 无删消息权限、消息超 48 小时）"""
+    print(f"[PTB] 删除消息失败 chat_id={chat_id} msg_id={msg_id} {label}: {type(e).__name__}: {e}")
+
+
+async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3):
+    """带重试的删除，应对 Telegram API 偶发失败（网络抖动、限流等）"""
+    for attempt in range(retries):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            return
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(2)  # 间隔 2 秒重试
+            else:
+                _log_delete_failure(chat_id, msg_id, label, e)
+
+
 async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None):
-    """sec 秒后删除 msg_id；若提供 user_msg_id，先尝试删除用户消息（90s 重试未删掉的触发消息）"""
+    """sec 秒后删除 msg_id；若提供 user_msg_id，先尝试删除用户消息（90s 重试未删掉的触发消息）。
+    删除失败会重试 3 次（间隔 2 秒），应对 API 偶发失败。若进程在 sleep 期间重启，任务丢失（无法避免）。"""
     await asyncio.sleep(sec)
     if user_msg_id is not None:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=user_msg_id)
-        except Exception:
-            pass
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-    except Exception:
-        pass
+        await _delete_message_with_retry(bot, chat_id, user_msg_id, "user_msg")
+    await _delete_message_with_retry(bot, chat_id, msg_id, "bot_msg")
 
 
 async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, first_name: str, last_name: str):
@@ -1578,11 +1589,13 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
         replied_frost_text = (reply_to.text or reply_to.caption or "").strip()
     if not KIMI_API_KEY:
         try:
-            await bot.send_message(
+            m = await bot.send_message(
                 chat_id=int(chat_id),
                 text="⚠️ 霜刃 AI 未配置：请在 bytecler/.env 中设置 OPENAI_API_KEY",
                 reply_to_message_id=msg.message_id,
             )
+            if FROST_REPLY_DELETE_AFTER > 0:
+                asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, FROST_REPLY_DELETE_AFTER))
         except Exception:
             pass
         return
@@ -1613,11 +1626,13 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
         )
         if is_handoff:
             try:
-                await bot.send_message(
+                hm = await bot.send_message(
                     chat_id=int(chat_id),
                     text=handoff_phrase,
                     reply_to_message_id=msg.message_id,
                 )
+                if FROST_REPLY_DELETE_AFTER > 0:
+                    asyncio.create_task(_delete_after(bot, int(chat_id), hm.message_id, FROST_REPLY_DELETE_AFTER))
                 _xhbot = _BASE.parent
                 if str(_xhbot) not in sys.path:
                     sys.path.insert(0, str(_xhbot))
@@ -1626,17 +1641,21 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
                 print(f"[PTB] 霜刃: 已转交小助理")
             except ImportError as e:
                 print(f"[PTB] 霜刃: handoff 导入失败，改为直接回复: {e}")
-                await bot.send_message(
+                fm = await bot.send_message(
                     chat_id=int(chat_id),
                     text=reply,
                     reply_to_message_id=msg.message_id,
                 )
+                if FROST_REPLY_DELETE_AFTER > 0:
+                    asyncio.create_task(_delete_after(bot, int(chat_id), fm.message_id, FROST_REPLY_DELETE_AFTER))
             return
-        await bot.send_message(
+        rm = await bot.send_message(
             chat_id=int(chat_id),
             text=reply,
             reply_to_message_id=msg.message_id,
         )
+        if FROST_REPLY_DELETE_AFTER > 0:
+            asyncio.create_task(_delete_after(bot, int(chat_id), rm.message_id, FROST_REPLY_DELETE_AFTER))
         print("[PTB] 霜刃: 已发送回复")
     except Exception as e:
         print(f"[PTB] 霜刃 AI 唤醒异常: {e}")
