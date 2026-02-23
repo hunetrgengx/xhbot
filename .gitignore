@@ -33,6 +33,7 @@ bytecler/spam_keywords.json
 bytecler/bgroup_config.json
 bytecler/target_groups.json
 bytecler/verified_users.*.json
+bytecler/debug/
 /tongbu.py
 /update.py
 /忽略/tongbu.py

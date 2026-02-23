@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 try:
     from dotenv import load_dotenv
@@ -51,8 +51,11 @@ SETTIME_CONFIG_PATH = _path("settime_config.json")
 BGROUP_CONFIG_PATH = _path("bgroup_config.json")  # 每群单独配置 B 群（仅一个）：{ "chat_id": "b_id" }，无全局
 LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 
-spam_keywords = {"text": {"exact": [], "match": [], "_ac": None, "_regex": []},
-                 "name": {"exact": [], "match": [], "_ac": None, "_regex": []},
+# 关键词三类：黑名单(命中直接删除)、待验证(命中触发人机验证)、白名单(管理员限制时不录入)
+spam_keywords = {"blacklist": {"text": {"exact": [], "match": [], "_ac": None, "_regex": []},
+                               "name": {"exact": [], "match": [], "_ac": None, "_regex": []}},
+                 "text": {"exact": [], "match": [], "_ac": None, "_regex": []},   # 待验证
+                 "name": {"exact": [], "match": [], "_ac": None, "_regex": []},   # 待验证
                  "bio": {"exact": [], "match": [], "_ac": None, "_regex": []},
                  "whitelist": {"name": {"exact": [], "match": [], "_regex": []},
                               "text": {"exact": [], "match": [], "_regex": []}}}
@@ -76,6 +79,13 @@ ENABLE_EMOJI_CHECK = os.getenv("ENABLE_EMOJI_CHECK", "1").lower() not in ("0", "
 ENABLE_STICKER_CHECK = os.getenv("ENABLE_STICKER_CHECK", "1").lower() not in ("0", "false", "no")
 # 霜刃 AI 回复 N 秒后自动删除，0 表示不删除
 FROST_REPLY_DELETE_AFTER = int(os.getenv("FROST_REPLY_DELETE_AFTER", "0") or "0")
+# 删除失败待重试队列：TTL 1 小时，最大 100 条，同群下条消息时顺带重试；单次每群最多重试 N 条
+PENDING_DELETE_RETRY_TTL = 3600
+PENDING_DELETE_RETRY_MAX = 100
+PENDING_DELETE_RETRY_PER_MSG = 3  # 每次同群消息最多重试条数，避免限流
+_pending_delete_retry: List[Tuple[str, int, int, float]] = []  # [(chat_id, msg_id, user_id, ts), ...]
+# 删除统计：立即删除成功/失败、重试成功/失败，每 6 小时输出到 debug/
+_delete_stats = {"immediate_success": 0, "immediate_fail": 0, "retry_success": 0, "retry_fail": 0}
 
 
 def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
@@ -137,6 +147,16 @@ def load_spam_keywords():
     try:
         with open(SPAM_KEYWORDS_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        # 黑名单：命中直接删除
+        bl = cfg.get("blacklist") or {}
+        for field in ("text", "name"):
+            fc = bl.get(field) or {}
+            ex, mt = _parse_field_keywords(fc)
+            spam_keywords["blacklist"][field]["exact"] = ex
+            spam_keywords["blacklist"][field]["match"] = mt
+            spam_keywords["blacklist"][field]["_ac"] = _build_ac(mt)
+            spam_keywords["blacklist"][field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+        # 待验证：text/name/bio
         for field in ("text", "name", "bio"):
             fc = cfg.get(field) or {}
             ex, mt = _parse_field_keywords(fc)
@@ -144,6 +164,7 @@ def load_spam_keywords():
             spam_keywords[field]["match"] = mt
             spam_keywords[field]["_ac"] = _build_ac(mt)
             spam_keywords[field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+        # 白名单：管理员限制时不录入
         wl = cfg.get("whitelist") or {}
         for field in ("name", "text"):
             fc = wl.get(field) or {}
@@ -158,6 +179,20 @@ def load_spam_keywords():
 def save_spam_keywords():
     try:
         cfg = {}
+        # 黑名单
+        bl_cfg = {}
+        for field in ("text", "name"):
+            kw = (spam_keywords.get("blacklist") or {}).get(field) or {}
+            exact = kw.get("exact") or []
+            match = []
+            for x in (kw.get("match") or []):
+                if x[0] == "str":
+                    match.append(x[1])
+                else:
+                    match.append(f"/{x[1].pattern}/")
+            bl_cfg[field] = {"exact": exact, "match": match}
+        cfg["blacklist"] = bl_cfg
+        # 待验证
         for field in ("text", "name", "bio"):
             kw = spam_keywords.get(field) or {}
             exact = kw.get("exact") or []
@@ -168,6 +203,7 @@ def save_spam_keywords():
                 else:
                     match.append(f"/{x[1].pattern}/")
             cfg[field] = {"exact": exact, "match": match}
+        # 白名单
         wl_cfg = {}
         for field in ("name", "text"):
             kw = (spam_keywords.get("whitelist") or {}).get(field) or {}
@@ -209,6 +245,29 @@ def _keyword_exists_in_field(field: str, keyword: str, as_exact: bool, is_regex:
     if field not in ("text", "name", "bio"):
         return False
     kw = spam_keywords.get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    if as_exact:
+        return kw_lower in [s.lower() for s in (kw.get("exact") or [])]
+    if is_regex:
+        try:
+            pat = keyword.strip()
+            if pat.startswith("/") and pat.endswith("/"):
+                pat = pat[1:-1]
+            rx = re.compile(pat, re.I)
+            for x in (kw.get("match") or []):
+                if x[0] == "regex" and x[1].pattern == rx.pattern:
+                    return True
+        except re.error:
+            pass
+        return False
+    return kw_lower in [s.lower() for s in (x[1] for x in (kw.get("match") or []) if x[0] == "str")]
+
+
+def _keyword_exists_in_blacklist(field: str, keyword: str, as_exact: bool, is_regex: bool) -> bool:
+    """检查关键词是否已存在于黑名单"""
+    if field not in ("text", "name"):
+        return False
+    kw = (spam_keywords.get("blacklist") or {}).get(field) or {}
     kw_lower = (keyword or "").strip().lower()
     if as_exact:
         return kw_lower in [s.lower() for s in (kw.get("exact") or [])]
@@ -279,6 +338,10 @@ def add_spam_keyword(field: str, keyword: str, is_regex: bool = False, as_exact:
                 return True
         kw["match"] = (kw.get("match") or []) + [("str", keyword.strip().lower())]
     kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    # 添加入待验证时，自动从黑名单和白名单移出（三类关键词严格互斥）
+    if field in ("text", "name"):
+        remove_blacklist_keyword(field, keyword, is_regex=is_regex, as_exact=use_exact)
+        _remove_whitelist_keyword(field, keyword, is_regex=is_regex, as_exact=use_exact)
     return True
 
 
@@ -341,6 +404,92 @@ def check_spam_text(text: str) -> Optional[str]:
 def check_spam_name(first_name: str, last_name: str) -> Optional[str]:
     name = ((first_name or "") + " " + (last_name or "")).strip()
     return _check_field(spam_keywords.get("name") or {}, name)
+
+
+def check_blacklist_text(text: str) -> Optional[str]:
+    """黑名单关键词：命中直接删除，并将用户加入黑名单"""
+    return _check_field((spam_keywords.get("blacklist") or {}).get("text") or {}, text or "")
+
+
+def check_blacklist_name(first_name: str, last_name: str) -> Optional[str]:
+    """黑名单关键词：命中直接删除，并将用户加入黑名单"""
+    name = ((first_name or "") + " " + (last_name or "")).strip()
+    return _check_field((spam_keywords.get("blacklist") or {}).get("name") or {}, name)
+
+
+def add_blacklist_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    """添加黑名单关键词。field: text | name"""
+    if field not in ("text", "name"):
+        return False
+    spam_keywords.setdefault("blacklist", {})
+    spam_keywords["blacklist"].setdefault(field, {"exact": [], "match": [], "_ac": None, "_regex": []})
+    kw = spam_keywords["blacklist"][field]
+    kw_lower = (keyword or "").strip().lower()
+    use_exact = as_exact if as_exact is not None else (not is_regex)
+    if is_regex:
+        if not (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2):
+            return False
+        try:
+            rx = re.compile(keyword[1:-1], re.I)
+        except re.error:
+            return False
+        for x in (kw.get("match") or []):
+            if x[0] == "regex" and x[1].pattern == rx.pattern:
+                return True
+        kw["match"] = (kw.get("match") or []) + [("regex", rx)]
+        kw["_regex"] = [x[1] for x in (kw.get("match") or []) if x[0] == "regex"]
+    elif use_exact:
+        if kw_lower in [s.lower() for s in (kw.get("exact") or [])]:
+            return True
+        kw["exact"] = (kw.get("exact") or []) + [keyword.strip()]
+    else:
+        for x in (kw.get("match") or []):
+            if x[0] == "str" and x[1].lower() == kw_lower:
+                return True
+        kw["match"] = (kw.get("match") or []) + [("str", keyword.strip().lower())]
+    kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    # 添加入黑名单时，自动从待验证关键词和白名单移出
+    remove_spam_keyword(field, keyword, is_regex=is_regex, as_exact=use_exact)
+    _remove_whitelist_keyword(field, keyword, is_regex=is_regex, as_exact=use_exact)
+    return True
+
+
+def remove_blacklist_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    if field not in ("text", "name"):
+        return False
+    kw = (spam_keywords.get("blacklist") or {}).get(field)
+    if not kw:
+        return False
+    if as_exact is None:
+        as_exact = not is_regex
+    kw_lower = (keyword or "").strip().lower()
+    if is_regex:
+        pat = (keyword or "").strip()
+        if pat.startswith("/") and pat.endswith("/"):
+            pat = pat[1:-1]
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error:
+            return False
+        mt = [x for x in (kw.get("match") or []) if not (x[0] == "regex" and x[1].pattern == rx.pattern)]
+        if len(mt) == len(kw.get("match") or []):
+            return False
+        kw["match"] = mt
+        kw["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+    elif as_exact:
+        ex = [s for s in (kw.get("exact") or []) if s.lower() != kw_lower]
+        if len(ex) == len(kw.get("exact") or []):
+            return False
+        kw["exact"] = ex
+    else:
+        mt = [x for x in (kw.get("match") or []) if not (x[0] == "str" and x[1].lower() == kw_lower)]
+        if len(mt) == len(kw.get("match") or []):
+            return False
+        kw["match"] = mt
+        kw["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+    kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    spam_keywords.setdefault("blacklist", {})[field] = kw
+    return True
 
 
 def load_verified_users():
@@ -597,6 +746,23 @@ def get_verification_record(chat_id: str, message_id: int) -> dict | None:
     return _verification_records.get(k)
 
 
+def _log_verification_outcome(chat_id: str, msg_id: int, verification_passed: str):
+    """人机验证完成时，将 verification_passed 写入 bio_calls.jsonl（仅人机验证类型，不含 B 群）"""
+    rec = get_verification_record(chat_id, msg_id)
+    if not rec:
+        return
+    reason = rec.get("trigger_reason") or ""
+    if reason == "not_in_required_group":
+        return  # B 群校验，非人机验证
+    content = (rec.get("msg_preview") or "").strip()
+    if not content:
+        return
+    user_id = rec.get("user_id", 0)
+    full_name = rec.get("full_name") or "用户"
+    trigger_type = f"verify:{reason}" if reason else "verify:unknown"
+    _log_deleted_content(user_id, full_name, content, trigger_type=trigger_type, verification_passed=verification_passed)
+
+
 def save_verification_blacklist():
     try:
         with open(VERIFICATION_BLACKLIST_PATH, "w", encoding="utf-8") as f:
@@ -709,6 +875,11 @@ DELETED_CONTENT_LOG_PATH = _BASE / "bio_calls.jsonl"  # 被删除文案记录：
 VERIFY_TIMEOUT = 90
 VERIFY_MSG_DELETE_AFTER = 30
 REQUIRED_GROUP_MSG_DELETE_AFTER = 90  # 入群验证消息 90 秒后自动删除；可通过 /settime 配置
+# B 群合并警告：30s 窗口内多用户合并为一条；合并消息 30s 后删除
+BGROUP_MERGE_WINDOW_SEC = 30
+BGROUP_MERGE_MSG_DELETE_AFTER = 30
+# chat_id -> {"users": [(user_id, full_name, ts, cnt)], "msg_id": int}
+_bgroup_merge_state: dict = {}
 
 _settime_config: dict = {}  # {"required_group_msg_delete_after": 90, "verify_msg_delete_after": 30}
 
@@ -992,6 +1163,9 @@ async def _get_required_group_buttons(bot, chat_id: str) -> list[tuple[str, str]
         if cached and len(cached) >= 3 and (now - cached[2]) <= _REQUIRED_GROUP_INFO_CACHE_TTL:
             result.append((cached[0], cached[1]))
             continue
+        # 读时若过期则删除该 key 再重新拉取，避免 dict 残留过期数据
+        if cached:
+            _required_group_info_cache.pop(b_id, None)
         try:
             chat = await bot.get_chat(chat_id=int(b_id))
             title = (getattr(chat, "title", None) or "").strip() or f"群组 {b_id}"
@@ -1115,8 +1289,10 @@ def _log_restriction(chat_id: str, user_id: int, full_name: str, action: str, un
         print(f"[PTB] 记录封禁日志失败: {e}")
 
 
-def _log_deleted_content(user_id: int, full_name: str, deleted_content: str):
-    """记录被删除的文案到 bio_calls.jsonl：time, user_id, full_name, deleted_content"""
+def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, trigger_type: str = "", verification_passed: Optional[str] = None):
+    """记录被删除的文案到 bio_calls.jsonl：time, user_id, full_name, deleted_content, trigger_type, verification_passed
+    trigger_type: bgroup | blacklist_text | blacklist_name | verify:ad | verify:emoji | verify:sticker | verify:spam_text | verify:spam_name | verify:blacklist | verify:reply_other_chat | admin_restrict
+    verification_passed: 仅人机验证时有效，pending=待验证 | true=通过 | false=未通过"""
     content = (deleted_content or "").strip()
     if not content:
         return
@@ -1126,7 +1302,10 @@ def _log_deleted_content(user_id: int, full_name: str, deleted_content: str):
             "user_id": user_id,
             "full_name": full_name or "",
             "deleted_content": content[:500],
+            "trigger_type": trigger_type or "",
         }
+        if verification_passed is not None:
+            rec["verification_passed"] = verification_passed
         with open(DELETED_CONTENT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -1183,6 +1362,9 @@ def _add_whitelist_keyword(field: str, keyword: str, is_regex: bool = False, as_
                 return True
         wl.setdefault("match", []).append(("str", kw_lower))
     wl["_regex"] = [x[1] for x in (wl.get("match") or []) if x[0] == "regex"]
+    # 添加入白名单时，自动从待验证关键词和黑名单移出
+    remove_spam_keyword(field, keyword, is_regex=is_regex, as_exact=use_exact)
+    remove_blacklist_keyword(field, keyword, is_regex=is_regex, as_exact=use_exact)
     return True
 
 
@@ -1240,7 +1422,7 @@ def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
     else:
         print(f"[PTB] 管理员操作: 用户 {user_id} 无消息缓存(可能仅发过图/贴纸/无文字，或 bot 重启后未收到其新消息)，未加入 text 关键词")
     if msg_text:
-        _log_deleted_content(user_id, full_name, msg_text)
+        _log_deleted_content(user_id, full_name, msg_text, trigger_type="admin_restrict")
         msg_text = msg_text[:200]  # 截断避免过长
         if not _is_in_keyword_whitelist("text", msg_text):
             as_exact_text = len(msg_text) <= 2
@@ -1312,6 +1494,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         print(f"[PTB] 群消息跳过(无记录): chat_id={chat_id} 不在监控列表")
         return
 
+    # 同群触发：顺带重试该群待删除队列（立即删除偶发失败时的补充）
+    await _retry_pending_deletes_for_chat(context.bot, chat_id)
+
     user = msg.from_user
     if not user:
         print(f"[PTB] 群消息跳过(无记录): chat_id={chat_id} msg_id={msg.message_id} 无 from_user")
@@ -1366,6 +1551,32 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text or "", first_name, last_name)
         return
 
+    # 黑名单关键词：命中直接删除，并将用户加入黑名单
+    hit_bl_text = check_blacklist_text(text)
+    hit_bl_name = check_blacklist_name(first_name, last_name)
+    if hit_bl_text:
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 黑名单关键词(text) 直接删除+加黑 hit={hit_bl_text}")
+        add_to_blacklist(uid)
+        save_verified_users()
+        save_verification_blacklist()
+        full_name = f"{first_name} {last_name}".strip() or "用户"
+        msg_preview = (text or "")[:200]
+        if msg_preview.strip():
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="blacklist_text")
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_text", retries=2, clear_cache_key=(chat_id, uid))
+        return
+    if hit_bl_name:
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 黑名单关键词(name) 直接删除+加黑 hit={hit_bl_name}")
+        add_to_blacklist(uid)
+        save_verified_users()
+        save_verification_blacklist()
+        full_name = f"{first_name} {last_name}".strip() or "用户"
+        msg_preview = (text or "")[:200]
+        if msg_preview.strip():
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="blacklist_name")
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_name", retries=2, clear_cache_key=(chat_id, uid))
+        return
+
     if uid in verified_users:
         add_verification_record(
             chat_id, msg.message_id, uid,
@@ -1387,6 +1598,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 if msg_id is not None:
                     update_verification_record(chat_id, msg_id, "passed")
                     save_verification_records()
+                    _schedule_sync_background(_log_verification_outcome, chat_id, msg_id, "true")
                 else:
                     print(f"[PTB] 警告: 验证通过但 msg_id 为空，跳过记录更新 chat_id={chat_id} uid={uid}")
                 add_verified_user(uid, user.username, f"{first_name} {last_name}".strip())
@@ -1404,9 +1616,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 else:
                     left = VERIFY_FAIL_THRESHOLD - cnt
                     print(f"[PTB] 群消息: chat_id={chat_id} 验证码错误 msg_id={msg.message_id} [验证码消息不单独建记录]")
-                    await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "verify_wrong_code", retries=2)
+                    await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "verify_wrong_code", retries=2, clear_cache_key=(chat_id, uid))
                     vmsg = await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
-                    asyncio.create_task(_delete_after(context.bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after(), user_msg_id=msg.message_id))
+                    asyncio.create_task(_delete_after(context.bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after(), user_msg_id=msg.message_id, user_cache_key=(chat_id, uid)))
             return
         # 超时 = 未完成验证，计 1 次失败，杜绝「间隔发违禁词」规避限制
         cnt = increment_verification_failures(chat_id, uid)
@@ -1481,14 +1693,15 @@ def _cleanup_required_group_warn_count():
 
 
 async def _start_required_group_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str):
-    """未加入 B 群时：删除消息，发送带按钮的警告，冷却+窗口内 5 次后限制"""
+    """未加入 B 群时：删除消息，发送带按钮的警告。30s 窗口内多用户合并为一条，替换时删旧发新，合并消息 30s 后删除。"""
+    global _bgroup_merge_state
     _cleanup_required_group_warn_count()
     key = (chat_id, user_id)
     ts_list = _required_group_warn_count.get(key, [])
     should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
     if should_count:
         _required_group_warn_count[key] = new_ts
-    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, "required_group_trigger", retries=2)  # 立即删除用户触发消息，重试应对偶发失败
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, "required_group_trigger", retries=2, clear_cache_key=(chat_id, user_id))
     full_name = f"{first_name} {last_name}".strip() or "用户"
     deleted_text = (msg.text or msg.caption or "").strip()
     if deleted_text:
@@ -1508,20 +1721,36 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         save_verification_blacklist()
         await _restrict_and_notify(bot, chat_id, user_id, full_name, msg.message_id, restrict_hours=REQUIRED_GROUP_RESTRICT_HOURS)
         return
+
+    now = time.time()
+    cutoff = now - BGROUP_MERGE_WINDOW_SEC
+    state = _bgroup_merge_state.get(chat_id) or {}
+    prev_users: list = state.get("users") or []
+    prev_msg_id = state.get("msg_id")
+    # 过滤过期用户，保留 30s 内的
+    users_in_window = [(uid, name, t, c) for (uid, name, t, c) in prev_users if t > cutoff]
+    # 加入当前用户（若已在列表中则更新）
+    users_in_window = [(uid, name, t, c) for (uid, name, t, c) in users_in_window if uid != user_id]
+    users_in_window.append((user_id, full_name, now, cnt))
+
+    # 删除旧的合并消息（若存在）
+    if prev_msg_id is not None:
+        await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "bgroup_merge_replace", retries=1)
+
+    # 构建合并文案
+    lines = [f"【{name}】• 警告({c}/{VERIFY_FAIL_THRESHOLD})" for (_, name, _, c) in users_in_window]
+    body = "\n".join(lines) + "\n\n请以上用户先关注如下频道或加入群组后才能发言。\n\n本消息将于30s后删除"
     rows = []
     for title, link in await _get_required_group_buttons(bot, chat_id):
         if link:
             rows.append([InlineKeyboardButton(title, url=link)])
-    cb_data = f"reqgrp_unr:{chat_id}:{user_id}"
+    cb_data = f"reqgrp_unr:{chat_id}:0"
     if len(cb_data) <= 64:
         rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
     reply_markup = InlineKeyboardMarkup(rows) if rows else None
-    vmsg = await bot.send_message(
-        chat_id=int(chat_id),
-        text=f"【{full_name}】\n\n请先关注如下频道或加入群组后才能发言 。\n\n• 警告({cnt}/{VERIFY_FAIL_THRESHOLD})\n\n本条消息{_get_required_group_msg_delete_after()}秒后自动删除",
-        reply_markup=reply_markup,
-    )
-    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, _get_required_group_msg_delete_after(), user_msg_id=msg.message_id))
+    vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
+    _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id}
+    asyncio.create_task(_delete_bgroup_merge_after(bot, int(chat_id), vmsg.message_id, chat_id))
 
 
 async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, intro: str, trigger_reason: str = "", hit_keyword: str = ""):
@@ -1531,8 +1760,8 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     raw_body = _serialize_message_body(msg)
     full_name = f"{first_name} {last_name}".strip() or "用户"
     if msg_preview.strip():
-        _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview)
-    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2)  # 立即删除，重试应对偶发失败
+        _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview, trigger_type=f"verify:{trigger_reason}" if trigger_reason else "verify:unknown", verification_passed="pending")
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2, clear_cache_key=(chat_id, user_id))
     add_verification_record(
         chat_id, msg_id, user_id,
         full_name, getattr(msg.from_user, "username", None) or "",
@@ -1554,25 +1783,83 @@ def _log_delete_failure(chat_id, msg_id: int, label: str, e: Exception):
     print(f"[PTB] 删除消息失败 chat_id={chat_id} msg_id={msg_id} {label}: {type(e).__name__}: {e}")
 
 
-async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3):
-    """带重试的删除，应对 Telegram API 偶发失败（网络抖动、限流等）"""
+def _add_pending_delete_retry(chat_id: str, msg_id: int, user_id: int):
+    """删除失败时加入待重试队列，同群下条消息时顺带重试。user_id=0 表示 bot 消息。去重：同 (chat_id,msg_id) 不重复入队。TTL 1 小时，最大 100 条。"""
+    global _pending_delete_retry
+    if any((c, m) == (chat_id, msg_id) for (c, m, u, t) in _pending_delete_retry):
+        return
+    now = time.time()
+    cutoff = now - PENDING_DELETE_RETRY_TTL
+    _pending_delete_retry = [(c, m, u, t) for (c, m, u, t) in _pending_delete_retry if t > cutoff]
+    while len(_pending_delete_retry) >= PENDING_DELETE_RETRY_MAX:
+        _pending_delete_retry.pop(0)
+    _pending_delete_retry.append((chat_id, msg_id, user_id, now))
+
+
+async def _retry_pending_deletes_for_chat(bot, chat_id: str):
+    """同群触发：顺带重试该群待删除队列。方案B：重试成功时不释放缓存。单次最多重试 N 条。"""
+    global _pending_delete_retry, _delete_stats
+    now = time.time()
+    cutoff = now - PENDING_DELETE_RETRY_TTL
+    candidates = [(c, m, u, t) for (c, m, u, t) in _pending_delete_retry if c == chat_id and t > cutoff]
+    to_retry = candidates[:PENDING_DELETE_RETRY_PER_MSG]
+    remaining_this_chat = candidates[PENDING_DELETE_RETRY_PER_MSG:]
+    other_items = [(c, m, u, t) for (c, m, u, t) in _pending_delete_retry if c != chat_id or t <= cutoff]
+    for item in to_retry:
+        cid, msg_id, user_id, ts = item
+        try:
+            await bot.delete_message(chat_id=int(cid), message_id=msg_id)
+            _delete_stats["retry_success"] += 1
+        except Exception as e:
+            if "not found" in str(e).lower():
+                _delete_stats["retry_success"] += 1  # 消息已不存在，视为成功
+            else:
+                remaining_this_chat.append(item)
+                _delete_stats["retry_fail"] += 1
+    _pending_delete_retry = other_items + remaining_this_chat
+
+
+async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None) -> bool:
+    """带重试的删除，应对 Telegram API 偶发失败。成功时若提供 clear_cache_key 则释放该用户消息缓存。
+    失败时加入待重试队列（用户消息用 user_id，bot 消息用 0），同群下条消息时顺带重试。返回是否删除成功。"""
+    global _delete_stats
     for attempt in range(retries):
         try:
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            return
+            _delete_stats["immediate_success"] += 1
+            if clear_cache_key is not None:
+                _last_message_by_user.pop(clear_cache_key, None)
+            return True
         except Exception as e:
             if attempt < retries - 1:
                 await asyncio.sleep(2)  # 间隔 2 秒重试
             else:
                 _log_delete_failure(chat_id, msg_id, label, e)
+                _delete_stats["immediate_fail"] += 1
+                # 消息已不存在（如已被替换删除）时不入队，避免无效重试
+                if "not found" in str(e).lower():
+                    return False
+    user_id = clear_cache_key[1] if clear_cache_key is not None else 0  # 0 表示 bot 消息
+    _add_pending_delete_retry(str(chat_id), msg_id, user_id)
+    return False
 
 
-async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None):
-    """sec 秒后删除 msg_id；若提供 user_msg_id，先尝试删除用户消息（90s 重试未删掉的触发消息）。
-    删除失败会重试 3 次（间隔 2 秒），应对 API 偶发失败。若进程在 sleep 期间重启，任务丢失（无法避免）。"""
+async def _delete_bgroup_merge_after(bot, chat_id: int, msg_id: int, chat_id_str: str):
+    """B 群合并消息 30s 后删除，并清理 state（若未被替换）"""
+    global _bgroup_merge_state
+    await asyncio.sleep(BGROUP_MERGE_MSG_DELETE_AFTER)
+    await _delete_message_with_retry(bot, chat_id, msg_id, "bgroup_merge")
+    state = _bgroup_merge_state.get(chat_id_str)
+    if state and state.get("msg_id") == msg_id:
+        _bgroup_merge_state.pop(chat_id_str, None)
+
+
+async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None, user_cache_key: Optional[tuple[str, int]] = None):
+    """sec 秒后删除 msg_id；若提供 user_msg_id，先尝试删除用户消息（重试未删掉的触发消息）。
+    删除失败会重试 3 次。user_cache_key：删除用户消息成功时释放该缓存。若进程在 sleep 期间重启，任务丢失（无法避免）。"""
     await asyncio.sleep(sec)
     if user_msg_id is not None:
-        await _delete_message_with_retry(bot, chat_id, user_msg_id, "user_msg")
+        await _delete_message_with_retry(bot, chat_id, user_msg_id, "user_msg", clear_cache_key=user_cache_key)
     await _delete_message_with_retry(bot, chat_id, msg_id, "bot_msg")
 
 
@@ -1681,6 +1968,7 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
     if msg_id is not None:
         update_verification_record(chat_id, msg_id, "failed_restricted", fail_count=VERIFY_FAIL_THRESHOLD)
         save_verification_records()
+        _schedule_sync_background(_log_verification_outcome, chat_id, msg_id, "false")
     add_to_blacklist(user_id)
     save_verified_users()
     save_verification_blacklist()
@@ -1782,7 +2070,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
-        "• /add_text、/add_name — 多轮添加（直接输入=子串，/前缀=精确，已存在则删除，/cancel 结束）\n"
+        "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
         "• /add_group — 添加霜刃可用群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
         "• /cancel — 取消当前操作\n"
         "• /help — 本帮助\n"
@@ -1790,8 +2078,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /start — 启动\n"
         "• /settime — 配置关联群验证/人机验证消息自动删除时间\n"
         "• 群内 /setlimit — 配置本群 B 群/频道（需加入才能发言），仅拥有「可添加管理员」权限的管理员可配置；/clearlimit 删除\n"
-        "• /kw_text、/kw_name add/remove — 关键词增删\n"
-        "• /wl_name、/wl_text — 关键词白名单（管理员限制用户时不录入这些昵称/消息）\n"
+        "• /kw_text、/kw_name add/remove — 待验证关键词（命中触发人机验证）\n"
+        "• /kw_blacklist_text、/kw_blacklist_name add/remove — 黑名单关键词（命中直接删除+加黑）\n"
+        "• /wl_name、/wl_text — 白名单（管理员限制用户时不录入这些昵称/消息）\n"
         "• 发送群消息链接 — 查看该消息的验证过程\n\n"
         "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
     )
@@ -1807,9 +2096,10 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_verification_blacklist()
     _load_bgroup_config()
     _load_target_groups()
-    await update.message.reply_text("已重载 spam_keywords、白名单、黑名单、B群配置、监控群列表")
+    await update.message.reply_text("已重载 关键词(黑名单/待验证/白名单)、用户黑名单、B群配置、监控群列表")
 
 pending_keyword_cmd = {}
+pending_keyword_confirm = {}  # confirm_id -> {uid, field, kw, as_exact, is_regex, label} 关键词已存在时等待用户确认是否移除
 pending_settime_cmd = {}  # uid -> {"type": "required_group"|"verify"}
 pending_add_group: dict[int, dict] = {}  # uid -> {timestamp}，/add_group 两段式
 PENDING_ADD_GROUP_TIMEOUT = 120
@@ -1879,6 +2169,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif uid in pending_keyword_cmd:
         pending_keyword_cmd.pop(uid, None)
         await update.message.reply_text("已取消")
+    elif any(v.get("uid") == uid for v in pending_keyword_confirm.values()):
+        to_pop = [k for k, v in pending_keyword_confirm.items() if v.get("uid") == uid]
+        for k in to_pop:
+            pending_keyword_confirm.pop(k, None)
+        await update.message.reply_text("已取消")
     elif uid in pending_settime_cmd:
         pending_settime_cmd.pop(uid, None)
         await update.message.reply_text("已取消")
@@ -1891,6 +2186,52 @@ async def cmd_kw_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_kw(update, context, "name", "昵称")
 async def cmd_kw_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("bio 简介关键词暂未启用")
+
+
+async def cmd_kw_blacklist_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_kw_blacklist(update, context, "text", "消息")
+async def cmd_kw_blacklist_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_kw_blacklist(update, context, "name", "昵称")
+
+
+async def _cmd_kw_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
+    """黑名单关键词管理：命中直接删除并将用户加入黑名单。add/remove/list"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    args = (context.args or [])
+    if len(args) >= 1 and args[0].lower() == "list":
+        kw = (spam_keywords.get("blacklist") or {}).get(field) or {}
+        ex = kw.get("exact") or []
+        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
+        txt = f"【{label}黑名单】命中直接删除+加黑\nexact: {ex or '无'}\nmatch: {mt or '无'}"
+        await update.message.reply_text(txt)
+        return
+    if len(args) >= 2:
+        op, kw = args[0].lower(), " ".join(args[1:]).strip()
+        is_regex = kw.startswith("/") and kw.endswith("/") and len(kw) > 2
+        if op == "add" and kw:
+            if add_blacklist_keyword(field, kw, is_regex=is_regex):
+                save_spam_keywords()
+                await update.message.reply_text(f"已添加「{kw}」到{label}黑名单（命中直接删除+加黑）")
+            else:
+                await update.message.reply_text("添加失败（可能已存在或正则无效）")
+        elif op == "remove" and kw:
+            if remove_blacklist_keyword(field, kw, is_regex=is_regex):
+                save_spam_keywords()
+                await update.message.reply_text(f"已从{label}黑名单移除「{kw}」")
+            else:
+                await update.message.reply_text("移除失败（可能不存在）")
+        else:
+            await update.message.reply_text(f"用法: /kw_blacklist_{field} add 关键词  或  /kw_blacklist_{field} remove 关键词  或  /kw_blacklist_{field} list")
+    else:
+        await update.message.reply_text(
+            f"【{label}黑名单】命中直接删除并将用户加入黑名单\n"
+            f"add 关键词 — 添加\nremove 关键词 — 移除\nlist — 查看\n"
+            f"例: /kw_blacklist_{field} add 违禁词"
+        )
 
 
 async def cmd_wl_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1935,7 +2276,7 @@ async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
     else:
         await update.message.reply_text(
             f"【{label}白名单】管理员限制用户时不录入这些\n"
-            f"add 关键词 — 添加（直接输入=子串，/前缀=精确，/正则/=正则）\n"
+            f"add 关键词 — 添加（自动从待验证/黑名单移出）\n"
             f"remove 关键词 — 移除\n"
             f"list — 查看\n"
             f"例: /wl_{field} add 测试用户"
@@ -1943,7 +2284,7 @@ async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
 
 
 async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """两段式多轮：直接输入=子串match，/前缀=精确exact，已存在则删除，/cancel 结束"""
+    """两段式多轮：添加消息黑名单关键词，命中直接删除+加黑。已存在则移除。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     if not is_admin(update.effective_user.id, ADMIN_IDS):
@@ -1951,12 +2292,14 @@ async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending_keyword_cmd[update.effective_user.id] = {"field": "text", "op": "add", "label": "消息", "multi": True, "timestamp": time.time()}
     await update.message.reply_text(
-        "【消息】关键词管理（多轮，/cancel 结束）\n"
+        "【消息黑名单】命中直接删除+加黑（多轮，/cancel 结束）\n"
         "• 直接输入如 加V → 子串匹配\n"
-        "• /加微信 或 / 加微信 → 精确匹配"
+        "• /加微信 → 精确匹配\n"
+        "• 已存在则移除，并自动从待验证/白名单移出"
     )
 
 async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """两段式多轮：添加昵称黑名单关键词，命中直接删除+加黑。已存在则移除。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     if not is_admin(update.effective_user.id, ADMIN_IDS):
@@ -1964,9 +2307,10 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending_keyword_cmd[update.effective_user.id] = {"field": "name", "op": "add", "label": "昵称", "multi": True, "timestamp": time.time()}
     await update.message.reply_text(
-        "【昵称】关键词管理（多轮，/cancel 结束）\n"
+        "【昵称黑名单】命中直接删除+加黑（多轮，/cancel 结束）\n"
         "• 直接输入 → 子串匹配\n"
-        "• /关键词 → 精确匹配"
+        "• /关键词 → 精确匹配\n"
+        "• 已存在则移除，并自动从待验证/白名单移出"
     )
 
 async def cmd_add_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2060,6 +2404,42 @@ async def callback_required_group_unrestrict(update: Update, context: ContextTyp
     for b_id in get_bgroup_ids_for_chat(chat_id_str):
         _user_in_required_group_cache.pop((clicker_id, b_id), None)
     await query.answer("已解禁", show_alert=True)
+
+
+async def callback_keyword_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 add_text/add_name 中关键词已存在时的「取消/移除」按钮"""
+    global pending_keyword_confirm
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("kw_confirm:"):
+        return
+    uid = query.from_user.id if query.from_user else 0
+    if not uid or not is_admin(uid, ADMIN_IDS):
+        await query.answer("无权限", show_alert=True)
+        return
+    parts = query.data.split(":", 2)  # kw_confirm:id:action
+    if len(parts) < 3:
+        await query.answer("数据格式错误", show_alert=True)
+        return
+    _, confirm_id, action = parts[0], parts[1], parts[2]
+    info = pending_keyword_confirm.pop(confirm_id, None)
+    if not info:
+        await query.answer("已超时或已处理", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    field, kw, label = info["field"], info["kw"], info["label"]
+    as_exact, is_regex = info.get("as_exact"), info.get("is_regex", False)
+    await query.answer()
+    if action == "cancel":
+        await query.edit_message_text(f"「{kw}」已取消移除", reply_markup=None)
+    elif action == "remove":
+        if remove_blacklist_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            await query.edit_message_text(f"已从{label}黑名单移除「{kw}」", reply_markup=None)
+        else:
+            await query.edit_message_text(f"移除「{kw}」失败（可能已不存在）", reply_markup=None)
 
 
 async def callback_raw_message_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2206,17 +2586,23 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("已取消" if not text else "请发送关键词")
             return
         as_exact, kw, is_regex = _parse_keyword_input(text)
-        exists = _keyword_exists_in_field(field, kw, as_exact, is_regex)
+        # add_text/add_name 添加黑名单关键词
+        exists = _keyword_exists_in_blacklist(field, kw, as_exact, is_regex)
         if exists:
-            if remove_spam_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
-                save_spam_keywords()
-                await update.message.reply_text(f"已移除「{kw}」")
-            else:
-                await update.message.reply_text("移除失败")
+            _cleanup_pending_keyword_confirm()  # 添加前清理超时条目
+            confirm_id = f"{int(time.time()*1000)}_{uid}"[:32]  # 唯一 id，避免多轮冲突
+            pending_keyword_confirm[confirm_id] = {"uid": uid, "field": field, "kw": kw, "as_exact": as_exact, "is_regex": is_regex, "label": label, "ts": time.time()}
+            rows = [
+                [InlineKeyboardButton("取消", callback_data=f"kw_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"kw_confirm:{confirm_id}:remove")]
+            ]
+            await update.message.reply_text(
+                f"「{kw}」已在{label}黑名单中，是否移除？",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
         else:
-            if add_spam_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+            if add_blacklist_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
                 save_spam_keywords()
-                reply = f"已添加「{kw}」（{'精确' if as_exact else '子串'}）"
+                reply = f"已添加「{kw}」到{label}黑名单（命中直接删除+加黑）"
                 if multi:
                     reply += "。继续发送关键词，/cancel 结束"
                 await update.message.reply_text(reply)
@@ -2395,6 +2781,61 @@ async def _job_frost_reply(context: ContextTypes.DEFAULT_TYPE):
         print(f"[PTB] frost_reply 处理失败: {e}")
 
 
+PENDING_KEYWORD_CONFIRM_TIMEOUT = 120  # 关键词已存在确认按钮 120 秒超时
+
+
+def _cleanup_pending_keyword_confirm():
+    """清理超时的 pending_keyword_confirm 条目"""
+    global pending_keyword_confirm
+    now = time.time()
+    cutoff = now - PENDING_KEYWORD_CONFIRM_TIMEOUT
+    to_pop = [k for k, v in pending_keyword_confirm.items() if (v.get("ts") or 0) <= cutoff]
+    for k in to_pop:
+        pending_keyword_confirm.pop(k, None)
+
+
+async def _job_cleanup_pending_keyword_confirm(context: ContextTypes.DEFAULT_TYPE):
+    """定时清理超时的 pending_keyword_confirm"""
+    _cleanup_pending_keyword_confirm()
+
+
+async def _job_delete_stats(context: ContextTypes.DEFAULT_TYPE):
+    """每 6 小时输出删除统计到 bytecler/debug/delete_stats_*.json"""
+    global _delete_stats, _pending_delete_retry
+    try:
+        debug_dir = _BASE / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        fpath = debug_dir / f"delete_stats_{ts}.json"
+        imm_s = _delete_stats["immediate_success"]
+        imm_f = _delete_stats["immediate_fail"]
+        ret_s = _delete_stats["retry_success"]
+        ret_f = _delete_stats["retry_fail"]
+        total_imm = imm_s + imm_f
+        total_ret = ret_s + ret_f
+        rate_imm = (imm_s / total_imm * 100) if total_imm else 0
+        rate_ret = (ret_s / total_ret * 100) if total_ret else 0
+        total_del = imm_s + ret_s
+        data = {
+            "ts": ts,
+            "immediate_success": imm_s,
+            "immediate_fail": imm_f,
+            "immediate_total": total_imm,
+            "immediate_rate_pct": round(rate_imm, 2),
+            "retry_success": ret_s,
+            "retry_fail": ret_f,
+            "retry_total": total_ret,
+            "retry_rate_pct": round(rate_ret, 2),
+            "total_deleted": total_del,
+            "pending_queue_len": len(_pending_delete_retry),
+        }
+        with open(fpath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[PTB] 删除统计已写入 {fpath}")
+    except Exception as e:
+        print(f"[PTB] 删除统计写入失败: {e}")
+
+
 def _is_sync_success(msg: str) -> bool:
     """判断抽奖同步是否成功"""
     return ("同步" in msg and "个中奖用户" in msg) or "无新中奖用户" in msg
@@ -2503,6 +2944,8 @@ def _ptb_main():
     app.add_handler(CommandHandler("kw_text", cmd_kw_text))
     app.add_handler(CommandHandler("kw_name", cmd_kw_name))
     app.add_handler(CommandHandler("kw_bio", cmd_kw_bio))
+    app.add_handler(CommandHandler("kw_blacklist_text", cmd_kw_blacklist_text))
+    app.add_handler(CommandHandler("kw_blacklist_name", cmd_kw_blacklist_name))
     app.add_handler(CommandHandler("wl_name", cmd_wl_name))
     app.add_handler(CommandHandler("wl_text", cmd_wl_text))
     app.add_handler(CommandHandler("add_text", cmd_add_text))
@@ -2514,12 +2957,15 @@ def _ptb_main():
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
     app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))
     app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
+    app.add_handler(CallbackQueryHandler(callback_keyword_confirm, pattern="^kw_confirm:"))
 
     jq = app.job_queue
     if jq:
         jq.run_repeating(_job_frost_reply, interval=2, first=2)
+        jq.run_repeating(_job_cleanup_pending_keyword_confirm, interval=60, first=60)  # 每 60 秒清理超时确认
         jq.run_daily(_job_lottery_sync, time=dt_time(20, 0))  # 20:00 UTC = 北京时间凌晨 4 点
-        print("[PTB] 定时任务已注册：抽奖同步 每日 20:00 UTC（北京时间 4:00）")
+        jq.run_repeating(_job_delete_stats, interval=21600, first=21600)  # 每 6 小时输出删除统计到 debug/
+        print("[PTB] 定时任务已注册：抽奖同步 每日 20:00 UTC；关键词确认清理 每 60 秒；删除统计 每 6 小时")
     else:
         print("[PTB] ⚠️ job_queue 为 None，定时任务未注册。请执行: pip install 'python-telegram-bot[job-queue]'")
 
