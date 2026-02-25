@@ -1000,22 +1000,29 @@ def _save_bgroup_config():
 
 
 def get_bgroup_ids_for_chat(chat_id: str) -> list:
-    """获取某群的 B 群 ID（仅一个）。无全局配置，未设置或设为空则返回 [] 表示不校验。"""
-    val = _bgroup_config.get(str(chat_id))
-    if val is None:
+    """获取某群的 B 群 ID（仅一个）。群级配置优先；未配置时回退到 REQUIRED_GROUP_ID（.env）；显式 /clearlimit 则不校验。"""
+    cid = str(chat_id)
+    if cid in _bgroup_config:
+        val = _bgroup_config[cid]
+        if val is None or (isinstance(val, str) and not val.strip()):
+            return []  # 显式 /clearlimit 后存空，表示不校验
+        s = str(val).strip()
+        if s and s.lstrip("-").isdigit():
+            return [s]
         return []
-    s = str(val).strip()
-    if not s or not s.lstrip("-").isdigit():
-        return []
-    return [s]
+    # 未配置群级时使用全局 B 群（与注释一致）
+    if REQUIRED_GROUP_ID and REQUIRED_GROUP_ID.lstrip("-").isdigit():
+        return [REQUIRED_GROUP_ID]
+    return []
 
 
 def set_bgroup_for_chat(chat_id: str, b_id: str | None) -> bool:
-    """设置某群的 B 群。b_id: 群 ID 字符串，None/空 表示不校验（删除配置）。"""
+    """设置某群的 B 群。b_id: 群 ID 字符串，None/空 表示不校验（显式禁用，存空以区分「未配置」）。"""
     cid = str(chat_id)
     if b_id is None or (isinstance(b_id, str) and not b_id.strip()):
         if cid in _bgroup_config:
-            del _bgroup_config[cid]
+            # 存空表示「显式不校验」，与「从未配置」区分（后者会回退到 REQUIRED_GROUP_ID）
+            _bgroup_config[cid] = ""
             _save_bgroup_config()
             return True
         return False
