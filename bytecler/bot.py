@@ -12,6 +12,7 @@ import re
 import sqlite3
 import sys
 import time
+import traceback
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -111,6 +112,13 @@ FROST_REPLY_DELETE_AFTER = int(os.getenv("FROST_REPLY_DELETE_AFTER", "0") or "0"
 # 消息删除模块（message_delete.py），删除失败待重试队列等参数在模块内配置
 
 
+def _mask_display_name(name: str) -> str:
+    """入群验证展示用：≤7字正常展示，>7字取前2字+***+后2字"""
+    if not name:
+        return name
+    return name if len(name) <= 7 else name[:2] + "***" + name[-2:]
+
+
 def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
     """冷却间隔+时间窗口。返回 (本次是否计入, 更新后的时间戳列表, 当前窗口内次数)"""
     cutoff = now - TRIGGER_WINDOW_SECONDS
@@ -197,6 +205,7 @@ def load_spam_keywords():
             spam_keywords["whitelist"][field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
     except Exception as e:
         print(f"[shared] 加载关键词失败: {e}")
+        traceback.print_exc()
 
 
 def save_spam_keywords():
@@ -243,6 +252,7 @@ def save_spam_keywords():
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[shared] 保存关键词失败: {e}")
+        traceback.print_exc()
 
 
 def _is_in_keyword_whitelist(field: str, value: str) -> bool:
@@ -542,6 +552,7 @@ def load_verified_users():
                 join_times[uid] = t
     except Exception as e:
         print(f"[shared] 加载白名单失败: {e}")
+        traceback.print_exc()
 
 
 def _verification_failures_ent_to_timestamps(ent) -> list:
@@ -575,6 +586,7 @@ def load_verification_failures():
                 verification_failures[key] = {"timestamps": ts_list}
     except Exception as e:
         print(f"[shared] 加载失败计数失败: {e}")
+        traceback.print_exc()
 
 
 def load_verification_blacklist():
@@ -591,6 +603,7 @@ def load_verification_blacklist():
                 verification_blacklist.add(uid)
     except Exception as e:
         print(f"[shared] 加载黑名单失败: {e}")
+        traceback.print_exc()
 
 
 def chat_allowed(chat_id: str, target_ids: set) -> bool:
@@ -649,6 +662,7 @@ def save_verification_failures():
             json.dump({"failures": to_save}, f, ensure_ascii=False)
     except Exception as e:
         print(f"[shared] 保存失败计数失败: {e}")
+        traceback.print_exc()
 
 
 def add_to_blacklist(user_id: int):
@@ -672,6 +686,7 @@ def load_verification_records():
         _verification_records = data.get("records") or {}
     except Exception as e:
         print(f"[shared] 加载验证记录失败: {e}")
+        traceback.print_exc()
 
 
 def save_verification_records():
@@ -685,6 +700,7 @@ def save_verification_records():
             json.dump({"records": _verification_records}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[shared] 保存验证记录失败: {e}")
+        traceback.print_exc()
 
 
 def _serialize_message_body(msg) -> dict | None:
@@ -729,6 +745,7 @@ def _serialize_message_body(msg) -> dict | None:
         return body
     except Exception as e:
         print(f"[PTB] 序列化消息体失败: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -792,6 +809,7 @@ def save_verification_blacklist():
             json.dump({"users": list(verification_blacklist)}, f, ensure_ascii=False)
     except Exception as e:
         print(f"[shared] 保存黑名单失败: {e}")
+        traceback.print_exc()
 
 
 def sync_lottery_winners() -> tuple[int, str]:
@@ -879,6 +897,7 @@ def sync_lottery_winners() -> tuple[int, str]:
     except sqlite3.OperationalError as e:
         return 0, f"lottery.db 只读打开失败: {e}"
     except Exception as e:
+        traceback.print_exc()
         return 0, f"抽奖同步异常: {e}"
 
 
@@ -903,6 +922,14 @@ BGROUP_MERGE_WINDOW_SEC = 30
 BGROUP_MERGE_MSG_DELETE_AFTER = 30
 # chat_id -> {"users": [(user_id, full_name, ts, cnt)], "msg_id": int}
 _bgroup_merge_state: dict = {}
+_bgroup_merge_lock: dict = {}  # chat_id -> asyncio.Lock，防止并发导致多条合并消息
+
+# 人机验证合并：30s 窗口内多用户合并为一条，每人一个验证码；合并消息 30s 后删除
+VERIFY_MERGE_WINDOW_SEC = int(os.getenv("VERIFY_MERGE_WINDOW_SEC", "30"))
+VERIFY_MERGE_MSG_DELETE_AFTER = int(os.getenv("VERIFY_MERGE_MSG_DELETE_AFTER", "30"))
+# chat_id -> {"users": [(user_id, full_name, code, msg_id, ts)], "msg_id": int, "ts": float}
+_verify_merge_state: dict = {}
+_verify_merge_lock: dict = {}  # chat_id -> asyncio.Lock，防止并发导致多条合并消息
 
 _settime_config: dict = {}  # {"required_group_msg_delete_after": 90, "verify_msg_delete_after": 30}
 
@@ -917,6 +944,7 @@ def _load_settime_config():
             _settime_config = {}
     except Exception as e:
         print(f"[PTB] 加载 settime 配置失败: {e}")
+        traceback.print_exc()
         _settime_config = {}
 
 
@@ -934,6 +962,7 @@ def _save_settime_config():
             json.dump(_settime_config, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[PTB] 保存 settime 配置失败: {e}")
+        traceback.print_exc()
 
 
 _load_settime_config()
@@ -951,6 +980,7 @@ def _load_bgroup_config():
             _bgroup_config = {}
     except Exception as e:
         print(f"[PTB] 加载 B 群配置失败: {e}")
+        traceback.print_exc()
         _bgroup_config = {}
 
 
@@ -960,6 +990,7 @@ def _save_bgroup_config():
             json.dump(_bgroup_config, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[PTB] 保存 B 群配置失败: {e}")
+        traceback.print_exc()
 
 
 def get_bgroup_ids_for_chat(chat_id: str) -> list:
@@ -1037,6 +1068,7 @@ def _load_target_groups():
                     TARGET_GROUP_IDS.add(s)
     except Exception as e:
         print(f"[PTB] 加载 target_groups 失败: {e}")
+        traceback.print_exc()
 
 
 def _save_target_groups():
@@ -1047,6 +1079,7 @@ def _save_target_groups():
             json.dump({"groups": sorted(extra)}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[PTB] 保存 target_groups 失败: {e}")
+        traceback.print_exc()
 
 
 def _add_target_group(gid: str) -> bool:
@@ -1170,6 +1203,7 @@ async def _is_user_in_required_group(bot, user_id: int, chat_id: str, skip_cache
                 return True
         except Exception as e:
             print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {b_id} 失败: {e}")
+            traceback.print_exc()
             return True  # 接口报错或异常时，默认用户在 B 群，不限制
     return False
 
@@ -1310,6 +1344,7 @@ def _log_restriction(chat_id: str, user_id: int, full_name: str, action: str, un
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[PTB] 记录封禁日志失败: {e}")
+        traceback.print_exc()
 
 
 def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, trigger_type: str = "", verification_passed: Optional[str] = None):
@@ -1333,6 +1368,7 @@ def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, tri
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[PTB] 记录被删文案失败: {e}")
+        traceback.print_exc()
 
 
 def _schedule_sync_background(func, *args, **kwargs):
@@ -1342,6 +1378,7 @@ def _schedule_sync_background(func, *args, **kwargs):
             func(*args, **kwargs)
         except Exception as e:
             print(f"[PTB] 后台任务失败: {e}")
+            traceback.print_exc()
     try:
         loop = asyncio.get_running_loop()
         loop.run_in_executor(None, _run)
@@ -1716,8 +1753,22 @@ def _cleanup_required_group_warn_count():
         _required_group_warn_count.pop(k, None)
 
 
+def _get_bgroup_merge_lock(chat_id: str) -> asyncio.Lock:
+    """获取 B 群合并的 per-chat 锁，防止并发导致多条合并消息刷屏"""
+    if chat_id not in _bgroup_merge_lock:
+        _bgroup_merge_lock[chat_id] = asyncio.Lock()
+    return _bgroup_merge_lock[chat_id]
+
+
+def _get_verify_merge_lock(chat_id: str) -> asyncio.Lock:
+    """获取人机验证合并的 per-chat 锁，防止并发导致多条合并消息刷屏"""
+    if chat_id not in _verify_merge_lock:
+        _verify_merge_lock[chat_id] = asyncio.Lock()
+    return _verify_merge_lock[chat_id]
+
+
 async def _start_required_group_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str):
-    """未加入 B 群时：删除消息，发送带按钮的警告。30s 窗口内多用户合并为一条，替换时删旧发新，合并消息 30s 后删除。"""
+    """未加入 B 群时：删除消息，发送带按钮的警告。30s 窗口内多用户合并为一条，替换时删旧发新，合并消息 N 秒后删除。"""
     global _bgroup_merge_state
     _cleanup_required_group_warn_count()
     key = (chat_id, user_id)
@@ -1746,38 +1797,57 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         await _restrict_and_notify(bot, chat_id, user_id, full_name, msg.message_id, restrict_hours=REQUIRED_GROUP_RESTRICT_HOURS)
         return
 
-    now = time.time()
-    cutoff = now - BGROUP_MERGE_WINDOW_SEC
-    state = _bgroup_merge_state.get(chat_id) or {}
-    prev_users: list = state.get("users") or []
-    prev_msg_id = state.get("msg_id")
-    # 过滤过期用户，保留 30s 内的
-    users_in_window = [(uid, name, t, c) for (uid, name, t, c) in prev_users if t > cutoff]
-    # 加入当前用户（若已在列表中则更新）
-    users_in_window = [(uid, name, t, c) for (uid, name, t, c) in users_in_window if uid != user_id]
-    users_in_window.append((user_id, full_name, now, cnt))
+    async with _get_bgroup_merge_lock(chat_id):
+        now = time.time()
+        cutoff = now - BGROUP_MERGE_WINDOW_SEC
+        state = _bgroup_merge_state.get(chat_id) or {}
+        prev_users: list = state.get("users") or []
+        prev_msg_id = state.get("msg_id")
+        # 过滤过期用户，保留 30s 内的
+        users_in_window = [(uid, name, t, c) for (uid, name, t, c) in prev_users if t > cutoff]
+        # 加入当前用户（若已在列表中则更新）
+        users_in_window = [(uid, name, t, c) for (uid, name, t, c) in users_in_window if uid != user_id]
+        users_in_window.append((user_id, full_name, now, cnt))
 
-    # 删除旧的合并消息（若存在）
-    if prev_msg_id is not None:
-        await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "bgroup_merge_replace", retries=1)
+        # 删除旧的合并消息（若存在）
+        if prev_msg_id is not None:
+            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "bgroup_merge_replace", retries=1)
 
-    # 构建合并文案
-    lines = [f"【{name}】• 警告({c}/{VERIFY_FAIL_THRESHOLD})" for (_, name, _, c) in users_in_window]
-    body = "\n".join(lines) + "\n\n请以上用户先关注如下频道或加入群组后才能发言。\n\n本消息将于30s后删除"
-    rows = []
-    for title, link in await _get_required_group_buttons(bot, chat_id):
-        if link:
-            rows.append([InlineKeyboardButton(title, url=link)])
-    cb_data = f"reqgrp_unr:{chat_id}:0"
-    if len(cb_data) <= 64:
-        rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
-    reply_markup = InlineKeyboardMarkup(rows) if rows else None
-    vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
-    _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": time.time()}
+        # 构建合并文案（用户名>7字时脱敏展示）
+        lines = [f"【{_mask_display_name(name)}】• 警告({c}/{VERIFY_FAIL_THRESHOLD})" for (_, name, _, c) in users_in_window]
+        req_sec = _get_required_group_msg_delete_after()
+        body = "\n".join(lines) + f"\n\n请以上用户先关注如下频道或加入群组后才能发言。\n\n本消息将于{req_sec}s后删除"
+        rows = []
+        for title, link in await _get_required_group_buttons(bot, chat_id):
+            if link:
+                rows.append([InlineKeyboardButton(title, url=link)])
+        cb_data = f"reqgrp_unr:{chat_id}:0"
+        if len(cb_data) <= 64:
+            rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
+        reply_markup = InlineKeyboardMarkup(rows) if rows else None
+        vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
+        _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": time.time()}
     _safe_create_task(_delete_bgroup_merge_after(bot, int(chat_id), vmsg.message_id, chat_id), "bgroup_merge")
 
 
+async def _delete_verify_merge_after(bot, chat_id: int, msg_id: int, chat_id_str: str):
+    """人机验证合并消息 N 秒后删除（settime 选项 2）。仅删除成功时清理 state，失败时保留供兜底任务补删。"""
+    global _verify_merge_state
+    try:
+        await asyncio.sleep(_get_verify_msg_delete_after())
+        ok = await _delete_message_with_retry(bot, chat_id, msg_id, "verify_merge")
+        if ok:
+            state = _verify_merge_state.get(chat_id_str)
+            if state and state.get("msg_id") == msg_id:
+                _verify_merge_state.pop(chat_id_str, None)
+    except Exception as e:
+        print(f"[PTB] 人机验证合并删除异常 chat_id={chat_id_str} msg_id={msg_id}: {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+
 async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, intro: str, trigger_reason: str = "", hit_keyword: str = ""):
+    """人机验证：30s 窗口内多用户合并为一条消息，每人一个验证码。合并消息 N 秒后删除。"""
+    global _verify_merge_state
     code = str(random.randint(1000, 9999))
     msg_id = msg.message_id
     msg_preview = (msg.text or msg.caption or "")[:200]
@@ -1791,15 +1861,30 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
         full_name, getattr(msg.from_user, "username", None) or "",
         trigger_reason, msg_preview, hit_keyword=hit_keyword, raw_message_body=raw_body,
     )
-    vmsg = await bot.send_message(
-        chat_id=int(chat_id),
-        text=f"【{full_name}】\n\n{intro}\n\n👉 您的验证码是： <code>{code}</code>\n\n"
-             f"直接发送上述验证码即可通过（{VERIFY_TIMEOUT}秒内有效）",
-        parse_mode="HTML",
-    )
     pending_verification[(chat_id, user_id)] = {"code": code, "time": time.time(), "msg_id": msg_id}
     _schedule_sync_background(save_verification_records)
-    asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after()))
+
+    async with _get_verify_merge_lock(chat_id):
+        now = time.time()
+        cutoff = now - VERIFY_MERGE_WINDOW_SEC
+        state = _verify_merge_state.get(chat_id) or {}
+        prev_users: list = state.get("users") or []
+        prev_msg_id = state.get("msg_id")
+        users_in_window = [(uid, name, c, mid, t) for (uid, name, c, mid, t) in prev_users if t > cutoff]
+        users_in_window = [(uid, name, c, mid, t) for (uid, name, c, mid, t) in users_in_window if uid != user_id]
+        users_in_window.append((user_id, full_name, code, msg_id, now))
+
+        if prev_msg_id is not None:
+            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "verify_merge_replace", retries=1)
+
+        lines = [f"【{_mask_display_name(name)}】" for (_, name, _, _, _) in users_in_window]
+        header = " ".join(lines) + "\n\n⚠️ 检测到疑似广告风险，请先完成人机验证。\n\n"
+        code_lines = [f"• {_mask_display_name(name)} 验证码：<code>{c}</code>" for (_, name, c, _, _) in users_in_window]
+        verify_sec = _get_verify_msg_delete_after()
+        body = header + "\n".join(code_lines) + f"\n\n直接发送上述验证码即可通过（{VERIFY_TIMEOUT}秒内有效）\n本消息将于{verify_sec}s后删除"
+        vmsg = await bot.send_message(chat_id=int(chat_id), text=body, parse_mode="HTML")
+        _verify_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": now}
+    _safe_create_task(_delete_verify_merge_after(bot, int(chat_id), vmsg.message_id, chat_id), "verify_merge")
 
 
 def _safe_create_task(coro, name: str = ""):
@@ -1817,10 +1902,10 @@ def _safe_create_task(coro, name: str = ""):
 
 
 async def _delete_bgroup_merge_after(bot, chat_id: int, msg_id: int, chat_id_str: str):
-    """B 群合并消息 30s 后删除。仅删除成功时清理 state，失败时保留供兜底任务 _job_cleanup_bgroup_merge 补删。"""
+    """B 群合并消息 N 秒后删除（settime 选项 1）。仅删除成功时清理 state，失败时保留供兜底任务补删。"""
     global _bgroup_merge_state
     try:
-        await asyncio.sleep(BGROUP_MERGE_MSG_DELETE_AFTER)
+        await asyncio.sleep(_get_required_group_msg_delete_after())
         ok = await _delete_message_with_retry(bot, chat_id, msg_id, "bgroup_merge")
         if ok:
             state = _bgroup_merge_state.get(chat_id_str)
@@ -1828,6 +1913,7 @@ async def _delete_bgroup_merge_after(bot, chat_id: int, msg_id: int, chat_id_str
                 _bgroup_merge_state.pop(chat_id_str, None)
     except Exception as e:
         print(f"[PTB] B群合并删除异常 chat_id={chat_id_str} msg_id={msg_id}: {type(e).__name__}: {e}")
+        traceback.print_exc()
 
 
 async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, first_name: str, last_name: str):
@@ -1913,7 +1999,6 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
         print("[PTB] 霜刃: 已发送回复")
     except Exception as e:
         print(f"[PTB] 霜刃 AI 唤醒异常: {e}")
-        import traceback
         traceback.print_exc()
 
 
@@ -1931,6 +2016,7 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
         )
     except Exception as e:
         print(f"[PTB] 限制用户失败: {e}")
+        traceback.print_exc()
         return
     if msg_id is not None:
         update_verification_record(chat_id, msg_id, "failed_restricted", fail_count=VERIFY_FAIL_THRESHOLD)
@@ -1946,9 +2032,9 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
     try:
         m = await bot.send_message(
             chat_id=int(chat_id),
-            text=f"【{full_name}】\n\n验证失败，如有需要，请联系 {UNBAN_BOT_USERNAME} 进行解封",
+            text=f"【{_mask_display_name(full_name)}】\n\n验证失败，如有需要，请联系 {UNBAN_BOT_USERNAME} 进行解封",
         )
-        asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, _get_verify_msg_delete_after()))
+        asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, VERIFY_MSG_DELETE_AFTER))
     except Exception:
         pass
 
@@ -2515,7 +2601,7 @@ async def callback_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = _get_required_group_msg_delete_after()
         key = "required_group_msg_delete_after"
     elif typ == "verify":
-        label = "人机验证（5 次命中后提示文案）"
+        label = "人机验证（合并消息及验证码错误提示）"
         current = _get_verify_msg_delete_after()
         key = "verify_msg_delete_after"
     else:
@@ -2788,6 +2874,7 @@ async def _job_frost_reply(context: ContextTypes.DEFAULT_TYPE):
         pass
     except Exception as e:
         print(f"[PTB] frost_reply 处理失败: {e}")
+        traceback.print_exc()
 
 
 PENDING_KEYWORD_CONFIRM_TIMEOUT = 120  # 关键词已存在确认按钮 120 秒超时
@@ -2809,11 +2896,11 @@ async def _job_cleanup_pending_keyword_confirm(context: ContextTypes.DEFAULT_TYP
 
 
 async def _job_cleanup_bgroup_merge(context: ContextTypes.DEFAULT_TYPE):
-    """兜底：定时检查 B 群合并消息，超 30s 未删则补删（应对 create_task 丢失、异常等）"""
+    """兜底：定时检查 B 群合并消息，超时未删则补删（应对 create_task 丢失、异常等）"""
     global _bgroup_merge_state
     bot = context.bot
     now = time.time()
-    cutoff = now - BGROUP_MERGE_MSG_DELETE_AFTER - 5  # 35s 视为超时，留 5s 缓冲
+    cutoff = now - _get_required_group_msg_delete_after() - 5  # 留 5s 缓冲
     to_clean = []
     for chat_id_str, state in list(_bgroup_merge_state.items()):
         ts = state.get("ts") or 0
@@ -2829,6 +2916,30 @@ async def _job_cleanup_bgroup_merge(context: ContextTypes.DEFAULT_TYPE):
                     print(f"[PTB] B群合并兜底删除失败 chat_id={chat_id_str} msg_id={msg_id}: {e}")
         if _bgroup_merge_state.get(chat_id_str, {}).get("msg_id") == msg_id:
             _bgroup_merge_state.pop(chat_id_str, None)
+
+
+async def _job_cleanup_verify_merge(context: ContextTypes.DEFAULT_TYPE):
+    """兜底：定时检查人机验证合并消息，超时未删则补删"""
+    global _verify_merge_state
+    bot = context.bot
+    now = time.time()
+    cutoff = now - _get_verify_msg_delete_after() - 5
+    to_clean = []
+    for chat_id_str, state in list(_verify_merge_state.items()):
+        ts = state.get("ts") or 0
+        if ts <= cutoff:
+            to_clean.append((chat_id_str, state.get("msg_id")))
+    for chat_id_str, msg_id in to_clean:
+        if msg_id is not None:
+            try:
+                await bot.delete_message(chat_id=int(chat_id_str), message_id=msg_id)
+                print(f"[PTB] 人机验证合并兜底删除: chat_id={chat_id_str} msg_id={msg_id}")
+            except Exception as e:
+                if "not found" not in str(e).lower():
+                    print(f"[PTB] 人机验证合并兜底删除失败 chat_id={chat_id_str} msg_id={msg_id}: {e}")
+                    traceback.print_exc()
+        if _verify_merge_state.get(chat_id_str, {}).get("msg_id") == msg_id:
+            _verify_merge_state.pop(chat_id_str, None)
 
 
 def _write_delete_stats_sync():
@@ -2910,6 +3021,7 @@ async def _send_sync_result_to_groups(bot, added: int, msg: str):
                 await bot.send_message(chat_id=int(gid), text=sync_msg)
             except Exception as e:
                 print(f"[PTB] 抽奖同步结果群发失败 chat_id={gid}: {e}")
+                traceback.print_exc()
 
 
 async def _job_lottery_sync(context: ContextTypes.DEFAULT_TYPE):
@@ -2918,6 +3030,7 @@ async def _job_lottery_sync(context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         added, msg = await loop.run_in_executor(None, sync_lottery_winners)
     except Exception as e:
+        traceback.print_exc()
         added, msg = 0, f"抽奖同步异常: {e}"
     print(f"[PTB] 抽奖同步: {msg}")
     await _send_sync_result_to_groups(context.bot, added, msg)
@@ -2939,12 +3052,14 @@ async def _post_init_send_hello(application: Application):
         ])
     except Exception as e:
         print(f"[PTB] 设置菜单命令失败: {e}")
+        traceback.print_exc()
     for gid in TARGET_GROUP_IDS:
         if gid:
             try:
                 await application.bot.send_message(chat_id=int(gid), text="你好")
             except Exception as e:
                 print(f"[PTB] 群发你好失败 chat_id={gid}: {e}")
+                traceback.print_exc()
     added, msg = sync_lottery_winners()
     print(f"[PTB] 抽奖同步: {msg}")
     await _send_sync_result_to_groups(application.bot, added, msg)
@@ -2953,6 +3068,7 @@ async def _post_init_send_hello(application: Application):
         print(f"[PTB] 霜刃 @{me.username} 已就绪，监控群: {list(TARGET_GROUP_IDS)}")
     except Exception as e:
         print(f"[PTB] 获取 bot 信息失败: {e}")
+        traceback.print_exc()
 
 
 def _ptb_main():
@@ -2975,6 +3091,8 @@ def _ptb_main():
     async def _error_handler(update, context):
         err = getattr(context, "error", None)
         print(f"[PTB] Handler 异常: {err}")
+        if err is not None:
+            traceback.print_exception(type(err), err, err.__traceback__)
     app.add_error_handler(_error_handler)
 
     # 显式指定 CHAT_MEMBER（其他成员状态变更），非 MY_CHAT_MEMBER（Bot 自身状态）
@@ -3013,6 +3131,7 @@ def _ptb_main():
         jq.run_repeating(_job_frost_reply, interval=2, first=2)
         jq.run_repeating(_job_cleanup_pending_keyword_confirm, interval=60, first=60)  # 每 60 秒清理超时确认
         jq.run_repeating(_job_cleanup_bgroup_merge, interval=45, first=45)  # 每 45 秒兜底检查 B 群合并消息
+        jq.run_repeating(_job_cleanup_verify_merge, interval=45, first=45)  # 每 45 秒兜底检查人机验证合并消息
         jq.run_repeating(job_retry_pending_deletes, interval=120, first=120)  # 每 2 分钟兜底重试待删队列（无新消息群）
         jq.run_daily(_job_lottery_sync, time=dt_time(20, 0))  # 20:00 UTC = 北京时间凌晨 4 点
         jq.run_repeating(_job_delete_stats, interval=21600, first=21600)  # 每 6 小时输出删除统计到 debug/

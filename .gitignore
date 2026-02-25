@@ -1,3 +1,7 @@
+# 文档与表格（勿提交）
+*.md
+*.xlsx
+
 # IDE
 .vs/
 __pycache__/
