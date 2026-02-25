@@ -1880,8 +1880,7 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
         lines = [f"【{_mask_display_name(name)}】" for (_, name, _, _, _) in users_in_window]
         header = " ".join(lines) + "\n\n⚠️ 检测到疑似广告风险，请先完成人机验证。\n\n"
         code_lines = [f"• {_mask_display_name(name)} 验证码：<code>{c}</code>" for (_, name, c, _, _) in users_in_window]
-        verify_sec = _get_verify_msg_delete_after()
-        body = header + "\n".join(code_lines) + f"\n\n直接发送上述验证码即可通过（{VERIFY_TIMEOUT}秒内有效）\n本消息将于{verify_sec}s后删除"
+        body = header + "\n".join(code_lines) + "\n\n直接发送上述验证码即可通过"
         vmsg = await bot.send_message(chat_id=int(chat_id), text=body, parse_mode="HTML")
         _verify_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": now}
     _safe_create_task(_delete_verify_merge_after(bot, int(chat_id), vmsg.message_id, chat_id), "verify_merge")
@@ -2943,13 +2942,13 @@ async def _job_cleanup_verify_merge(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _write_delete_stats_sync():
-    """同步写入删除统计到文件，供 run_in_executor 调用，避免阻塞事件循环"""
+    """同步写入删除统计到文件，供 run_in_executor 调用，避免阻塞事件循环。统一写入 delete_stats.json，最新记录在文件最上方。"""
     stats = get_delete_stats()
     pending_len = get_pending_queue_len()
     debug_dir = _BASE / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
+    fpath = debug_dir / "delete_stats.json"
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    fpath = debug_dir / f"delete_stats_{ts}.json"
     imm_s = stats.get("immediate_success", 0)
     imm_f = stats.get("immediate_fail", 0)
     ret_s = stats.get("retry_success", 0)
@@ -2976,13 +2975,23 @@ def _write_delete_stats_sync():
         "total_deleted": total_del,
         "pending_queue_len": pending_len,
     }
+    records = []
+    if fpath.exists():
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                records = []
+        except (json.JSONDecodeError, OSError):
+            records = []
+    records.insert(0, data)
     with open(fpath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(records, f, ensure_ascii=False, indent=2)
     return str(fpath)
 
 
 async def _job_delete_stats(context: ContextTypes.DEFAULT_TYPE):
-    """每 6 小时输出删除统计到 bytecler/debug/delete_stats_*.json。同步 IO 放入 executor 避免阻塞事件循环"""
+    """每 6 小时输出删除统计到 bytecler/debug/delete_stats.json（最新记录在文件最上方）。同步 IO 放入 executor 避免阻塞事件循环"""
     try:
         loop = asyncio.get_running_loop()
         fpath = await loop.run_in_executor(None, _write_delete_stats_sync)
