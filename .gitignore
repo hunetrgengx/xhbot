@@ -38,6 +38,8 @@ bytecler/bgroup_config.json
 bytecler/target_groups.json
 bytecler/verified_users.*.json
 bytecler/debug/
+bytecler/pending_delete_persist.jsonl
+bytecler/delete_failures.jsonl
 /tongbu.py
 /update.py
 /忽略/tongbu.py

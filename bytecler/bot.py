@@ -43,16 +43,21 @@ from message_delete import (
     job_retry_pending_deletes,
     get_stats as get_delete_stats,
     get_pending_queue_len,
+    get_persist_queue_len,
 )
 
 
 async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None) -> bool:
-    """本项目封装：clear_cache_key 时自动用 _last_message_by_user 清理"""
-    return await _delete_message_with_retry_raw(
+    """本项目封装：clear_cache_key 时自动用 _last_message_by_user 清理；失败时记录到 delete_failures.jsonl"""
+    ok = await _delete_message_with_retry_raw(
         bot, chat_id, msg_id, label, retries=retries,
         cache_dict=_last_message_by_user if clear_cache_key else None,
         clear_cache_key=clear_cache_key,
     )
+    if not ok:
+        uid = clear_cache_key[1] if clear_cache_key else 0
+        _schedule_sync_background(_log_delete_failure, chat_id, msg_id, label, uid)
+    return ok
 
 
 async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None, user_cache_key: Optional[Tuple[str, int]] = None):
@@ -914,6 +919,7 @@ ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
 RESTRICTED_USERS_LOG_PATH = _BASE / "restricted_users.jsonl"
 DELETED_CONTENT_LOG_PATH = _BASE / "bio_calls.jsonl"  # 被删除文案记录：time, user_id, full_name, deleted_content
+DELETE_FAILURES_LOG_PATH = _path("delete_failures.jsonl")  # 删除失败记录：time, chat_id, msg_id, label, user_id
 VERIFY_TIMEOUT = 90
 VERIFY_MSG_DELETE_AFTER = 30
 REQUIRED_GROUP_MSG_DELETE_AFTER = 90  # 入群验证消息 90 秒后自动删除；可通过 /settime 配置
@@ -1205,7 +1211,7 @@ async def _is_user_in_required_group(bot, user_id: int, chat_id: str, skip_cache
         except Exception as e:
             print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {b_id} 失败: {e}")
             traceback.print_exc()
-            return True  # 接口报错或异常时，默认用户在 B 群，不限制
+            return False  # 接口报错或异常时（如 Bot 未加入 B 群），无法验证则视为未加入，触发限制
     return False
 
 
@@ -1346,6 +1352,22 @@ def _log_restriction(chat_id: str, user_id: int, full_name: str, action: str, un
     except Exception as e:
         print(f"[PTB] 记录封禁日志失败: {e}")
         traceback.print_exc()
+
+
+def _log_delete_failure(chat_id: int, msg_id: int, label: str, user_id: int = 0):
+    """记录删除失败到 delete_failures.jsonl"""
+    try:
+        rec = {
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "chat_id": str(chat_id),
+            "msg_id": msg_id,
+            "label": label or "",
+            "user_id": user_id,
+        }
+        with open(DELETE_FAILURES_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[PTB] 记录删除失败日志异常: {e}")
 
 
 def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, trigger_type: str = "", verification_passed: Optional[str] = None):
@@ -2184,7 +2206,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if target_uid in verified_users:
                     print(f"[PTB] 自助验证: 白名单用户 uid={target_uid} 已提示无需验证")
                     await update.message.reply_text(
-                        "✓ 无需验证\n\n您已是白名单用户\n\n所在群：" + group_display + " （点击可进入该群）",
+                        "✅ 无需验证\n\n您已是白名单用户\n\n所在群：" + group_display,
                         parse_mode="HTML",
                     )
                     return
@@ -2204,7 +2226,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     code = str(random.randint(1000, 9999))
                     msg_id = None
                     pending_verification[key] = {"code": code, "time": now, "msg_id": msg_id}
-                body = f"⌛您正在发起验证\n\n验证码是：{code}\n\n验证通过后可进入白名单\n目标群：{group_display}（点击进入该群）"
+                body = f"⌛您正在发起验证\n\n验证码是：{code}\n\n验证通过后可进入白名单\n目标群：{group_display}"
                 await update.message.reply_text(body, parse_mode="HTML")
                 pending_private_verify[uid] = {"chat_id": chat_id, "start_time": now}
                 return
@@ -3112,6 +3134,7 @@ def _write_delete_stats_sync():
     """同步写入删除统计到文件，供 run_in_executor 调用，避免阻塞事件循环。统一写入 delete_stats.json，最新记录在文件最上方。"""
     stats = get_delete_stats()
     pending_len = get_pending_queue_len()
+    persist_len = get_persist_queue_len()
     debug_dir = _BASE / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
     fpath = debug_dir / "delete_stats.json"
@@ -3141,6 +3164,9 @@ def _write_delete_stats_sync():
         "evict_retry_fail": ev_f,
         "total_deleted": total_del,
         "pending_queue_len": pending_len,
+        "persist_queue_len": persist_len,
+        "persist_retry_success": stats.get("persist_retry_success", 0),
+        "persist_retry_fail": stats.get("persist_retry_fail", 0),
     }
     records = []
     if fpath.exists():
@@ -3280,6 +3306,7 @@ def _ptb_main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, group_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.CAPTION, group_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.Sticker.ALL, group_message_handler))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ATTACHMENT, group_message_handler))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("reload", cmd_reload))
