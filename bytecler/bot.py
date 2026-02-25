@@ -35,6 +35,35 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
+from message_delete import (
+    delete_message_with_retry as _delete_message_with_retry_raw,
+    retry_pending_deletes_for_chat,
+    delete_after as _delete_after_raw,
+    job_retry_pending_deletes,
+    get_stats as get_delete_stats,
+    get_pending_queue_len,
+)
+
+
+async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None) -> bool:
+    """本项目封装：clear_cache_key 时自动用 _last_message_by_user 清理"""
+    return await _delete_message_with_retry_raw(
+        bot, chat_id, msg_id, label, retries=retries,
+        cache_dict=_last_message_by_user if clear_cache_key else None,
+        clear_cache_key=clear_cache_key,
+    )
+
+
+async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None, user_cache_key: Optional[Tuple[str, int]] = None):
+    """本项目封装：user_cache_key 时自动用 _last_message_by_user 清理"""
+    await _delete_after_raw(
+        bot, chat_id, msg_id, sec,
+        user_msg_id=user_msg_id,
+        cache_dict=_last_message_by_user if user_cache_key else None,
+        user_cache_key=user_cache_key,
+    )
+
+
 # ==================== 共享逻辑 (原 shared.py) ====================
 _BASE = Path(__file__).resolve().parent
 
@@ -79,13 +108,7 @@ ENABLE_EMOJI_CHECK = os.getenv("ENABLE_EMOJI_CHECK", "1").lower() not in ("0", "
 ENABLE_STICKER_CHECK = os.getenv("ENABLE_STICKER_CHECK", "1").lower() not in ("0", "false", "no")
 # 霜刃 AI 回复 N 秒后自动删除，0 表示不删除
 FROST_REPLY_DELETE_AFTER = int(os.getenv("FROST_REPLY_DELETE_AFTER", "0") or "0")
-# 删除失败待重试队列：TTL 1 小时，最大 100 条，同群下条消息时顺带重试；单次每群最多重试 N 条
-PENDING_DELETE_RETRY_TTL = 3600
-PENDING_DELETE_RETRY_MAX = 100
-PENDING_DELETE_RETRY_PER_MSG = 3  # 每次同群消息最多重试条数，避免限流
-_pending_delete_retry: List[Tuple[str, int, int, float]] = []  # [(chat_id, msg_id, user_id, ts), ...]
-# 删除统计：立即删除成功/失败、重试成功/失败，每 6 小时输出到 debug/
-_delete_stats = {"immediate_success": 0, "immediate_fail": 0, "retry_success": 0, "retry_fail": 0}
+# 消息删除模块（message_delete.py），删除失败待重试队列等参数在模块内配置
 
 
 def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
@@ -1495,7 +1518,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # 同群触发：顺带重试该群待删除队列（立即删除偶发失败时的补充）
-    await _retry_pending_deletes_for_chat(context.bot, chat_id)
+    await retry_pending_deletes_for_chat(context.bot, chat_id)
 
     user = msg.from_user
     if not user:
@@ -1515,7 +1538,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     key = (chat_id, uid)
     if key in pending_setlimit:
         info = pending_setlimit[key]
-        if (time.time() - info.get("timestamp", 0)) > PENDING_SETLIMIT_TIMEOUT:
+        elapsed = time.time() - info.get("timestamp", 0)
+        if elapsed >= 0 and elapsed > PENDING_SETLIMIT_TIMEOUT:
             pending_setlimit.pop(key, None)
             await update.message.reply_text("已超时，请重新发送 /setlimit")
             return
@@ -1749,8 +1773,8 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
     reply_markup = InlineKeyboardMarkup(rows) if rows else None
     vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
-    _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id}
-    asyncio.create_task(_delete_bgroup_merge_after(bot, int(chat_id), vmsg.message_id, chat_id))
+    _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": time.time()}
+    _safe_create_task(_delete_bgroup_merge_after(bot, int(chat_id), vmsg.message_id, chat_id), "bgroup_merge")
 
 
 async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, intro: str, trigger_reason: str = "", hit_keyword: str = ""):
@@ -1778,89 +1802,32 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     asyncio.create_task(_delete_after(bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after()))
 
 
-def _log_delete_failure(chat_id, msg_id: int, label: str, e: Exception):
-    """删除失败时输出日志，便于排查（常见原因：Bot 无删消息权限、消息超 48 小时）"""
-    print(f"[PTB] 删除消息失败 chat_id={chat_id} msg_id={msg_id} {label}: {type(e).__name__}: {e}")
-
-
-def _add_pending_delete_retry(chat_id: str, msg_id: int, user_id: int):
-    """删除失败时加入待重试队列，同群下条消息时顺带重试。user_id=0 表示 bot 消息。去重：同 (chat_id,msg_id) 不重复入队。TTL 1 小时，最大 100 条。"""
-    global _pending_delete_retry
-    if any((c, m) == (chat_id, msg_id) for (c, m, u, t) in _pending_delete_retry):
-        return
-    now = time.time()
-    cutoff = now - PENDING_DELETE_RETRY_TTL
-    _pending_delete_retry = [(c, m, u, t) for (c, m, u, t) in _pending_delete_retry if t > cutoff]
-    while len(_pending_delete_retry) >= PENDING_DELETE_RETRY_MAX:
-        _pending_delete_retry.pop(0)
-    _pending_delete_retry.append((chat_id, msg_id, user_id, now))
-
-
-async def _retry_pending_deletes_for_chat(bot, chat_id: str):
-    """同群触发：顺带重试该群待删除队列。方案B：重试成功时不释放缓存。单次最多重试 N 条。"""
-    global _pending_delete_retry, _delete_stats
-    now = time.time()
-    cutoff = now - PENDING_DELETE_RETRY_TTL
-    candidates = [(c, m, u, t) for (c, m, u, t) in _pending_delete_retry if c == chat_id and t > cutoff]
-    to_retry = candidates[:PENDING_DELETE_RETRY_PER_MSG]
-    remaining_this_chat = candidates[PENDING_DELETE_RETRY_PER_MSG:]
-    other_items = [(c, m, u, t) for (c, m, u, t) in _pending_delete_retry if c != chat_id or t <= cutoff]
-    for item in to_retry:
-        cid, msg_id, user_id, ts = item
+def _safe_create_task(coro, name: str = ""):
+    """创建后台任务，异常时打印日志避免静默失败"""
+    task = asyncio.create_task(coro)
+    def _done(t):
         try:
-            await bot.delete_message(chat_id=int(cid), message_id=msg_id)
-            _delete_stats["retry_success"] += 1
+            t.result()
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
-            if "not found" in str(e).lower():
-                _delete_stats["retry_success"] += 1  # 消息已不存在，视为成功
-            else:
-                remaining_this_chat.append(item)
-                _delete_stats["retry_fail"] += 1
-    _pending_delete_retry = other_items + remaining_this_chat
-
-
-async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None) -> bool:
-    """带重试的删除，应对 Telegram API 偶发失败。成功时若提供 clear_cache_key 则释放该用户消息缓存。
-    失败时加入待重试队列（用户消息用 user_id，bot 消息用 0），同群下条消息时顺带重试。返回是否删除成功。"""
-    global _delete_stats
-    for attempt in range(retries):
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            _delete_stats["immediate_success"] += 1
-            if clear_cache_key is not None:
-                _last_message_by_user.pop(clear_cache_key, None)
-            return True
-        except Exception as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(2)  # 间隔 2 秒重试
-            else:
-                _log_delete_failure(chat_id, msg_id, label, e)
-                _delete_stats["immediate_fail"] += 1
-                # 消息已不存在（如已被替换删除）时不入队，避免无效重试
-                if "not found" in str(e).lower():
-                    return False
-    user_id = clear_cache_key[1] if clear_cache_key is not None else 0  # 0 表示 bot 消息
-    _add_pending_delete_retry(str(chat_id), msg_id, user_id)
-    return False
+            print(f"[PTB] 后台任务异常 {name}: {type(e).__name__}: {e}")
+    task.add_done_callback(_done)
+    return task
 
 
 async def _delete_bgroup_merge_after(bot, chat_id: int, msg_id: int, chat_id_str: str):
-    """B 群合并消息 30s 后删除，并清理 state（若未被替换）"""
+    """B 群合并消息 30s 后删除。仅删除成功时清理 state，失败时保留供兜底任务 _job_cleanup_bgroup_merge 补删。"""
     global _bgroup_merge_state
-    await asyncio.sleep(BGROUP_MERGE_MSG_DELETE_AFTER)
-    await _delete_message_with_retry(bot, chat_id, msg_id, "bgroup_merge")
-    state = _bgroup_merge_state.get(chat_id_str)
-    if state and state.get("msg_id") == msg_id:
-        _bgroup_merge_state.pop(chat_id_str, None)
-
-
-async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None, user_cache_key: Optional[tuple[str, int]] = None):
-    """sec 秒后删除 msg_id；若提供 user_msg_id，先尝试删除用户消息（重试未删掉的触发消息）。
-    删除失败会重试 3 次。user_cache_key：删除用户消息成功时释放该缓存。若进程在 sleep 期间重启，任务丢失（无法避免）。"""
-    await asyncio.sleep(sec)
-    if user_msg_id is not None:
-        await _delete_message_with_retry(bot, chat_id, user_msg_id, "user_msg", clear_cache_key=user_cache_key)
-    await _delete_message_with_retry(bot, chat_id, msg_id, "bot_msg")
+    try:
+        await asyncio.sleep(BGROUP_MERGE_MSG_DELETE_AFTER)
+        ok = await _delete_message_with_retry(bot, chat_id, msg_id, "bgroup_merge")
+        if ok:
+            state = _bgroup_merge_state.get(chat_id_str)
+            if state and state.get("msg_id") == msg_id:
+                _bgroup_merge_state.pop(chat_id_str, None)
+    except Exception as e:
+        print(f"[PTB] B群合并删除异常 chat_id={chat_id_str} msg_id={msg_id}: {type(e).__name__}: {e}")
 
 
 async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, first_name: str, last_name: str):
@@ -2063,11 +2030,15 @@ async def cmd_clearlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
+    if update.effective_user:
+        pending_keyword_cmd.pop(update.effective_user.id, None)
     await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
+    if update.effective_user:
+        pending_keyword_cmd.pop(update.effective_user.id, None)
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
         "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
@@ -2091,6 +2062,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
+    pending_keyword_cmd.pop(update.effective_user.id, None)
     load_spam_keywords()
     load_verified_users()
     load_verification_blacklist()
@@ -2106,14 +2078,28 @@ PENDING_ADD_GROUP_TIMEOUT = 120
 
 
 async def cmd_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """私聊添加霜刃可用群：@群、https://t.me/xxx、-100xxxxxxxxxx"""
+    """私聊添加霜刃可用群。支持 /add_group @群 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
     uid = update.effective_user.id
+    pending_keyword_cmd.pop(uid, None)
+    args_text = " ".join(context.args or []).strip()
     pending_add_group[uid] = {"timestamp": time.time()}
+    if args_text:
+        gid = await _resolve_group_input(context.bot, args_text)
+        if gid:
+            title, link = await _get_group_display_info(context.bot, gid)
+            if _add_target_group(gid):
+                await update.message.reply_text(f"已添加 <a href=\"{link}\">{_escape_html(title)}</a>", parse_mode="HTML")
+            else:
+                await update.message.reply_text(f"<a href=\"{link}\">{_escape_html(title)}</a> 已在监控列表中", parse_mode="HTML")
+            pending_add_group.pop(uid, None)
+        else:
+            await update.message.reply_text("解析失败，请发送 @群、https://t.me/xxx 或 -100xxxxxxxxxx")
+        return
     cur = list(TARGET_GROUP_IDS) if TARGET_GROUP_IDS else []
     if cur:
         lines = ["当前监控群："]
@@ -2185,6 +2171,8 @@ async def cmd_kw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_kw_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_kw(update, context, "name", "昵称")
 async def cmd_kw_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        pending_keyword_cmd.pop(update.effective_user.id, None)
     await update.message.reply_text("bio 简介关键词暂未启用")
 
 
@@ -2201,6 +2189,7 @@ async def _cmd_kw_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
+    pending_keyword_cmd.pop(update.effective_user.id, None)
     args = (context.args or [])
     if len(args) >= 1 and args[0].lower() == "list":
         kw = (spam_keywords.get("blacklist") or {}).get(field) or {}
@@ -2247,6 +2236,8 @@ async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
+    # 清除 add_text/add_name 的待输入状态，避免用户发 /wl_text 后输入关键词被误判为黑名单超时
+    pending_keyword_cmd.pop(update.effective_user.id, None)
     args = (context.args or [])
     if len(args) >= 1 and args[0].lower() == "list":
         wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
@@ -2283,14 +2274,43 @@ async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
         )
 
 
+async def _process_add_keyword_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, field: str, label: str, multi: bool, text: str) -> bool:
+    """处理 add_text/add_name 的后续关键词输入，返回是否已处理"""
+    if not text:
+        return False
+    as_exact, kw, is_regex = _parse_keyword_input(text)
+    exists = _keyword_exists_in_blacklist(field, kw, as_exact, is_regex)
+    if exists:
+        _cleanup_pending_keyword_confirm()
+        confirm_id = f"{int(time.time()*1000)}_{uid}"[:32]
+        pending_keyword_confirm[confirm_id] = {"uid": uid, "field": field, "kw": kw, "as_exact": as_exact, "is_regex": is_regex, "label": label, "ts": time.time()}
+        rows = [[InlineKeyboardButton("取消", callback_data=f"kw_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"kw_confirm:{confirm_id}:remove")]]
+        await update.message.reply_text(f"「{kw}」已在{label}黑名单中，是否移除？", reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        if add_blacklist_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            reply = f"已添加「{kw}」到{label}黑名单（命中直接删除+加黑）"
+            if multi:
+                reply += "。继续发送关键词，/cancel 结束"
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text("添加失败（正则无效？）")
+    return True
+
+
 async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """两段式多轮：添加消息黑名单关键词，命中直接删除+加黑。已存在则移除。"""
+    """两段式多轮：添加消息黑名单关键词。支持 /add_text 关键词 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
-    pending_keyword_cmd[update.effective_user.id] = {"field": "text", "op": "add", "label": "消息", "multi": True, "timestamp": time.time()}
+    uid = update.effective_user.id
+    args_text = " ".join(context.args or []).strip()
+    pending_keyword_cmd[uid] = {"field": "text", "op": "add", "label": "消息", "multi": True, "timestamp": time.time()}
+    if args_text:
+        await _process_add_keyword_followup(update, context, uid, "text", "消息", True, args_text)
+        return
     await update.message.reply_text(
         "【消息黑名单】命中直接删除+加黑（多轮，/cancel 结束）\n"
         "• 直接输入如 加V → 子串匹配\n"
@@ -2299,13 +2319,18 @@ async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """两段式多轮：添加昵称黑名单关键词，命中直接删除+加黑。已存在则移除。"""
+    """两段式多轮：添加昵称黑名单关键词。支持 /add_name 关键词 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
-    pending_keyword_cmd[update.effective_user.id] = {"field": "name", "op": "add", "label": "昵称", "multi": True, "timestamp": time.time()}
+    uid = update.effective_user.id
+    args_text = " ".join(context.args or []).strip()
+    pending_keyword_cmd[uid] = {"field": "name", "op": "add", "label": "昵称", "multi": True, "timestamp": time.time()}
+    if args_text:
+        await _process_add_keyword_followup(update, context, uid, "name", "昵称", True, args_text)
+        return
     await update.message.reply_text(
         "【昵称黑名单】命中直接删除+加黑（多轮，/cancel 结束）\n"
         "• 直接输入 → 子串匹配\n"
@@ -2322,6 +2347,7 @@ async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
+    pending_keyword_cmd.pop(update.effective_user.id, None)
     args = (context.args or [])
     if len(args) >= 2:
         op, kw = args[0].lower(), " ".join(args[1:]).strip()
@@ -2516,7 +2542,8 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     # 0. /add_group 的后续输入：等待群标识（120 秒超时）
     if uid in pending_add_group:
         info = pending_add_group[uid]
-        if (time.time() - info.get("timestamp", 0)) > PENDING_ADD_GROUP_TIMEOUT:
+        elapsed = time.time() - info.get("timestamp", 0)
+        if elapsed >= 0 and elapsed > PENDING_ADD_GROUP_TIMEOUT:
             pending_add_group.pop(uid, None)
             await update.message.reply_text("已超时，请重新发送 /add_group")
             return
@@ -2547,7 +2574,8 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     PENDING_SETTIME_TIMEOUT = 120
     if uid in pending_settime_cmd:
         info = pending_settime_cmd[uid]
-        if (time.time() - info.get("timestamp", 0)) > PENDING_SETTIME_TIMEOUT:
+        elapsed = time.time() - info.get("timestamp", 0)
+        if elapsed >= 0 and elapsed > PENDING_SETTIME_TIMEOUT:
             pending_settime_cmd.pop(uid, None)
             await update.message.reply_text("已超时，请重新发送 /settime 选择要设置的项")
             return
@@ -2575,7 +2603,10 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     PENDING_KEYWORD_TIMEOUT = 120  # 等待关键词状态 120 秒后超时
     if uid in pending_keyword_cmd:
         info = pending_keyword_cmd[uid]
-        if (time.time() - info.get("timestamp", 0)) > PENDING_KEYWORD_TIMEOUT:
+        elapsed = time.time() - info.get("timestamp", 0)
+        if elapsed < 0:
+            pass  # 时钟偏差，不视为超时
+        elif elapsed > PENDING_KEYWORD_TIMEOUT:
             pending_keyword_cmd.pop(uid, None)
             await update.message.reply_text("已超时，请重新发送 /add_text 或 /add_name")
             return
@@ -2585,29 +2616,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
                 pending_keyword_cmd.pop(uid, None)
             await update.message.reply_text("已取消" if not text else "请发送关键词")
             return
-        as_exact, kw, is_regex = _parse_keyword_input(text)
-        # add_text/add_name 添加黑名单关键词
-        exists = _keyword_exists_in_blacklist(field, kw, as_exact, is_regex)
-        if exists:
-            _cleanup_pending_keyword_confirm()  # 添加前清理超时条目
-            confirm_id = f"{int(time.time()*1000)}_{uid}"[:32]  # 唯一 id，避免多轮冲突
-            pending_keyword_confirm[confirm_id] = {"uid": uid, "field": field, "kw": kw, "as_exact": as_exact, "is_regex": is_regex, "label": label, "ts": time.time()}
-            rows = [
-                [InlineKeyboardButton("取消", callback_data=f"kw_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"kw_confirm:{confirm_id}:remove")]
-            ]
-            await update.message.reply_text(
-                f"「{kw}」已在{label}黑名单中，是否移除？",
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
-        else:
-            if add_blacklist_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
-                save_spam_keywords()
-                reply = f"已添加「{kw}」到{label}黑名单（命中直接删除+加黑）"
-                if multi:
-                    reply += "。继续发送关键词，/cancel 结束"
-                await update.message.reply_text(reply)
-            else:
-                await update.message.reply_text("添加失败（正则无效？）")
+        await _process_add_keyword_followup(update, context, uid, field, label, multi, text)
         if not multi:
             pending_keyword_cmd.pop(uid, None)
         else:
@@ -2799,38 +2808,73 @@ async def _job_cleanup_pending_keyword_confirm(context: ContextTypes.DEFAULT_TYP
     _cleanup_pending_keyword_confirm()
 
 
+async def _job_cleanup_bgroup_merge(context: ContextTypes.DEFAULT_TYPE):
+    """兜底：定时检查 B 群合并消息，超 30s 未删则补删（应对 create_task 丢失、异常等）"""
+    global _bgroup_merge_state
+    bot = context.bot
+    now = time.time()
+    cutoff = now - BGROUP_MERGE_MSG_DELETE_AFTER - 5  # 35s 视为超时，留 5s 缓冲
+    to_clean = []
+    for chat_id_str, state in list(_bgroup_merge_state.items()):
+        ts = state.get("ts") or 0
+        if ts <= cutoff:
+            to_clean.append((chat_id_str, state.get("msg_id")))
+    for chat_id_str, msg_id in to_clean:
+        if msg_id is not None:
+            try:
+                await bot.delete_message(chat_id=int(chat_id_str), message_id=msg_id)
+                print(f"[PTB] B群合并兜底删除: chat_id={chat_id_str} msg_id={msg_id}")
+            except Exception as e:
+                if "not found" not in str(e).lower():
+                    print(f"[PTB] B群合并兜底删除失败 chat_id={chat_id_str} msg_id={msg_id}: {e}")
+        if _bgroup_merge_state.get(chat_id_str, {}).get("msg_id") == msg_id:
+            _bgroup_merge_state.pop(chat_id_str, None)
+
+
+def _write_delete_stats_sync():
+    """同步写入删除统计到文件，供 run_in_executor 调用，避免阻塞事件循环"""
+    stats = get_delete_stats()
+    pending_len = get_pending_queue_len()
+    debug_dir = _BASE / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fpath = debug_dir / f"delete_stats_{ts}.json"
+    imm_s = stats.get("immediate_success", 0)
+    imm_f = stats.get("immediate_fail", 0)
+    ret_s = stats.get("retry_success", 0)
+    ret_f = stats.get("retry_fail", 0)
+    total_imm = imm_s + imm_f
+    total_ret = ret_s + ret_f
+    rate_imm = (imm_s / total_imm * 100) if total_imm else 0
+    rate_ret = (ret_s / total_ret * 100) if total_ret else 0
+    total_del = imm_s + ret_s
+    ev_s = stats.get("evict_retry_success", 0)
+    ev_f = stats.get("evict_retry_fail", 0)
+    data = {
+        "ts": ts,
+        "immediate_success": imm_s,
+        "immediate_fail": imm_f,
+        "immediate_total": total_imm,
+        "immediate_rate_pct": round(rate_imm, 2),
+        "retry_success": ret_s,
+        "retry_fail": ret_f,
+        "retry_total": total_ret,
+        "retry_rate_pct": round(rate_ret, 2),
+        "evict_retry_success": ev_s,
+        "evict_retry_fail": ev_f,
+        "total_deleted": total_del,
+        "pending_queue_len": pending_len,
+    }
+    with open(fpath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return str(fpath)
+
+
 async def _job_delete_stats(context: ContextTypes.DEFAULT_TYPE):
-    """每 6 小时输出删除统计到 bytecler/debug/delete_stats_*.json"""
-    global _delete_stats, _pending_delete_retry
+    """每 6 小时输出删除统计到 bytecler/debug/delete_stats_*.json。同步 IO 放入 executor 避免阻塞事件循环"""
     try:
-        debug_dir = _BASE / "debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        fpath = debug_dir / f"delete_stats_{ts}.json"
-        imm_s = _delete_stats["immediate_success"]
-        imm_f = _delete_stats["immediate_fail"]
-        ret_s = _delete_stats["retry_success"]
-        ret_f = _delete_stats["retry_fail"]
-        total_imm = imm_s + imm_f
-        total_ret = ret_s + ret_f
-        rate_imm = (imm_s / total_imm * 100) if total_imm else 0
-        rate_ret = (ret_s / total_ret * 100) if total_ret else 0
-        total_del = imm_s + ret_s
-        data = {
-            "ts": ts,
-            "immediate_success": imm_s,
-            "immediate_fail": imm_f,
-            "immediate_total": total_imm,
-            "immediate_rate_pct": round(rate_imm, 2),
-            "retry_success": ret_s,
-            "retry_fail": ret_f,
-            "retry_total": total_ret,
-            "retry_rate_pct": round(rate_ret, 2),
-            "total_deleted": total_del,
-            "pending_queue_len": len(_pending_delete_retry),
-        }
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        loop = asyncio.get_running_loop()
+        fpath = await loop.run_in_executor(None, _write_delete_stats_sync)
         print(f"[PTB] 删除统计已写入 {fpath}")
     except Exception as e:
         print(f"[PTB] 删除统计写入失败: {e}")
@@ -2869,7 +2913,12 @@ async def _send_sync_result_to_groups(bot, added: int, msg: str):
 
 
 async def _job_lottery_sync(context: ContextTypes.DEFAULT_TYPE):
-    added, msg = sync_lottery_winners()
+    """抽奖同步。sync_lottery_winners 为同步 sqlite 操作，放入 executor 避免阻塞事件循环"""
+    try:
+        loop = asyncio.get_running_loop()
+        added, msg = await loop.run_in_executor(None, sync_lottery_winners)
+    except Exception as e:
+        added, msg = 0, f"抽奖同步异常: {e}"
     print(f"[PTB] 抽奖同步: {msg}")
     await _send_sync_result_to_groups(context.bot, added, msg)
 
@@ -2963,9 +3012,11 @@ def _ptb_main():
     if jq:
         jq.run_repeating(_job_frost_reply, interval=2, first=2)
         jq.run_repeating(_job_cleanup_pending_keyword_confirm, interval=60, first=60)  # 每 60 秒清理超时确认
+        jq.run_repeating(_job_cleanup_bgroup_merge, interval=45, first=45)  # 每 45 秒兜底检查 B 群合并消息
+        jq.run_repeating(job_retry_pending_deletes, interval=120, first=120)  # 每 2 分钟兜底重试待删队列（无新消息群）
         jq.run_daily(_job_lottery_sync, time=dt_time(20, 0))  # 20:00 UTC = 北京时间凌晨 4 点
         jq.run_repeating(_job_delete_stats, interval=21600, first=21600)  # 每 6 小时输出删除统计到 debug/
-        print("[PTB] 定时任务已注册：抽奖同步 每日 20:00 UTC；关键词确认清理 每 60 秒；删除统计 每 6 小时")
+        print("[PTB] 定时任务已注册：抽奖同步 每日 20:00 UTC；关键词确认清理 每 60 秒；B群合并兜底 每 45 秒；待删队列兜底 每 2 分钟；删除统计 每 6 小时")
     else:
         print("[PTB] ⚠️ job_queue 为 None，定时任务未注册。请执行: pip install 'python-telegram-bot[job-queue]'")
 
