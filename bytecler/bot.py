@@ -1164,6 +1164,7 @@ XHCHAT_BOT_USERNAME = (os.getenv("XHCHAT_BOT_USERNAME") or os.getenv("BOT_USERNA
 BOT_NICKNAME = (os.getenv("BOT_NICKNAME") or "").strip()  # 机器人显示昵称，用于消息内容；未配置则用 get_me().first_name
 
 pending_verification = {}
+pending_private_verify: dict[int, dict] = {}  # user_id -> {chat_id, start_time}，自助验证私聊会话状态
 # 未加入 B 群的触发时间戳，(chat_id, uid) -> [t1,t2,...]，冷却+窗口内 5 次即限制
 _required_group_warn_count: dict[tuple[str, int], list] = {}
 _LINK_RE = re.compile(r"t\.me/c/(\d+)/(\d+)", re.I)
@@ -1656,19 +1657,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             ok = text == pb["code"] or text == f"验证码{pb['code']}"
             msg_id = pb.get("msg_id")
             if ok:
-                if msg_id is not None:
-                    update_verification_record(chat_id, msg_id, "passed")
-                    save_verification_records()
-                    _schedule_sync_background(_log_verification_outcome, chat_id, msg_id, "true")
-                else:
-                    print(f"[PTB] 警告: 验证通过但 msg_id 为空，跳过记录更新 chat_id={chat_id} uid={uid}")
-                add_verified_user(uid, user.username, f"{first_name} {last_name}".strip())
-                save_verified_users()
-                verification_failures.pop(key, None)
-                verification_blacklist.discard(uid)
-                pending_verification.pop(key, None)
+                tip = await _apply_verification_pass(
+                    context.bot, chat_id, uid,
+                    msg_id=msg_id,
+                    username=user.username,
+                    full_name=f"{first_name} {last_name}".strip(),
+                )
                 print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 验证通过(更新原记录) | 当前验证码消息msg_id={msg.message_id} [验证码消息不单独建记录]")
-                await msg.reply_text(f"【{first_name} {last_name}】\n\n✓ 验证通过\n\n已将您加入白名单，可以正常发言了。")
+                await msg.reply_text(f"【{first_name} {last_name}】\n\n✓ 验证通过\n\n{tip}")
             else:
                 cnt = increment_verification_failures(chat_id, uid)
                 save_verification_failures()
@@ -1881,7 +1877,18 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
         header = " ".join(lines) + "\n\n⚠️ 检测到疑似广告风险，请先完成人机验证。\n\n"
         code_lines = [f"• {_mask_display_name(name)} 验证码：<code>{c}</code>" for (_, name, c, _, _) in users_in_window]
         body = header + "\n".join(code_lines) + "\n\n直接发送上述验证码即可通过"
-        vmsg = await bot.send_message(chat_id=int(chat_id), text=body, parse_mode="HTML")
+        try:
+            me = await bot.get_me()
+            bot_username = me.username or ""
+        except Exception:
+            bot_username = ""
+        buttons = []
+        if bot_username:
+            for (uid, _, _, _, _) in users_in_window:
+                deep_link = f"https://t.me/{bot_username}?start=verify_{chat_id}_{uid}"
+                buttons.append([InlineKeyboardButton("自助验证", url=deep_link)])
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        vmsg = await bot.send_message(chat_id=int(chat_id), text=body, parse_mode="HTML", reply_markup=reply_markup)
         _verify_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": now}
     _safe_create_task(_delete_verify_merge_after(bot, int(chat_id), vmsg.message_id, chat_id), "verify_merge")
 
@@ -2001,6 +2008,40 @@ async def _maybe_ai_trigger(bot, msg, chat_id: str, user_id: int, text: str, fir
         traceback.print_exc()
 
 
+async def _apply_verification_pass(bot, chat_id: str, user_id: int, msg_id: int | None = None, username: str | None = None, full_name: str | None = None) -> str:
+    """验证通过后的共用逻辑：加白、清黑、清 failures、清 pending、解除群内限制、更新记录。返回成功提示文案。"""
+    key = (chat_id, user_id)
+    add_verified_user(user_id, username, full_name)
+    save_verified_users()
+    verification_failures.pop(key, None)
+    verification_blacklist.discard(user_id)
+    pending_verification.pop(key, None)
+    pending_private_verify.pop(user_id, None)
+    if msg_id is not None:
+        update_verification_record(chat_id, msg_id, "passed")
+        save_verification_records()
+        _schedule_sync_background(_log_verification_outcome, chat_id, msg_id, "true")
+    try:
+        perms = ChatPermissions.all_permissions()
+    except (AttributeError, TypeError):
+        perms = {
+            "can_send_messages": True,
+            "can_send_media_messages": True,
+            "can_send_other_messages": True,
+            "can_send_polls": True,
+            "can_add_web_page_previews": True,
+        }
+    try:
+        await bot.restrict_chat_member(
+            chat_id=int(chat_id),
+            user_id=user_id,
+            permissions=perms,
+        )
+    except Exception as e:
+        print(f"[PTB] 自助验证解除限制失败 chat={chat_id} uid={user_id}: {e}")
+    return "验证通过，已将您加入白名单，您可以正常发言不触发风控"
+
+
 async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, msg_id: int = None, restrict_hours: float | None = None):
     """限制用户发言。restrict_hours 若指定则按小时，否则按 VERIFY_RESTRICT_DURATION 天（验证码失败用）。"""
     if restrict_hours is not None:
@@ -2115,8 +2156,58 @@ async def cmd_clearlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    if update.effective_user:
-        pending_keyword_cmd.pop(update.effective_user.id, None)
+    user = update.effective_user
+    uid = user.id if user else 0
+    if uid:
+        pending_keyword_cmd.pop(uid, None)
+    args = context.args or []
+    if args and args[0].startswith("verify_"):
+        parts = args[0].split("_", 2)
+        if len(parts) >= 3:
+            try:
+                chat_id = parts[1]
+                target_uid = int(parts[2])
+            except (ValueError, IndexError):
+                chat_id, target_uid = None, None
+        else:
+            chat_id, target_uid = None, None
+        if chat_id is not None and target_uid and uid == target_uid:
+            try:
+                chat = await context.bot.get_chat(chat_id=int(chat_id))
+            except Exception:
+                chat = None
+            if chat and getattr(chat, "type", "") == "supergroup":
+                title, link = await _get_group_display_info(context.bot, chat_id)
+                group_display = f'<a href="{link}">{_escape_html(title)}</a>'
+                if target_uid in verified_users:
+                    await update.message.reply_text(
+                        f"您已是 {group_display} 白名单用户，无需验证",
+                        parse_mode="HTML",
+                    )
+                    return
+                key = (chat_id, target_uid)
+                now = time.time()
+                if key in pending_verification:
+                    pb = pending_verification[key]
+                    if now - pb["time"] <= VERIFY_TIMEOUT:
+                        pb["time"] = now
+                        code = pb["code"]
+                        msg_id = pb.get("msg_id")
+                    else:
+                        code = str(random.randint(1000, 9999))
+                        msg_id = None
+                        pending_verification[key] = {"code": code, "time": now, "msg_id": msg_id}
+                else:
+                    code = str(random.randint(1000, 9999))
+                    msg_id = None
+                    pending_verification[key] = {"code": code, "time": now, "msg_id": msg_id}
+                body = f"您正在发起验证，验证通过后可进入 {group_display} 的白名单。验证码是：{code}"
+                await update.message.reply_text(body, parse_mode="HTML")
+                pending_private_verify[uid] = {"chat_id": chat_id, "start_time": now}
+                return
+        pending_private_verify.pop(uid, None)
+    else:
+        pending_private_verify.pop(uid, None)
     await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2124,6 +2215,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.effective_user:
         pending_keyword_cmd.pop(update.effective_user.id, None)
+        pending_private_verify.pop(update.effective_user.id, None)
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
         "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
@@ -2141,9 +2233,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
     )
 
+def _clear_pending_private_verify(update: Update):
+    """所有以 / 开头的命令均视为退出自助验证"""
+    if update.effective_user:
+        pending_private_verify.pop(update.effective_user.id, None)
+
+
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2166,6 +2265,7 @@ async def cmd_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """私聊添加霜刃可用群。支持 /add_group @群 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2206,6 +2306,7 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """配置关联群验证/人机验证消息自动删除时间"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2225,6 +2326,7 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     uid = update.effective_user.id
     chat_id = str(update.effective_chat.id) if update.effective_chat else ""
     key = (chat_id, uid)
@@ -2257,6 +2359,7 @@ async def cmd_kw_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_kw(update, context, "name", "昵称")
 async def cmd_kw_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
+        _clear_pending_private_verify(update)
         pending_keyword_cmd.pop(update.effective_user.id, None)
     await update.message.reply_text("bio 简介关键词暂未启用")
 
@@ -2271,6 +2374,7 @@ async def _cmd_kw_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     """黑名单关键词管理：命中直接删除并将用户加入黑名单。add/remove/list"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2318,6 +2422,7 @@ async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
     """白名单管理：add/remove/list。子串=直接输入，精确=/前缀，正则=/正则/"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2387,6 +2492,7 @@ async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """两段式多轮：添加消息黑名单关键词。支持 /add_text 关键词 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2407,6 +2513,7 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """两段式多轮：添加昵称黑名单关键词。支持 /add_name 关键词 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2424,11 +2531,14 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_add_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        _clear_pending_private_verify(update)
     await update.message.reply_text("bio 简介关键词暂未启用")
 
 async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
     if update.effective_chat.type != "private" or not update.effective_user:
         return
+    _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
         await update.message.reply_text("无权限")
         return
@@ -2612,17 +2722,69 @@ async def callback_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"【{label}】当前 {current} 秒后自动删除。请发送数字设置新值（如 90）：")
 
 
+async def private_nontext_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """私聊非文字消息（贴纸、图片等）：若在自助验证流程中则视为验证失败"""
+    if not update.message or update.effective_chat.type != "private" or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if uid in pending_private_verify:
+        await update.message.reply_text("验证码错误")
+
+
 async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_chat.type != "private":
         return
     user = update.effective_user
     if not user:
         return
-    if not is_admin(user.id, ADMIN_IDS):
-        await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
-        return
     uid = user.id
     text = (update.message.text or "").strip()
+
+    if text.startswith("/"):
+        pending_private_verify.pop(uid, None)
+
+    if uid in pending_private_verify:
+        info = pending_private_verify[uid]
+        chat_id = info.get("chat_id")
+        start_time = info.get("start_time", 0)
+        if time.time() - start_time > VERIFY_TIMEOUT:
+            pending_private_verify.pop(uid, None)
+            await update.message.reply_text("验证已超时")
+            return
+        if uid in verified_users:
+            pending_private_verify.pop(uid, None)
+            await update.message.reply_text("您已完成验证")
+            return
+        key = (chat_id, uid)
+        if key not in pending_verification:
+            pending_private_verify.pop(uid, None)
+            await update.message.reply_text("验证已超时")
+            return
+        pb = pending_verification[key]
+        if time.time() - pb["time"] > VERIFY_TIMEOUT:
+            pending_verification.pop(key, None)
+            pending_private_verify.pop(uid, None)
+            await update.message.reply_text("验证已超时")
+            return
+        if not text:
+            await update.message.reply_text("验证码错误")
+            return
+        ok = text == pb["code"] or text == f"验证码{pb['code']}"
+        if ok:
+            tip = await _apply_verification_pass(
+                context.bot, chat_id, uid,
+                msg_id=pb.get("msg_id"),
+                username=user.username,
+                full_name=f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or None,
+            )
+            await update.message.reply_text(tip)
+        else:
+            await update.message.reply_text("验证码错误")
+        return
+
+    if not is_admin(uid, ADMIN_IDS):
+        await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
+        return
 
     # 0. /add_group 的后续输入：等待群标识（120 秒超时）
     if uid in pending_add_group:
@@ -3130,6 +3292,7 @@ def _ptb_main():
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("add_group", cmd_add_group))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
     app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))
     app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
