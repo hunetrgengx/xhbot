@@ -913,7 +913,7 @@ _ENV_GROUP_IDS = {s.strip() for s in GROUP_ID_STR.split(",") if s.strip()}
 # 霜刃可用群 = 环境变量 + target_groups.json 中通过 /add_group 添加的
 TARGET_GROUP_IDS: set = set()
 TARGET_GROUPS_PATH = _path("target_groups.json")
-# 全局 B 群（未配置群级时使用）；群级配置见 bgroup_config.json、/set_bgroup
+# 已废弃：B 群仅通过 /setlimit 群内配置，不再使用 env 兜底
 REQUIRED_GROUP_ID = (os.getenv("REQUIRED_GROUP_ID") or os.getenv("REQUIRED_GROUP_IDS") or "").strip()
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
@@ -1000,7 +1000,7 @@ def _save_bgroup_config():
 
 
 def get_bgroup_ids_for_chat(chat_id: str) -> list:
-    """获取某群的 B 群 ID（仅一个）。群级配置优先；未配置时回退到 REQUIRED_GROUP_ID（.env）；显式 /clearlimit 则不校验。"""
+    """获取某群的 B 群 ID（仅一个）。仅当群内通过 /setlimit 显式配置时校验；未配置则无 B 群逻辑，不兜底 REQUIRED_GROUP_ID。"""
     cid = str(chat_id)
     if cid in _bgroup_config:
         val = _bgroup_config[cid]
@@ -1010,9 +1010,6 @@ def get_bgroup_ids_for_chat(chat_id: str) -> list:
         if s and s.lstrip("-").isdigit():
             return [s]
         return []
-    # 未配置群级时使用全局 B 群（与注释一致）
-    if REQUIRED_GROUP_ID and REQUIRED_GROUP_ID.lstrip("-").isdigit():
-        return [REQUIRED_GROUP_ID]
     return []
 
 
@@ -1021,7 +1018,7 @@ def set_bgroup_for_chat(chat_id: str, b_id: str | None) -> bool:
     cid = str(chat_id)
     if b_id is None or (isinstance(b_id, str) and not b_id.strip()):
         if cid in _bgroup_config:
-            # 存空表示「显式不校验」，与「从未配置」区分（后者会回退到 REQUIRED_GROUP_ID）
+            # 存空表示「显式不校验」，与「从未配置」区分
             _bgroup_config[cid] = ""
             _save_bgroup_config()
             return True
