@@ -2184,7 +2184,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if target_uid in verified_users:
                     print(f"[PTB] 自助验证: 白名单用户 uid={target_uid} 已提示无需验证")
                     await update.message.reply_text(
-                        f"您已是 {group_display} 白名单用户，无需验证",
+                        "✓ 无需验证\n\n您已是白名单用户\n\n所在群：" + group_display + " （点击可进入该群）",
                         parse_mode="HTML",
                     )
                     return
@@ -2204,7 +2204,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     code = str(random.randint(1000, 9999))
                     msg_id = None
                     pending_verification[key] = {"code": code, "time": now, "msg_id": msg_id}
-                body = f"您正在发起验证，验证通过后可进入 {group_display} 的白名单。验证码是：{code}"
+                body = f"⌛您正在发起验证\n\n验证码是：{code}\n\n验证通过后可进入白名单\n目标群：{group_display}（点击进入该群）"
                 await update.message.reply_text(body, parse_mode="HTML")
                 pending_private_verify[uid] = {"chat_id": chat_id, "start_time": now}
                 return
