@@ -1884,9 +1884,8 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
             bot_username = ""
         buttons = []
         if bot_username:
-            for (uid, _, _, _, _) in users_in_window:
-                deep_link = f"https://t.me/{bot_username}?start=verify_{chat_id}_{uid}"
-                buttons.append([InlineKeyboardButton("自助验证", url=deep_link)])
+            deep_link = f"https://t.me/{bot_username}?start=verify_{chat_id}"
+            buttons.append([InlineKeyboardButton("自助验证", url=deep_link)])
         reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
         vmsg = await bot.send_message(chat_id=int(chat_id), text=body, parse_mode="HTML", reply_markup=reply_markup)
         _verify_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": now}
@@ -2161,25 +2160,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid:
         pending_keyword_cmd.pop(uid, None)
     args = context.args or []
+    if not args and update.message and update.message.text:
+        parts_text = (update.message.text or "").strip().split(None, 1)
+        if len(parts_text) >= 2:
+            args = [parts_text[1]]
     if args and args[0].startswith("verify_"):
+        print(f"[PTB] 自助验证: 收到参数 args[0]={args[0]!r} uid={uid}")
         parts = args[0].split("_", 2)
-        if len(parts) >= 3:
-            try:
-                chat_id = parts[1]
-                target_uid = int(parts[2])
-            except (ValueError, IndexError):
-                chat_id, target_uid = None, None
+        if len(parts) >= 2:
+            chat_id = parts[1]
+            target_uid = uid
         else:
             chat_id, target_uid = None, None
-        if chat_id is not None and target_uid and uid == target_uid:
+        if chat_id and target_uid:
             try:
                 chat = await context.bot.get_chat(chat_id=int(chat_id))
-            except Exception:
+            except Exception as e:
+                print(f"[PTB] 自助验证 get_chat 失败 chat_id={chat_id}: {e}")
                 chat = None
-            if chat and getattr(chat, "type", "") == "supergroup":
+            if chat and getattr(chat, "type", "") in ("group", "supergroup"):
                 title, link = await _get_group_display_info(context.bot, chat_id)
                 group_display = f'<a href="{link}">{_escape_html(title)}</a>'
                 if target_uid in verified_users:
+                    print(f"[PTB] 自助验证: 白名单用户 uid={target_uid} 已提示无需验证")
                     await update.message.reply_text(
                         f"您已是 {group_display} 白名单用户，无需验证",
                         parse_mode="HTML",
@@ -2205,6 +2208,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(body, parse_mode="HTML")
                 pending_private_verify[uid] = {"chat_id": chat_id, "start_time": now}
                 return
+            if chat_id and target_uid:
+                print(f"[PTB] 自助验证未进入流程: chat={'None' if not chat else chat.type} uid={uid} target={target_uid}")
         pending_private_verify.pop(uid, None)
     else:
         pending_private_verify.pop(uid, None)
