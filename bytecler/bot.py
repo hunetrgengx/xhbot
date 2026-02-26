@@ -696,13 +696,15 @@ def load_verification_records():
 
 def save_verification_records():
     try:
-        items = list(_verification_records.items())
-        if len(items) > 10000:
-            items = sorted(items, key=lambda x: (x[1].get("started_at") or ""), reverse=True)[:10000]
+        # 快照，避免并发修改导致 "dictionary changed size during iteration"
+        snapshot = dict(_verification_records)
+        if len(snapshot) > 10000:
+            items = sorted(snapshot.items(), key=lambda x: (x[1].get("started_at") or ""), reverse=True)[:10000]
+            snapshot = dict(items)
             _verification_records.clear()
-            _verification_records.update(dict(items))
+            _verification_records.update(snapshot)
         with open(VERIFICATION_RECORDS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"records": _verification_records}, f, ensure_ascii=False, indent=2)
+            json.dump({"records": snapshot}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[shared] 保存验证记录失败: {e}")
         traceback.print_exc()
@@ -1061,6 +1063,33 @@ async def _resolve_bgroup_input(bot, raw: str) -> str | None:
     return None
 
 
+async def _check_bot_can_verify_bgroup(bot, b_id: str) -> tuple[bool, str]:
+    """
+    检查机器人是否能在 B 群/频道中正确验证用户是否已加入。
+    Telegram API：get_chat_member 仅在机器人为管理员时保证可用（频道必须为管理员）。
+    返回 (能否验证, 错误说明)，若可验证则错误说明为空。
+    """
+    try:
+        chat = await bot.get_chat(chat_id=int(b_id))
+        chat_type = getattr(chat, "type", "") or ""
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id=int(b_id), user_id=me.id)
+        status = getattr(member, "status", "") or ""
+        status_str = getattr(status, "value", status) if status else ""
+        status_str = str(status_str).lower()
+        if status_str in ("left", "kicked"):
+            return False, "机器人未加入该群组/频道，请先邀请机器人加入"
+        if chat_type == "channel":
+            if status_str not in ("creator", "administrator"):
+                return False, "该目标为频道，机器人需设为管理员才能检查用户是否已加入，请将机器人在频道中设为管理员"
+    except Exception as e:
+        err = str(e).strip() or repr(e)
+        if "chat not found" in err.lower() or "have no access" in err.lower():
+            return False, "机器人无法访问该群组/频道，请确认已邀请机器人加入"
+        return False, f"无法验证机器人权限：{err[:100]}"
+    return True, ""
+
+
 _load_bgroup_config()
 
 
@@ -1207,13 +1236,16 @@ async def _is_user_in_required_group(bot, user_id: int, chat_id: str, skip_cache
         try:
             member = await bot.get_chat_member(chat_id=int(b_id), user_id=user_id)
             status = getattr(member, "status", "") or ""
-            is_in = status not in ("left", "kicked")
+            # 兼容 enum/str：PTB 可能返回 ChatMemberStatus 枚举，统一转为字符串比较
+            status_str = getattr(status, "value", status) if status else ""
+            status_str = str(status_str).lower() if status_str else ""
+            is_in = status_str not in ("left", "kicked")
             _user_in_required_group_cache[key] = (is_in, now)
-            print(f"[PTB] B群检查: uid={user_id} b_id={b_id} status={status!r} is_in={is_in} skip_cache={skip_cache}")
+            print(f"[PTB] B群检查: chat_id={chat_id} uid={user_id} b_id={b_id} status={status_str!r} is_in={is_in} skip_cache={skip_cache}")
             if is_in:
                 return True
         except Exception as e:
-            print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {b_id} 失败: {e}")
+            print(f"[PTB] 检查用户 {user_id} 是否在 B 群 {b_id} 失败 (chat_id={chat_id}): {e}")
             traceback.print_exc()
             return False  # 接口报错或异常时（如 Bot 未加入 B 群），无法验证则视为未加入，触发限制
     return False
@@ -1612,8 +1644,16 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("请输入 B 群/频道，或 /cancel 取消")
             pending_setlimit[key] = {"timestamp": time.time()}
             return
+        if (text or "").strip().lower() in ("/cancel", "cancel"):
+            await update.message.reply_text("已取消")
+            return
         b_id = await _resolve_bgroup_input(context.bot, text)
         if b_id:
+            can_verify, err_msg = await _check_bot_can_verify_bgroup(context.bot, b_id)
+            if not can_verify:
+                await update.message.reply_text(f"无法设置：{err_msg}\n请修正后再试。")
+                pending_setlimit[key] = {"timestamp": time.time()}
+                return
             set_bgroup_for_chat(chat_id, b_id)
             await update.message.reply_text(f"已设置 B 群：{b_id}\n用户需加入才能发言")
         else:
