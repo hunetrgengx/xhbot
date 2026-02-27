@@ -30,6 +30,7 @@ except ImportError:
     AHOCORASICK_AVAILABLE = False
 
 from telegram import Update, ChatMemberBanned, ChatMemberRestricted, ChatMemberLeft, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeChatMember
 from telegram.constants import MessageEntityType
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ChatMemberHandler, CallbackQueryHandler,
@@ -1084,8 +1085,11 @@ async def _check_bot_can_verify_bgroup(bot, b_id: str) -> tuple[bool, str]:
                 return False, "该目标为频道，机器人需设为管理员才能检查用户是否已加入，请将机器人在频道中设为管理员"
     except Exception as e:
         err = str(e).strip() or repr(e)
-        if "chat not found" in err.lower() or "have no access" in err.lower():
+        err_l = err.lower()
+        if "chat not found" in err_l or "have no access" in err_l:
             return False, "机器人无法访问该群组/频道，请确认已邀请机器人加入"
+        if "member list is inaccessible" in err_l or "user not found" in err_l:
+            return False, "机器人需在该群组/频道中设为管理员才能检查用户是否已加入，请将机器人设为管理员"
         return False, f"无法验证机器人权限：{err[:100]}"
     return True, ""
 
@@ -1519,16 +1523,23 @@ def _remove_whitelist_keyword(field: str, keyword: str, is_regex: bool = False, 
     return True
 
 
+def _is_pure_english_or_spaces(s: str) -> bool:
+    """是否为纯英文或英文+空格组合（不含中文、数字、符号等）"""
+    t = (s or "").replace(" ", "")
+    return bool(t) and all(c.isascii() and c.isalpha() for c in t)
+
+
 def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
-    """管理员（真人）删除并限制/封禁用户时，将昵称加入 name 关键词、被删消息加入 text 关键词。白名单中的不录入。"""
+    """管理员（真人）删除并限制/封禁用户时，将昵称加入 name 关键词、被删消息加入 text 关键词。白名单中的不录入；纯英文昵称不录入。"""
     name_trimmed = (full_name or "").strip()
-    if name_trimmed and not _is_in_keyword_whitelist("name", name_trimmed):
+    skip_name = _is_in_keyword_whitelist("name", name_trimmed) or _is_pure_english_or_spaces(name_trimmed)
+    if name_trimmed and not skip_name:
         as_exact_name = len(name_trimmed) <= 2
         if add_spam_keyword("name", name_trimmed, as_exact=as_exact_name):
             save_spam_keywords()
             print(f"[PTB] 管理员操作: 已加入 name 关键词 {name_trimmed!r} (exact={as_exact_name})")
     elif name_trimmed:
-        print(f"[PTB] 管理员操作: 昵称 {name_trimmed!r} 在白名单中，跳过")
+        print(f"[PTB] 管理员操作: 昵称 {name_trimmed!r} 在白名单或为纯英文，跳过")
     key = (chat_id, user_id)
     entry = _last_message_by_user.pop(key, None)
     msg_text = ""
@@ -2146,6 +2157,10 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
 
 PENDING_SETLIMIT_TIMEOUT = 120
 pending_setlimit: dict[tuple[str, int], dict] = {}  # (chat_id, uid) -> {timestamp}
+pending_search: dict[int, dict] = {}  # uid -> {timestamp}，/search 后等待链接，仅管理员
+PENDING_SEARCH_TIMEOUT = 120
+pending_start_verify: dict[int, dict] = {}  # uid -> {timestamp}，/start 后非白名单用户等待群链接以发起验证
+PENDING_START_VERIFY_TIMEOUT = 120
 
 
 async def _is_group_admin_can_promote(bot, chat_id: int, user_id: int) -> bool:
@@ -2278,15 +2293,68 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[PTB] 自助验证未进入流程: chat={'None' if not chat else chat.type} uid={uid} target={target_uid}")
         pending_private_verify.pop(uid, None)
     else:
+        if uid in verified_users:
+            await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
+            return
+        if uid in pending_private_verify and not is_admin(uid, ADMIN_IDS):
+            info = pending_private_verify[uid]
+            chat_id = info.get("chat_id")
+            key = (chat_id, uid)
+            if key in pending_verification:
+                pb = pending_verification[key]
+                if time.time() - pb["time"] <= VERIFY_TIMEOUT:
+                    title, link = await _get_group_display_info(context.bot, chat_id)
+                    group_display = f'<a href="{link}">{_escape_html(title)}</a>'
+                    body = f"⌛您正在发起验证\n\n验证码是：{pb['code']}\n\n验证通过后可进入白名单\n目标群：{group_display}"
+                    await update.message.reply_text(body, parse_mode="HTML")
+                    return
+            await update.message.reply_text("您正在验证中，请直接发送验证码")
+            return
         pending_private_verify.pop(uid, None)
+        if is_admin(uid, ADMIN_IDS):
+            try:
+                _admin_cmds = [
+                    BotCommand("add_text", "添加消息关键词"),
+                    BotCommand("add_name", "添加昵称关键词"),
+                    BotCommand("add_group", "添加霜刃可用群"),
+                    BotCommand("cancel", "取消操作"),
+                    BotCommand("help", "帮助"),
+                    BotCommand("reload", "重载配置"),
+                    BotCommand("start", "启动"),
+                    BotCommand("settime", "配置自动删除时间"),
+                    BotCommand("setlimit", "群内配置B群"),
+                    BotCommand("search", "查询验证记录"),
+                ]
+                await context.bot.set_my_commands(
+                    _admin_cmds,
+                    scope=BotCommandScopeChatMember(chat_id=uid, user_id=uid),
+                )
+            except Exception:
+                pass
+            await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
+        else:
+            pending_start_verify[uid] = {"timestamp": time.time()}
+            await update.message.reply_text(
+                "请发送群链接（@群、https://t.me/xxx 或 -100xxxxxxxxxx）以发起验证\n"
+                "120 秒内有效，/cancel 取消"
+            )
+        return
     await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    if update.effective_user:
-        pending_keyword_cmd.pop(update.effective_user.id, None)
-        pending_private_verify.pop(update.effective_user.id, None)
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid:
+        pending_keyword_cmd.pop(uid, None)
+        if uid in pending_private_verify and not is_admin(uid, ADMIN_IDS):
+            await update.message.reply_text("您正在验证中，请直接发送验证码")
+            return
+        if uid in pending_start_verify and not is_admin(uid, ADMIN_IDS):
+            await update.message.reply_text("请发送群链接（@群、https://t.me/xxx 或 -100xxxxxxxxxx）以发起验证")
+            return
+        pending_private_verify.pop(uid, None)
+        pending_start_verify.pop(uid, None)
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
         "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
@@ -2300,14 +2368,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /kw_text、/kw_name add/remove — 待验证关键词（命中触发人机验证）\n"
         "• /kw_blacklist_text、/kw_blacklist_name add/remove — 黑名单关键词（命中直接删除+加黑）\n"
         "• /wl_name、/wl_text — 白名单（管理员限制用户时不录入这些昵称/消息）\n"
-        "• 发送群消息链接 — 查看该消息的验证过程\n\n"
+        "• /search — 管理员查询验证记录（发送后输入群消息链接）\n\n"
         "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
     )
 
 def _clear_pending_private_verify(update: Update):
-    """所有以 / 开头的命令均视为退出自助验证"""
+    """所有以 / 开头的命令均视为退出自助验证（/start、/help 对普通用户不打断，在 cmd_start/cmd_help 中单独处理）"""
     if update.effective_user:
         pending_private_verify.pop(update.effective_user.id, None)
+
+
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员查询验证记录：先 /search，再发送群消息链接"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if not is_admin(uid, ADMIN_IDS):
+        await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
+        return
+    pending_search[uid] = {"timestamp": time.time()}
+    await update.message.reply_text("请发送群消息链接（如 https://t.me/c/xxx/123）\n120 秒内有效，/cancel 取消")
 
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2420,6 +2500,12 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("已取消")
     elif uid in pending_settime_cmd:
         pending_settime_cmd.pop(uid, None)
+        await update.message.reply_text("已取消")
+    elif uid in pending_search:
+        pending_search.pop(uid, None)
+        await update.message.reply_text("已取消")
+    elif uid in pending_start_verify:
+        pending_start_verify.pop(uid, None)
         await update.message.reply_text("已取消")
     else:
         await update.message.reply_text("当前无待取消的操作")
@@ -2812,7 +2898,10 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
     text = (update.message.text or "").strip()
 
     if text.startswith("/"):
-        pending_private_verify.pop(uid, None)
+        cmd_lower = text.strip().lower().split(None, 1)[0] if text.strip() else ""
+        if cmd_lower not in ("/start", "/help"):
+            pending_private_verify.pop(uid, None)
+            pending_start_verify.pop(uid, None)
 
     if uid in pending_private_verify:
         info = pending_private_verify[uid]
@@ -2853,11 +2942,44 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("验证码错误")
         return
 
+    # 0. /start 后非白名单用户等待群链接以发起验证
+    if uid in pending_start_verify:
+        info = pending_start_verify.get(uid)
+        if info and (time.time() - info.get("timestamp", 0)) > PENDING_START_VERIFY_TIMEOUT:
+            pending_start_verify.pop(uid, None)
+            await update.message.reply_text("已超时，请重新发送 /start")
+            return
+        pending_start_verify.pop(uid, None)
+        if not text:
+            pending_start_verify[uid] = {"timestamp": time.time()}
+            await update.message.reply_text("请输入群链接（@群、https://t.me/xxx 或 -100xxxxxxxxxx）")
+            return
+        gid = await _resolve_group_input(context.bot, text)
+        if gid and chat_allowed(gid, TARGET_GROUP_IDS):
+            try:
+                chat = await context.bot.get_chat(chat_id=int(gid))
+            except Exception:
+                chat = None
+            if chat and getattr(chat, "type", "") in ("group", "supergroup"):
+                title, link = await _get_group_display_info(context.bot, gid)
+                group_display = f'<a href="{link}">{_escape_html(title)}</a>'
+                now = time.time()
+                code = str(random.randint(1000, 9999))
+                key = (gid, uid)
+                pending_verification[key] = {"code": code, "time": now, "msg_id": None}
+                pending_private_verify[uid] = {"chat_id": gid, "start_time": now}
+                body = f"⌛您正在发起验证\n\n验证码是：{code}\n\n验证通过后可进入白名单\n目标群：{group_display}"
+                await update.message.reply_text(body, parse_mode="HTML")
+                return
+        pending_start_verify[uid] = {"timestamp": time.time()}
+        await update.message.reply_text("解析失败或该群不在监控列表，请发送有效群链接（@群、https://t.me/xxx 或 -100xxxxxxxxxx）")
+        return
+
     if not is_admin(uid, ADMIN_IDS):
         await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
         return
 
-    # 0. /add_group 的后续输入：等待群标识（120 秒超时）
+    # 1. /add_group 的后续输入：等待群标识（120 秒超时）
     if uid in pending_add_group:
         info = pending_add_group[uid]
         elapsed = time.time() - info.get("timestamp", 0)
@@ -2941,9 +3063,17 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             info["timestamp"] = time.time()  # 刷新超时时间
         return
 
-    # 2. 群消息链接查询（支持 t.me/c/123/456 和 t.me/USERNAME/123），仅在有链接特征时解析
+    # 2. 群消息链接查询：需先 /search，再发送链接
     if not (text and ("t.me" in text or "telegram" in text.lower())):
         return
+    if uid not in pending_search:
+        return
+    info = pending_search.get(uid)
+    if info and (time.time() - info.get("timestamp", 0)) > PENDING_SEARCH_TIMEOUT:
+        pending_search.pop(uid, None)
+        await update.message.reply_text("已超时，请重新发送 /search")
+        return
+    pending_search.pop(uid, None)
     print(f"[PTB] 验证记录查询: 收到链接 text={text[:80]!r}")
     parsed = await _parse_message_link_async(text, context.bot)
     if not parsed:
@@ -3283,9 +3413,18 @@ async def _job_lottery_sync(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _post_init_send_hello(application: Application):
-    # 设置 Bot 菜单命令
+    # 设置 Bot 菜单命令：非管理员仅见 start/help/cancel，管理员见全部
     try:
-        await application.bot.set_my_commands([
+        minimal_commands = [
+            BotCommand("start", "启动"),
+            BotCommand("help", "帮助"),
+            BotCommand("cancel", "取消操作"),
+        ]
+        await application.bot.set_my_commands(
+            minimal_commands,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        admin_commands = [
             BotCommand("add_text", "添加消息关键词"),
             BotCommand("add_name", "添加昵称关键词"),
             BotCommand("add_group", "添加霜刃可用群"),
@@ -3295,7 +3434,16 @@ async def _post_init_send_hello(application: Application):
             BotCommand("start", "启动"),
             BotCommand("settime", "配置自动删除时间"),
             BotCommand("setlimit", "群内配置B群"),
-        ])
+            BotCommand("search", "查询验证记录"),
+        ]
+        for admin_id in ADMIN_IDS:
+            try:
+                await application.bot.set_my_commands(
+                    admin_commands,
+                    scope=BotCommandScopeChatMember(chat_id=admin_id, user_id=admin_id),
+                )
+            except Exception as e:
+                print(f"[PTB] 设置管理员 {admin_id} 命令菜单失败（可能未与机器人私聊过）: {e}")
     except Exception as e:
         print(f"[PTB] 设置菜单命令失败: {e}")
         traceback.print_exc()
@@ -3367,6 +3515,7 @@ def _ptb_main():
     app.add_handler(CommandHandler("add_bio", cmd_add_bio))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("add_group", cmd_add_group))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
