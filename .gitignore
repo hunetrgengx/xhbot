@@ -11,6 +11,8 @@ __pycache__/
 *.swo
 
 # 认证与数据库（勿提交）
+.env
+**/.env
 *.session
 *.session-journal
 *.db

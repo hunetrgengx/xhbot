@@ -48,13 +48,41 @@ from message_delete import (
 )
 
 
+def _select_delete_bot(chat_id: int, msg_id: int) -> str:
+    """方案 C 负载均衡：frost | assistant，hash 实现约 50% 分配"""
+    h = hash((str(chat_id), msg_id))
+    return "frost" if (h % 2 == 0) else "assistant"
+
+
 async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None) -> bool:
-    """本项目封装：clear_cache_key 时自动用 _last_message_by_user 清理；失败时记录到 delete_failures.jsonl"""
+    """本项目封装：方案 C 负载均衡；霜刃始终尝试删除（可独立运行），小助理为补充；clear_cache_key 时自动用 _last_message_by_user 清理"""
+    cid_int = int(chat_id) if isinstance(chat_id, str) else chat_id
+    if DELETE_LOAD_BALANCE:
+        choice = _select_delete_bot(cid_int, msg_id)
+        if choice == "assistant":
+            try:
+                _xhbot = _BASE.parent
+                if str(_xhbot) not in sys.path:
+                    sys.path.insert(0, str(_xhbot))
+                from handoff import put_delete_handoff
+                put_delete_handoff(cid_int, msg_id)
+            except Exception:
+                pass
+            # 不 return：霜刃继续尝试，保证无小助理或小助理权限不足时可独立运行
     ok = await _delete_message_with_retry_raw(
         bot, chat_id, msg_id, label, retries=retries,
         cache_dict=_last_message_by_user if clear_cache_key else None,
         clear_cache_key=clear_cache_key,
     )
+    if not ok and DELETE_LOAD_BALANCE:
+        try:
+            _xhbot = _BASE.parent
+            if str(_xhbot) not in sys.path:
+                sys.path.insert(0, str(_xhbot))
+            from handoff import put_delete_handoff
+            put_delete_handoff(cid_int, msg_id)
+        except Exception:
+            pass
     if not ok:
         uid = clear_cache_key[1] if clear_cache_key else 0
         _schedule_sync_background(_log_delete_failure, chat_id, msg_id, label, uid)
@@ -62,13 +90,12 @@ async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str,
 
 
 async def _delete_after(bot, chat_id: int, msg_id: int, sec: int, user_msg_id: Optional[int] = None, user_cache_key: Optional[Tuple[str, int]] = None):
-    """本项目封装：user_cache_key 时自动用 _last_message_by_user 清理"""
-    await _delete_after_raw(
-        bot, chat_id, msg_id, sec,
-        user_msg_id=user_msg_id,
-        cache_dict=_last_message_by_user if user_cache_key else None,
-        user_cache_key=user_cache_key,
-    )
+    """本项目封装：sec 秒后删除；user_cache_key 时自动用 _last_message_by_user 清理；走负载均衡"""
+    await asyncio.sleep(sec)
+    cid_int = int(chat_id) if isinstance(chat_id, str) else chat_id
+    if user_msg_id is not None:
+        await _delete_message_with_retry(bot, cid_int, user_msg_id, "user_msg", retries=3, clear_cache_key=user_cache_key)
+    await _delete_message_with_retry(bot, cid_int, msg_id, "bot_msg", retries=3)
 
 
 # ==================== 共享逻辑 (原 shared.py) ====================
@@ -85,6 +112,7 @@ VERIFICATION_RECORDS_PATH = _path("verification_records.json")
 SYNC_LOTTERY_CHECKPOINT_PATH = _path("sync_lottery_checkpoint.json")
 SETTIME_CONFIG_PATH = _path("settime_config.json")
 BGROUP_CONFIG_PATH = _path("bgroup_config.json")  # 每群单独配置 B 群（仅一个）：{ "chat_id": "b_id" }，无全局
+COMBINED_PAIRS_PATH = _path("combined_pairs.json")  # 组合关键词：昵称+消息同时匹配时直接删除，[{"name":"小月","text":"开课了"}]
 LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 
 # 关键词三类：黑名单(命中直接删除)、待验证(命中触发人机验证)、白名单(管理员限制时不录入)
@@ -95,6 +123,8 @@ spam_keywords = {"blacklist": {"text": {"exact": [], "match": [], "_ac": None, "
                  "bio": {"exact": [], "match": [], "_ac": None, "_regex": []},
                  "whitelist": {"name": {"exact": [], "match": [], "_regex": []},
                               "text": {"exact": [], "match": [], "_regex": []}}}
+# 组合关键词：昵称+消息同时匹配(match)时直接删除，不加入黑名单
+_combined_pairs: list[dict[str, str]] = []  # [{"name":"小月","text":"开课了"}, ...]
 verified_users = set()
 verified_users_details = {}
 join_times = {}
@@ -115,6 +145,8 @@ ENABLE_EMOJI_CHECK = os.getenv("ENABLE_EMOJI_CHECK", "1").lower() not in ("0", "
 ENABLE_STICKER_CHECK = os.getenv("ENABLE_STICKER_CHECK", "1").lower() not in ("0", "false", "no")
 # 霜刃 AI 回复 N 秒后自动删除，0 表示不删除
 FROST_REPLY_DELETE_AFTER = int(os.getenv("FROST_REPLY_DELETE_AFTER", "0") or "0")
+# 方案 C：删除负载均衡（霜刃/小助理 50% 分配），0 关闭
+DELETE_LOAD_BALANCE = os.getenv("DELETE_LOAD_BALANCE", "1").lower() not in ("0", "false", "no")
 # 消息删除模块（message_delete.py），删除失败待重试队列等参数在模块内配置
 
 
@@ -212,6 +244,69 @@ def load_spam_keywords():
     except Exception as e:
         print(f"[shared] 加载关键词失败: {e}")
         traceback.print_exc()
+
+
+def _load_combined_pairs():
+    global _combined_pairs
+    if not COMBINED_PAIRS_PATH.exists():
+        _combined_pairs = []
+        return
+    try:
+        with open(COMBINED_PAIRS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pairs = data.get("pairs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        _combined_pairs = [{"name": str(p.get("name", "")).strip(), "text": str(p.get("text", "")).strip()}
+                          for p in pairs if isinstance(p, dict) and p.get("name") and p.get("text")]
+    except Exception as e:
+        print(f"[PTB] 加载组合关键词失败: {e}")
+        traceback.print_exc()
+        _combined_pairs = []
+
+
+def _save_combined_pairs():
+    try:
+        with open(COMBINED_PAIRS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"pairs": _combined_pairs}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[PTB] 保存组合关键词失败: {e}")
+        traceback.print_exc()
+
+
+def check_combined_pairs(first_name: str, last_name: str, msg_text: str) -> Optional[tuple[str, str]]:
+    """检查昵称+消息是否同时匹配某组合对。match 形式（子串）。返回 (name_kw, text_kw) 或 None"""
+    full_name = f"{first_name or ''} {last_name or ''}".strip()
+    name_lower = full_name.lower()
+    text_lower = (msg_text or "").lower()
+    for p in _combined_pairs:
+        nk, tk = (p.get("name") or "").strip(), (p.get("text") or "").strip()
+        if nk and tk and nk.lower() in name_lower and tk.lower() in text_lower:
+            return (nk, tk)
+    return None
+
+
+def add_combined_pair(name_kw: str, text_kw: str) -> bool:
+    """添加组合对。已存在则返回 True 不重复添加"""
+    nk, tk = (name_kw or "").strip(), (text_kw or "").strip()
+    if not nk or not tk:
+        return False
+    for p in _combined_pairs:
+        if (p.get("name") or "").strip() == nk and (p.get("text") or "").strip() == tk:
+            return True
+    _combined_pairs.append({"name": nk, "text": tk})
+    return True
+
+
+def remove_combined_pair(name_kw: str, text_kw: str) -> bool:
+    """移除组合关键词"""
+    nk, tk = (name_kw or "").strip(), (text_kw or "").strip()
+    if not nk or not tk:
+        return False
+    global _combined_pairs
+    new_cp = [p for p in _combined_pairs if (p.get("name") or "").strip() != nk or (p.get("text") or "").strip() != tk]
+    if len(new_cp) == len(_combined_pairs):
+        return False
+    _combined_pairs = new_cp
+    return True
 
 
 def save_spam_keywords():
@@ -920,6 +1015,37 @@ TARGET_GROUPS_PATH = _path("target_groups.json")
 REQUIRED_GROUP_ID = (os.getenv("REQUIRED_GROUP_ID") or os.getenv("REQUIRED_GROUP_IDS") or "").strip()
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip().isdigit()}
+
+# 命令菜单：管理员见全部，非管理员仅 start/help/cancel
+_MENU_MINIMAL = [
+    BotCommand("start", "启动"),
+    BotCommand("help", "帮助"),
+    BotCommand("cancel", "取消操作"),
+]
+_MENU_ADMIN = [
+    BotCommand("add_text", "添加消息关键词"),
+    BotCommand("add_name", "添加昵称关键词"),
+    BotCommand("addcp", "添加组合关键词"),
+    BotCommand("add_group", "添加霜刃可用群"),
+    BotCommand("cancel", "取消操作"),
+    BotCommand("help", "帮助"),
+    BotCommand("reload", "重载配置"),
+    BotCommand("start", "启动"),
+    BotCommand("settime", "配置自动删除时间"),
+    BotCommand("setlimit", "群内配置B群"),
+    BotCommand("search", "查询验证记录"),
+]
+
+
+async def _set_menu_commands_for_user(bot, uid: int, is_admin_user: bool) -> None:
+    """按用户身份设置私聊命令菜单：管理员见全部，非管理员仅 start/help/cancel"""
+    try:
+        cmds = _MENU_ADMIN if is_admin_user else _MENU_MINIMAL
+        await bot.set_my_commands(cmds, scope=BotCommandScopeChatMember(chat_id=uid, user_id=uid))
+    except Exception as e:
+        print(f"[PTB] 设置用户 {uid} 命令菜单失败: {e}")
+
+
 RESTRICTED_USERS_LOG_PATH = _BASE / "restricted_users.jsonl"
 DELETED_CONTENT_LOG_PATH = _BASE / "bio_calls.jsonl"  # 被删除文案记录：time, user_id, full_name, deleted_content
 DELETE_FAILURES_LOG_PATH = _path("delete_failures.jsonl")  # 删除失败记录：time, chat_id, msg_id, label, user_id
@@ -1716,6 +1842,17 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_name", retries=2, clear_cache_key=(chat_id, uid))
         return
 
+    hit_cp = check_combined_pairs(first_name, last_name, text or "")
+    if hit_cp:
+        nk, tk = hit_cp
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 组合关键词 直接删除 hit=({nk!r},{tk!r})")
+        full_name = f"{first_name} {last_name}".strip() or "用户"
+        msg_preview = (text or "")[:200]
+        if msg_preview.strip():
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="combined_pair")
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid))
+        return
+
     if uid in verified_users:
         add_verification_record(
             chat_id, msg.message_id, uid,
@@ -2294,6 +2431,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_private_verify.pop(uid, None)
     else:
         if uid in verified_users:
+            await _set_menu_commands_for_user(context.bot, uid, is_admin(uid, ADMIN_IDS))
             await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
             return
         if uid in pending_private_verify and not is_admin(uid, ADMIN_IDS):
@@ -2311,26 +2449,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("您正在验证中，请直接发送验证码")
             return
         pending_private_verify.pop(uid, None)
+        await _set_menu_commands_for_user(context.bot, uid, is_admin(uid, ADMIN_IDS))
         if is_admin(uid, ADMIN_IDS):
-            try:
-                _admin_cmds = [
-                    BotCommand("add_text", "添加消息关键词"),
-                    BotCommand("add_name", "添加昵称关键词"),
-                    BotCommand("add_group", "添加霜刃可用群"),
-                    BotCommand("cancel", "取消操作"),
-                    BotCommand("help", "帮助"),
-                    BotCommand("reload", "重载配置"),
-                    BotCommand("start", "启动"),
-                    BotCommand("settime", "配置自动删除时间"),
-                    BotCommand("setlimit", "群内配置B群"),
-                    BotCommand("search", "查询验证记录"),
-                ]
-                await context.bot.set_my_commands(
-                    _admin_cmds,
-                    scope=BotCommandScopeChatMember(chat_id=uid, user_id=uid),
-                )
-            except Exception:
-                pass
             await update.message.reply_text("Bytecler 机器人\n发送 /help 查看完整指令")
         else:
             pending_start_verify[uid] = {"timestamp": time.time()}
@@ -2346,6 +2466,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id if update.effective_user else 0
     if uid:
+        await _set_menu_commands_for_user(context.bot, uid, is_admin(uid, ADMIN_IDS))
         pending_keyword_cmd.pop(uid, None)
         if uid in pending_private_verify and not is_admin(uid, ADMIN_IDS):
             await update.message.reply_text("您正在验证中，请直接发送验证码")
@@ -2358,6 +2479,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bytecler 指令（仅私聊有效）\n\n"
         "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
+        "• /addcp — 多轮添加组合关键词（昵称+消息同时匹配时直接删除，格式：昵称,消息）\n"
         "• /add_group — 添加霜刃可用群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
         "• /cancel — 取消当前操作\n"
         "• /help — 本帮助\n"
@@ -2399,11 +2521,12 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending_keyword_cmd.pop(update.effective_user.id, None)
     load_spam_keywords()
+    _load_combined_pairs()
     load_verified_users()
     load_verification_blacklist()
     _load_bgroup_config()
     _load_target_groups()
-    await update.message.reply_text("已重载 关键词(黑名单/待验证/白名单)、用户黑名单、B群配置、监控群列表")
+    await update.message.reply_text("已重载 关键词(黑名单/待验证/白名单)、组合关键词、用户黑名单、B群配置、监控群列表")
 
 pending_keyword_cmd = {}
 pending_keyword_confirm = {}  # confirm_id -> {uid, field, kw, as_exact, is_regex, label} 关键词已存在时等待用户确认是否移除
@@ -2691,6 +2814,55 @@ async def cmd_add_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         _clear_pending_private_verify(update)
     await update.message.reply_text("bio 简介关键词暂未启用")
+
+
+async def _process_add_cp_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, text: str) -> bool:
+    """处理 /addcp 的后续输入。格式：昵称关键词,消息关键词，支持多行。"""
+    if not text:
+        return False
+    added = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "," not in line:
+            await update.message.reply_text(f"格式错误：需用逗号分隔，如 小月,开课了\n收到：{line[:50]}")
+            continue
+        parts = line.split(",", 1)
+        name_kw = (parts[0] or "").strip()
+        text_kw = (parts[1] or "").strip()
+        if not name_kw or not text_kw:
+            await update.message.reply_text(f"格式错误：昵称和消息关键词均不能为空\n收到：{line[:50]}")
+            continue
+        if add_combined_pair(name_kw, text_kw):
+            _save_combined_pairs()
+            added += 1
+    if added > 0:
+        await update.message.reply_text(f"已添加 {added} 条组合关键词。继续发送（格式：昵称,消息），/cancel 结束")
+    return True
+
+
+async def cmd_addcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """多轮添加组合关键词：昵称+消息同时匹配时直接删除。格式：昵称关键词,消息关键词"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    _clear_pending_private_verify(update)
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("无权限")
+        return
+    uid = update.effective_user.id
+    args_text = " ".join(context.args or []).strip()
+    pending_keyword_cmd[uid] = {"field": "combined", "op": "add", "label": "组合", "multi": True, "timestamp": time.time()}
+    if args_text:
+        await _process_add_cp_followup(update, context, uid, args_text)
+        return
+    await update.message.reply_text(
+        "【组合关键词】昵称+消息同时匹配(match)时直接删除（多轮，/cancel 结束）\n"
+        "• 格式：昵称关键词,消息关键词\n"
+        "• 支持多行，如：\n"
+        "  小月,开课了\n"
+        "  小月,开课le"
+    )
 
 async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
     if update.effective_chat.type != "private" or not update.effective_user:
@@ -3048,7 +3220,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             pass  # 时钟偏差，不视为超时
         elif elapsed > PENDING_KEYWORD_TIMEOUT:
             pending_keyword_cmd.pop(uid, None)
-            await update.message.reply_text("已超时，请重新发送 /add_text 或 /add_name")
+            await update.message.reply_text("已超时，请重新发送 /add_text、/add_name 或 /addcp")
             return
         field, label, multi = info.get("field"), info.get("label", ""), info.get("multi", False)
         if not field or not text:
@@ -3056,7 +3228,10 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
                 pending_keyword_cmd.pop(uid, None)
             await update.message.reply_text("已取消" if not text else "请发送关键词")
             return
-        await _process_add_keyword_followup(update, context, uid, field, label, multi, text)
+        if field == "combined":
+            await _process_add_cp_followup(update, context, uid, text)
+        else:
+            await _process_add_keyword_followup(update, context, uid, field, label, multi, text)
         if not multi:
             pending_keyword_cmd.pop(uid, None)
         else:
@@ -3239,6 +3414,26 @@ async def _job_frost_reply(context: ContextTypes.DEFAULT_TYPE):
         traceback.print_exc()
 
 
+async def _job_delete_handoff_frost(context: ContextTypes.DEFAULT_TYPE):
+    """方案 C：小助理删除失败时，霜刃兜底重试"""
+    try:
+        _xhbot = _BASE.parent
+        if str(_xhbot) not in sys.path:
+            sys.path.insert(0, str(_xhbot))
+        from handoff import take_delete_handoff_frost
+        req = take_delete_handoff_frost()
+        if not req:
+            return
+        chat_id = req["chat_id"]
+        msg_id = req["msg_id"]
+        await _delete_message_with_retry(context.bot, chat_id, msg_id, "assistant_fallback", retries=2)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[PTB] delete_handoff_frost 处理失败: {e}")
+        traceback.print_exc()
+
+
 PENDING_KEYWORD_CONFIRM_TIMEOUT = 120  # 关键词已存在确认按钮 120 秒超时
 
 
@@ -3414,36 +3609,20 @@ async def _job_lottery_sync(context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init_send_hello(application: Application):
     # 设置 Bot 菜单命令：非管理员仅见 start/help/cancel，管理员见全部
+    # 先为管理员设置 ChatMember（更具体 scope），再设置 AllPrivateChats 作为默认
     try:
-        minimal_commands = [
-            BotCommand("start", "启动"),
-            BotCommand("help", "帮助"),
-            BotCommand("cancel", "取消操作"),
-        ]
-        await application.bot.set_my_commands(
-            minimal_commands,
-            scope=BotCommandScopeAllPrivateChats(),
-        )
-        admin_commands = [
-            BotCommand("add_text", "添加消息关键词"),
-            BotCommand("add_name", "添加昵称关键词"),
-            BotCommand("add_group", "添加霜刃可用群"),
-            BotCommand("cancel", "取消操作"),
-            BotCommand("help", "帮助"),
-            BotCommand("reload", "重载配置"),
-            BotCommand("start", "启动"),
-            BotCommand("settime", "配置自动删除时间"),
-            BotCommand("setlimit", "群内配置B群"),
-            BotCommand("search", "查询验证记录"),
-        ]
         for admin_id in ADMIN_IDS:
             try:
                 await application.bot.set_my_commands(
-                    admin_commands,
+                    _MENU_ADMIN,
                     scope=BotCommandScopeChatMember(chat_id=admin_id, user_id=admin_id),
                 )
             except Exception as e:
                 print(f"[PTB] 设置管理员 {admin_id} 命令菜单失败（可能未与机器人私聊过）: {e}")
+        await application.bot.set_my_commands(
+            _MENU_MINIMAL,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
     except Exception as e:
         print(f"[PTB] 设置菜单命令失败: {e}")
         traceback.print_exc()
@@ -3474,6 +3653,7 @@ def _ptb_main():
         print("❌ 检测到无效 token，请配置真实 Bot Token")
         return
     load_spam_keywords()
+    _load_combined_pairs()
     load_verified_users()
     load_verification_failures()
     load_verification_blacklist()
@@ -3512,6 +3692,7 @@ def _ptb_main():
     app.add_handler(CommandHandler("wl_text", cmd_wl_text))
     app.add_handler(CommandHandler("add_text", cmd_add_text))
     app.add_handler(CommandHandler("add_name", cmd_add_name))
+    app.add_handler(CommandHandler("addcp", cmd_addcp))
     app.add_handler(CommandHandler("add_bio", cmd_add_bio))
     app.add_handler(CommandHandler("settime", cmd_settime))
     app.add_handler(CommandHandler("add_group", cmd_add_group))
@@ -3526,6 +3707,7 @@ def _ptb_main():
     jq = app.job_queue
     if jq:
         jq.run_repeating(_job_frost_reply, interval=2, first=2)
+        jq.run_repeating(_job_delete_handoff_frost, interval=2, first=2)  # 方案 C：小助理失败兜底
         jq.run_repeating(_job_cleanup_pending_keyword_confirm, interval=60, first=60)  # 每 60 秒清理超时确认
         jq.run_repeating(_job_cleanup_bgroup_merge, interval=45, first=45)  # 每 45 秒兜底检查 B 群合并消息
         jq.run_repeating(_job_cleanup_verify_merge, interval=45, first=45)  # 每 45 秒兜底检查人机验证合并消息

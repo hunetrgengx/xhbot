@@ -186,6 +186,27 @@ async def _process_handoff_async(bot: Bot) -> None:
         logger.warning("handoff 处理失败: %s", e)
 
 
+async def _process_delete_handoff_async(bot: Bot) -> None:
+    """方案 C：轮询 handoff_delete，执行删除任务；失败时写入 handoff_delete_frost 由霜刃兜底"""
+    try:
+        from handoff import take_delete_handoff, put_delete_handoff_frost
+        req = take_delete_handoff()
+        if not req:
+            return
+        chat_id = req["chat_id"]
+        msg_id = req["msg_id"]
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            logger.info("handoff_delete: 已删除 chat_id=%s msg_id=%s", chat_id, msg_id)
+        except Exception as e:
+            logger.warning("handoff_delete: 删除失败 chat_id=%s msg_id=%s: %s", chat_id, msg_id, e)
+            put_delete_handoff_frost(chat_id, msg_id)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("handoff_delete 处理失败: %s", e)
+
+
 def run_warm_scheduler() -> None:
     """在独立线程中运行：延迟删除 + 暖群（启动/空闲/随机水群）"""
     if not TELEGRAM_BOT_TOKEN:
@@ -205,10 +226,14 @@ def run_warm_scheduler() -> None:
             next_handoff = time.time()
             while not _stop_event.is_set():
                 now = time.time()
-                # 0. 霜刃转交（每 2 秒检查）
+                # 0. 霜刃转交 + 删除 handoff（每 2 秒检查）
                 if now >= next_handoff:
                     try:
                         loop.run_until_complete(_process_handoff_async(bot))
+                    except Exception:
+                        pass
+                    try:
+                        loop.run_until_complete(_process_delete_handoff_async(bot))
                     except Exception:
                         pass
                     next_handoff = now + HANDOFF_CHECK_INTERVAL_SEC

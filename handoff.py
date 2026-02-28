@@ -17,8 +17,12 @@ logger = logging.getLogger(__name__)
 _XHBOT_ROOT = Path(__file__).resolve().parent
 HANDOFF_FILE = _XHBOT_ROOT / "handoff_pending.jsonl"
 FROST_REPLY_FILE = _XHBOT_ROOT / "handoff_frost_reply.jsonl"
+DELETE_HANDOFF_FILE = _XHBOT_ROOT / "handoff_delete.jsonl"  # 霜刃→小助理：删除任务
+DELETE_FROST_RETRY_FILE = _XHBOT_ROOT / "handoff_delete_frost.jsonl"  # 小助理→霜刃：删除失败兜底
 _lock = threading.Lock()
 _frost_lock = threading.Lock()
+_delete_lock = threading.Lock()
+_delete_frost_lock = threading.Lock()
 
 
 def put_handoff(chat_id: int, reply_to_message_id: int, question: str) -> bool:
@@ -125,6 +129,110 @@ def take_frost_reply_handoff() -> dict | None:
         logger.warning("handoff_frost: 读取失败 %s", e)
         try:
             os.remove(FROST_REPLY_FILE)
+        except Exception:
+            pass
+        return None
+
+
+# ==================== 删除任务 handoff（方案 C 负载均衡） ====================
+
+def put_delete_handoff(chat_id: int, msg_id: int) -> bool:
+    """
+    霜刃→小助理：写入删除任务。霜刃选中小助理时或霜刃删除失败时调用。
+    返回是否成功。
+    """
+    data = {"chat_id": int(chat_id), "msg_id": int(msg_id)}
+    try:
+        with _delete_lock:
+            with open(DELETE_HANDOFF_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        logger.info("handoff_delete: 已追加 chat_id=%s msg_id=%s", chat_id, msg_id)
+        return True
+    except Exception as e:
+        logger.warning("handoff_delete: 写入失败 %s", e)
+        return False
+
+
+def take_delete_handoff() -> dict | None:
+    """
+    小助理轮询调用，取走队列头部的一个删除任务。
+    返回 {"chat_id": int, "msg_id": int} 或 None
+    """
+    if not DELETE_HANDOFF_FILE.exists():
+        return None
+    try:
+        with _delete_lock:
+            with open(DELETE_HANDOFF_FILE, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            if not lines:
+                return None
+            data = json.loads(lines[0])
+            remaining = lines[1:]
+            chat_id = data.get("chat_id")
+            msg_id = data.get("msg_id")
+            if remaining:
+                with open(DELETE_HANDOFF_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(remaining) + "\n")
+            else:
+                os.remove(DELETE_HANDOFF_FILE)
+            if chat_id is None or msg_id is None:
+                return None
+            return {"chat_id": int(chat_id), "msg_id": int(msg_id)}
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("handoff_delete: 读取失败 %s", e)
+        return None
+
+
+def put_delete_handoff_frost(chat_id: int, msg_id: int) -> bool:
+    """
+    小助理→霜刃：小助理删除失败时写入，请求霜刃兜底重试。
+    返回是否成功。
+    """
+    data = {"chat_id": int(chat_id), "msg_id": int(msg_id)}
+    try:
+        with _delete_frost_lock:
+            with open(DELETE_FROST_RETRY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        logger.info("handoff_delete_frost: 已追加 chat_id=%s msg_id=%s", chat_id, msg_id)
+        return True
+    except Exception as e:
+        logger.warning("handoff_delete_frost: 写入失败 %s", e)
+        return False
+
+
+def take_delete_handoff_frost() -> dict | None:
+    """
+    霜刃轮询调用，取走队列头部的小助理失败兜底删除任务。
+    返回 {"chat_id": int, "msg_id": int} 或 None
+    """
+    if not DELETE_FROST_RETRY_FILE.exists():
+        return None
+    try:
+        with _delete_frost_lock:
+            with open(DELETE_FROST_RETRY_FILE, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+            if not lines:
+                return None
+            data = json.loads(lines[0])
+            remaining = lines[1:]
+            chat_id = data.get("chat_id")
+            msg_id = data.get("msg_id")
+            if remaining:
+                with open(DELETE_FROST_RETRY_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(remaining) + "\n")
+            else:
+                os.remove(DELETE_FROST_RETRY_FILE)
+            if chat_id is None or msg_id is None:
+                return None
+            return {"chat_id": int(chat_id), "msg_id": int(msg_id)}
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("handoff_delete_frost: 读取失败 %s", e)
+        try:
+            os.remove(DELETE_FROST_RETRY_FILE)
         except Exception:
             pass
         return None
