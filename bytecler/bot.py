@@ -37,6 +37,18 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
+# tgface 头像性别检测（可选，需 opencv-python）
+_FACE_GENDER_AVAILABLE = False
+try:
+    _bot_dir = Path(__file__).resolve().parent
+    _tgface_base = _bot_dir / "tgface"
+    if _tgface_base.exists() and str(_tgface_base) not in sys.path:
+        sys.path.insert(0, str(_tgface_base))
+    from opencv_gender import detect_gender as _detect_gender_sync
+    _FACE_GENDER_AVAILABLE = True
+except Exception as e:
+    print(f"[PTB] tgface 未启用（头像性别检测不可用）: {e}")
+
 from message_delete import (
     delete_message_with_retry as _delete_message_with_retry_raw,
     retry_pending_deletes_for_chat,
@@ -116,13 +128,16 @@ COMBINED_PAIRS_PATH = _path("combined_pairs.json")  # 组合关键词：昵称+�
 LOTTERY_DB_PATH = os.getenv("LOTTERY_DB_PATH", "/tgbot/cjbot/cjdb/lottery.db")
 
 # 关键词三类：黑名单(命中直接删除)、待验证(命中触发人机验证)、白名单(管理员限制时不录入)
+# facetext/facename：头像为女性且命中关键词时直接删除（不保留头像，仅识别）
 spam_keywords = {"blacklist": {"text": {"exact": [], "match": [], "_ac": None, "_regex": []},
                                "name": {"exact": [], "match": [], "_ac": None, "_regex": []}},
                  "text": {"exact": [], "match": [], "_ac": None, "_regex": []},   # 待验证
                  "name": {"exact": [], "match": [], "_ac": None, "_regex": []},   # 待验证
                  "bio": {"exact": [], "match": [], "_ac": None, "_regex": []},
                  "whitelist": {"name": {"exact": [], "match": [], "_regex": []},
-                              "text": {"exact": [], "match": [], "_regex": []}}}
+                              "text": {"exact": [], "match": [], "_regex": []}},
+                 "facetext": {"exact": [], "match": [], "_ac": None, "_regex": []},   # 女性头像+消息命中→删除
+                 "facename": {"exact": [], "match": [], "_ac": None, "_regex": []}}  # 女性头像+昵称命中→删除
 # 组合关键词：昵称+消息同时匹配(match)时直接删除，不加入黑名单
 _combined_pairs: list[dict[str, str]] = []  # [{"name":"小月","text":"开课了"}, ...]
 verified_users = set()
@@ -241,6 +256,14 @@ def load_spam_keywords():
             spam_keywords["whitelist"][field]["exact"] = ex
             spam_keywords["whitelist"][field]["match"] = mt
             spam_keywords["whitelist"][field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+        # facetext/facename：女性头像+关键词命中→直接删除
+        for field in ("facetext", "facename"):
+            fc = cfg.get(field) or {}
+            ex, mt = _parse_field_keywords(fc)
+            spam_keywords[field]["exact"] = ex
+            spam_keywords[field]["match"] = mt
+            spam_keywords[field]["_ac"] = _build_ac(mt)
+            spam_keywords[field]["_regex"] = [x[1] for x in mt if x[0] == "regex"]
     except Exception as e:
         print(f"[shared] 加载关键词失败: {e}")
         traceback.print_exc()
@@ -349,6 +372,17 @@ def save_spam_keywords():
                     match.append(f"/{x[1].pattern}/")
             wl_cfg[field] = {"exact": exact, "match": match}
         cfg["whitelist"] = wl_cfg
+        # facetext/facename
+        for field in ("facetext", "facename"):
+            kw = spam_keywords.get(field) or {}
+            exact = kw.get("exact") or []
+            match = []
+            for x in (kw.get("match") or []):
+                if x[0] == "str":
+                    match.append(x[1])
+                else:
+                    match.append(f"/{x[1].pattern}/")
+            cfg[field] = {"exact": exact, "match": match}
         with open(SPAM_KEYWORDS_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -395,6 +429,75 @@ def _keyword_exists_in_field(field: str, keyword: str, as_exact: bool, is_regex:
             pass
         return False
     return kw_lower in [s.lower() for s in (x[1] for x in (kw.get("match") or []) if x[0] == "str")]
+
+
+def _keyword_exists_in_face(field: str, keyword: str, as_exact: bool, is_regex: bool) -> bool:
+    """检查关键词是否已存在于 facetext/facename"""
+    if field not in ("facetext", "facename"):
+        return False
+    kw_cfg = spam_keywords.get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    if as_exact:
+        return kw_lower in [s.lower() for s in (kw_cfg.get("exact") or [])]
+    if is_regex:
+        try:
+            pat = keyword.strip()
+            if pat.startswith("/") and pat.endswith("/"):
+                pat = pat[1:-1]
+            rx = re.compile(pat, re.I)
+            for x in (kw_cfg.get("match") or []):
+                if x[0] == "regex" and x[1].pattern == rx.pattern:
+                    return True
+        except re.error:
+            pass
+        return False
+    return kw_lower in [s.lower() for s in (x[1] for x in (kw_cfg.get("match") or []) if x[0] == "str")]
+
+
+def _keyword_exists_in_verify(field: str, keyword: str, as_exact: bool, is_regex: bool) -> bool:
+    """检查关键词是否已存在于待验证（text/name）"""
+    if field not in ("text", "name"):
+        return False
+    kw_cfg = spam_keywords.get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    if as_exact:
+        return kw_lower in [s.lower() for s in (kw_cfg.get("exact") or [])]
+    if is_regex:
+        try:
+            pat = keyword.strip()
+            if pat.startswith("/") and pat.endswith("/"):
+                pat = pat[1:-1]
+            rx = re.compile(pat, re.I)
+            for x in (kw_cfg.get("match") or []):
+                if x[0] == "regex" and x[1].pattern == rx.pattern:
+                    return True
+        except re.error:
+            pass
+        return False
+    return kw_lower in [s.lower() for s in (x[1] for x in (kw_cfg.get("match") or []) if x[0] == "str")]
+
+
+def _keyword_exists_in_whitelist(field: str, keyword: str, as_exact: bool, is_regex: bool) -> bool:
+    """检查关键词是否已存在于白名单"""
+    if field not in ("name", "text"):
+        return False
+    wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
+    kw_lower = (keyword or "").strip().lower()
+    if as_exact:
+        return kw_lower in [s.lower() for s in (wl.get("exact") or [])]
+    if is_regex:
+        try:
+            pat = keyword.strip()
+            if pat.startswith("/") and pat.endswith("/"):
+                pat = pat[1:-1]
+            rx = re.compile(pat, re.I)
+            for x in (wl.get("match") or []):
+                if x[0] == "regex" and x[1].pattern == rx.pattern:
+                    return True
+        except re.error:
+            pass
+        return False
+    return kw_lower in [x[1] for x in (wl.get("match") or []) if x[0] == "str"]
 
 
 def _keyword_exists_in_blacklist(field: str, keyword: str, as_exact: bool, is_regex: bool) -> bool:
@@ -549,6 +652,95 @@ def check_blacklist_name(first_name: str, last_name: str) -> Optional[str]:
     """黑名单关键词：命中直接删除，并将用户加入黑名单"""
     name = ((first_name or "") + " " + (last_name or "")).strip()
     return _check_field((spam_keywords.get("blacklist") or {}).get("name") or {}, name)
+
+
+def check_facetext(text: str) -> Optional[str]:
+    """facetext 关键词：女性头像+消息命中→直接删除"""
+    return _check_field(spam_keywords.get("facetext") or {}, text or "")
+
+
+def check_facename(first_name: str, last_name: str) -> Optional[str]:
+    """facename 关键词：女性头像+昵称命中→直接删除"""
+    name = ((first_name or "") + " " + (last_name or "")).strip()
+    return _check_field(spam_keywords.get("facename") or {}, name)
+
+
+def _has_face_keywords(field: str) -> bool:
+    """检查 facetext/facename 是否有配置关键词"""
+    kw = spam_keywords.get(field) or {}
+    ex = kw.get("exact") or []
+    mt = kw.get("match") or []
+    return bool(ex or mt)
+
+
+def add_face_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    """添加 facetext/facename 关键词。field: facetext | facename"""
+    if field not in ("facetext", "facename"):
+        return False
+    kw = spam_keywords.setdefault(field, {"exact": [], "match": [], "_ac": None, "_regex": []})
+    kw_lower = (keyword or "").strip().lower()
+    use_exact = as_exact if as_exact is not None else (not is_regex)
+    if is_regex:
+        if not (keyword.startswith("/") and keyword.endswith("/") and len(keyword) > 2):
+            return False
+        try:
+            rx = re.compile(keyword[1:-1], re.I)
+        except re.error:
+            return False
+        for x in (kw.get("match") or []):
+            if x[0] == "regex" and x[1].pattern == rx.pattern:
+                return True
+        kw["match"] = (kw.get("match") or []) + [("regex", rx)]
+        kw["_regex"] = [x[1] for x in (kw.get("match") or []) if x[0] == "regex"]
+    elif use_exact:
+        if kw_lower in [s.lower() for s in (kw.get("exact") or [])]:
+            return True
+        kw["exact"] = (kw.get("exact") or []) + [keyword.strip()]
+    else:
+        for x in (kw.get("match") or []):
+            if x[0] == "str" and x[1].lower() == kw_lower:
+                return True
+        kw["match"] = (kw.get("match") or []) + [("str", keyword.strip().lower())]
+    kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    return True
+
+
+def remove_face_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
+    """移除 facetext/facename 关键词"""
+    if field not in ("facetext", "facename"):
+        return False
+    kw = spam_keywords.get(field)
+    if not kw:
+        return False
+    if as_exact is None:
+        as_exact = not is_regex
+    kw_lower = (keyword or "").strip().lower()
+    if is_regex:
+        pat = (keyword or "").strip()
+        if pat.startswith("/") and pat.endswith("/"):
+            pat = pat[1:-1]
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error:
+            return False
+        mt = [x for x in (kw.get("match") or []) if not (x[0] == "regex" and x[1].pattern == rx.pattern)]
+        if len(mt) == len(kw.get("match") or []):
+            return False
+        kw["match"] = mt
+        kw["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+    elif as_exact:
+        ex = [s for s in (kw.get("exact") or []) if s.lower() != kw_lower]
+        if len(ex) == len(kw.get("exact") or []):
+            return False
+        kw["exact"] = ex
+    else:
+        mt = [x for x in (kw.get("match") or []) if not (x[0] == "str" and x[1].lower() == kw_lower)]
+        if len(mt) == len(kw.get("match") or []):
+            return False
+        kw["match"] = mt
+        kw["_regex"] = [x[1] for x in mt if x[0] == "regex"]
+    kw["_ac"] = _build_ac([x for x in (kw.get("match") or []) if x[0] == "str"])
+    return True
 
 
 def add_blacklist_keyword(field: str, keyword: str, is_regex: bool = False, as_exact: bool = None) -> bool:
@@ -1028,12 +1220,15 @@ _MENU_ADMIN = [
     BotCommand("addcp", "添加组合关键词"),
     BotCommand("add_group", "添加霜刃可用群"),
     BotCommand("cancel", "取消操作"),
+    BotCommand("facename", "女性头像+昵称关键词"),
+    BotCommand("facetext", "女性头像+消息关键词"),
     BotCommand("help", "帮助"),
     BotCommand("reload", "重载配置"),
-    BotCommand("start", "启动"),
-    BotCommand("settime", "配置自动删除时间"),
-    BotCommand("setlimit", "群内配置B群"),
     BotCommand("search", "查询验证记录"),
+    BotCommand("set", "群管理"),
+    BotCommand("setlimit", "群内配置B群"),
+    BotCommand("settime", "配置自动删除时间"),
+    BotCommand("start", "启动"),
 ]
 
 
@@ -1158,6 +1353,48 @@ def set_bgroup_for_chat(chat_id: str, b_id: str | None) -> bool:
     _bgroup_config[cid] = s
     _save_bgroup_config()
     return True
+
+
+# 群管理设置：B 群检查位置。bgroup_check_late=True 时，未加入 B 群判断放到 组合关键词 和 白名单用户 之间
+GROUP_SETTINGS_PATH = _path("group_settings.json")
+_group_settings: dict = {}  # chat_id -> {"bgroup_check_late": bool}
+
+
+def _load_group_settings():
+    global _group_settings
+    try:
+        if GROUP_SETTINGS_PATH.exists():
+            with open(GROUP_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                _group_settings = json.load(f)
+        else:
+            _group_settings = {}
+    except Exception as e:
+        print(f"[PTB] 加载 group_settings 失败: {e}")
+        _group_settings = {}
+
+
+def _save_group_settings():
+    try:
+        with open(GROUP_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(_group_settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[PTB] 保存 group_settings 失败: {e}")
+
+
+def get_bgroup_check_late(chat_id: str) -> bool:
+    """是否将 B 群检查延后（放到组合关键词与白名单之间）。默认 False=维持现状（最早检查）"""
+    cid = str(chat_id)
+    return bool(_group_settings.get(cid, {}).get("bgroup_check_late", False))
+
+
+def set_bgroup_check_late(chat_id: str, late: bool) -> None:
+    """设置 B 群检查是否延后"""
+    cid = str(chat_id)
+    _group_settings.setdefault(cid, {})["bgroup_check_late"] = late
+    _save_group_settings()
+
+
+_load_group_settings()
 
 
 async def _resolve_bgroup_input(bot, raw: str) -> str | None:
@@ -1437,6 +1674,37 @@ async def _is_mention_bot(msg, text: str, bot) -> bool:
             if men and me.username and men.lower() == f"@{me.username}".lower():
                 return True
     return False
+
+
+async def _detect_avatar_gender(bot, user_id: int) -> Optional[str]:
+    """
+    获取用户头像并检测性别（不保留图片，仅识别）。
+    返回: "female" | "male" | "other" | "failure" | None（无头像）
+    """
+    if not _FACE_GENDER_AVAILABLE:
+        return None
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if not photos or not photos.photos:
+            return None
+        photo_sizes = photos.photos[0]
+        largest = max(photo_sizes, key=lambda p: p.width * p.height)
+        file = await bot.get_file(largest.file_id)
+        temp_path = _BASE / "debug" / f"_face_{user_id}_{int(time.time()*1000)}.jpg"
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await file.download_to_drive(custom_path=str(temp_path))
+            # 同步 CPU 密集操作放到线程，避免阻塞
+            result = await asyncio.to_thread(_detect_gender_sync, temp_path)
+            return result
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"[PTB] 头像性别检测失败 uid={user_id}: {e}")
+        return "failure"
 
 
 async def _is_frost_trigger(msg, text: str, bot) -> bool:
@@ -1738,12 +2006,28 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             save_verification_blacklist()
 
 
+# 仅私聊有效的命令（群内输入时提示）
+_PRIVATE_ONLY_COMMANDS = frozenset([
+    "/help", "/start", "/cancel",
+    "/add_group", "/add_text", "/add_name", "/addcp", "/add_bio",
+    "/reload", "/search", "/set", "/settime",
+    "/kw_text", "/kw_name",
+    "/wl_name", "/wl_text", "/facetext", "/facename",
+])
+
+
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_chat:
         return
     msg = update.message
     chat_id = str(msg.chat_id)
     text = (msg.text or msg.caption or "").strip()
+    # 群内输入仅私聊有效的管理员命令时，给出提示
+    if text and text.startswith("/"):
+        cmd = text.strip().split(None, 1)[0].lower() if text.strip() else ""
+        if cmd in _PRIVATE_ONLY_COMMANDS:
+            await update.message.reply_text("⚠️ 该命令仅在私聊中有效")
+            return
     if not chat_allowed(chat_id, TARGET_GROUP_IDS):
         if text and await _is_frost_trigger(msg, text, context.bot):
             print(f"[PTB] 群 {chat_id} 不在目标列表 {TARGET_GROUP_IDS}，忽略霜刃唤醒")
@@ -1804,9 +2088,9 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if len(_last_message_by_user) % 100 == 0:  # 每 100 条消息清理一次过期缓存
             _cleanup_expired_message_cache()
 
-    # 未加入 B 群？→ 触发验证（在霜刃唤醒之前）；仅检验真实用户，机器人跳过；白名单用户跳过缓存，确保离开 B 群后立即触发（频道消息已在上方提前 return）
+    # 未加入 B 群？→ 触发验证。开关关闭时在霜刃唤醒之前检查；开关开启时延后到组合关键词与白名单之间
     is_bot = getattr(user, "is_bot", False)
-    if get_bgroup_ids_for_chat(chat_id) and not is_bot and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
+    if not get_bgroup_check_late(chat_id) and get_bgroup_ids_for_chat(chat_id) and not is_bot and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group)")
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
@@ -1815,6 +2099,22 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         print(f"[PTB] 收到霜刃唤醒 chat={chat_id} uid={uid} msg_id={msg.message_id} text={text[:50]!r} [霜刃唤醒不建记录]")
         await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text or "", first_name, last_name)
         return
+
+    # facetext/facename：女性头像+关键词命中→直接删除（放在霜刃唤醒和黑名单之间，每次均识别头像）
+    if _FACE_GENDER_AVAILABLE and (_has_face_keywords("facetext") or _has_face_keywords("facename")):
+        hit_ft = check_facetext(text)
+        hit_fn = check_facename(first_name, last_name)
+        if hit_ft or hit_fn:
+            gender = await _detect_avatar_gender(context.bot, uid)
+            if gender == "female":
+                trigger = "facetext" if hit_ft else "facename"
+                print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} facetext/facename 女性头像+关键词 直接删除 trigger={trigger}")
+                full_name = f"{first_name} {last_name}".strip() or "用户"
+                msg_preview = (text or "")[:200]
+                if msg_preview.strip():
+                    _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type=trigger)
+                await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, trigger, retries=2, clear_cache_key=(chat_id, uid))
+                return
 
     # 黑名单关键词：命中直接删除，并将用户加入黑名单
     hit_bl_text = check_blacklist_text(text)
@@ -1851,6 +2151,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="combined_pair")
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid))
+        return
+
+    # 开关开启时：未加入 B 群判断放到组合关键词与白名单之间
+    if get_bgroup_check_late(chat_id) and get_bgroup_ids_for_chat(chat_id) and not is_bot and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group,延后)")
+        await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
 
     if uid in verified_users:
@@ -2476,23 +2782,34 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         pending_private_verify.pop(uid, None)
         pending_start_verify.pop(uid, None)
-    await update.message.reply_text(
-        "Bytecler 指令（仅私聊有效）\n\n"
-        "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
-        "• /addcp — 多轮添加组合关键词（昵称+消息同时匹配时直接删除，格式：昵称,消息）\n"
-        "• /add_group — 添加霜刃可用群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
-        "• /cancel — 取消当前操作\n"
-        "• /help — 本帮助\n"
-        "• /reload — 重载配置\n"
-        "• /start — 启动\n"
-        "• /settime — 配置关联群验证/人机验证消息自动删除时间\n"
-        "• 群内 /setlimit — 配置本群 B 群/频道（需加入才能发言），仅拥有「可添加管理员」权限的管理员可配置；/clearlimit 删除\n"
-        "• /kw_text、/kw_name add/remove — 待验证关键词（命中触发人机验证）\n"
-        "• /kw_blacklist_text、/kw_blacklist_name add/remove — 黑名单关键词（命中直接删除+加黑）\n"
-        "• /wl_name、/wl_text — 白名单（管理员限制用户时不录入这些昵称/消息）\n"
-        "• /search — 管理员查询验证记录（发送后输入群消息链接）\n\n"
-        "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
-    )
+    admin = uid and is_admin(uid, ADMIN_IDS)
+    if admin:
+        await update.message.reply_text(
+            "Bytecler 指令（仅私聊有效）\n\n"
+            "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
+            "• /addcp — 多轮添加组合关键词（昵称+消息同时匹配时直接删除，格式：昵称,消息）\n"
+            "• /add_group — 添加霜刃可用群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
+            "• /cancel — 取消当前操作\n"
+            "• /help — 本帮助\n"
+            "• /reload — 重载配置\n"
+            "• /start — 启动\n"
+            "• /settime — 配置关联群验证/人机验证消息自动删除时间\n"
+            "• 群内 /setlimit — 配置本群 B 群/频道（需加入才能发言），仅拥有「可添加管理员」权限的管理员可配置；/clearlimit 删除\n"
+            "• /kw_text、/kw_name add/remove — 待验证关键词（命中触发人机验证）\n"
+            "• /facetext、/facename — 女性头像+消息/昵称关键词（多轮添加，命中直接删除，需 tgface）\n"
+            "• /wl_name、/wl_text — 白名单（管理员限制用户时不录入这些昵称/消息）\n"
+            "• /search — 管理员查询验证记录（发送后输入群消息链接）\n"
+            "• /set — 管理员群管理（B 群检查延后开关）\n\n"
+            "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
+        )
+    else:
+        await update.message.reply_text(
+            "Bytecler 指令\n\n"
+            "• /start — 启动\n"
+            "• /help — 本帮助\n"
+            "• /cancel — 取消当前操作\n\n"
+            "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
+        )
 
 def _clear_pending_private_verify(update: Update):
     """所有以 / 开头的命令均视为退出自助验证（/start、/help 对普通用户不打断，在 cmd_start/cmd_help 中单独处理）"""
@@ -2506,10 +2823,100 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     if not is_admin(uid, ADMIN_IDS):
-        await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     pending_search[uid] = {"timestamp": time.time()}
     await update.message.reply_text("请发送群消息链接（如 https://t.me/c/xxx/123）\n120 秒内有效，/cancel 取消")
+
+
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员群管理：列出群列表，点击群后显示 B 群检查延后开关"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("⚠️ 仅管理员可使用")
+        return
+    groups = sorted(TARGET_GROUP_IDS)
+    if not groups:
+        await update.message.reply_text("暂无监控群，请先用 /add_group 添加")
+        return
+    buttons = []
+    for gid in groups:
+        try:
+            title, _ = await _get_group_display_info(context.bot, gid)
+            label = (title[:20] + "…") if len(title) > 20 else title
+        except Exception:
+            label = gid
+        buttons.append([InlineKeyboardButton(label, callback_data=f"set_grp:{gid}")])
+    kb = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text("选择群进行设置：", reply_markup=kb)
+
+
+async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/set 群列表点击：显示群详情与 B 群检查延后开关，仅管理员可操作"""
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+    if not is_admin(query.from_user.id, ADMIN_IDS):
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
+        return
+    await query.answer()
+    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and query.data != "set_list":
+        return
+    if query.data == "set_list":
+        groups = sorted(TARGET_GROUP_IDS)
+        if not groups:
+            await query.edit_message_text("暂无监控群")
+            return
+        buttons = []
+        for gid in groups:
+            try:
+                title, _ = await _get_group_display_info(context.bot, gid)
+                label = (title[:20] + "…") if len(title) > 20 else title
+            except Exception:
+                label = gid
+            buttons.append([InlineKeyboardButton(label, callback_data=f"set_grp:{gid}")])
+        kb = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text("选择群进行设置：", reply_markup=kb)
+        return
+    if query.data.startswith("set_tgl:"):
+        gid = query.data[8:].strip()
+        if gid and gid in TARGET_GROUP_IDS:
+            late = get_bgroup_check_late(gid)
+            set_bgroup_check_late(gid, not late)
+            new_late = get_bgroup_check_late(gid)
+            status = "开启" if new_late else "关闭"
+            try:
+                title, _ = await _get_group_display_info(context.bot, gid)
+            except Exception:
+                title = gid
+            toggle_btn = InlineKeyboardButton(
+                f"B群检查延后: {'开启' if new_late else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[toggle_btn], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            await query.edit_message_text(f"群：{_escape_html(title)}\n\nB群检查延后：{status}\n（开启时，未加入B群判断放到组合关键词与白名单之间）", parse_mode="HTML", reply_markup=kb)
+        return
+    if query.data.startswith("set_grp:"):
+        gid = query.data[8:].strip()
+        if not gid or gid not in TARGET_GROUP_IDS:
+            await query.edit_message_text("群不存在或已移除")
+            return
+        late = get_bgroup_check_late(gid)
+        try:
+            title, _ = await _get_group_display_info(context.bot, gid)
+        except Exception:
+            title = gid
+        toggle_btn = InlineKeyboardButton(
+            f"B群检查延后: {'开启' if late else '关闭'} ← 点击切换",
+            callback_data=f"set_tgl:{gid}",
+        )
+        kb = InlineKeyboardMarkup([[toggle_btn], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+        await query.edit_message_text(
+            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
 
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2517,7 +2924,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     pending_keyword_cmd.pop(update.effective_user.id, None)
     load_spam_keywords()
@@ -2526,10 +2933,14 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     load_verification_blacklist()
     _load_bgroup_config()
     _load_target_groups()
-    await update.message.reply_text("已重载 关键词(黑名单/待验证/白名单)、组合关键词、用户黑名单、B群配置、监控群列表")
+    _load_group_settings()
+    await update.message.reply_text("已重载 关键词(黑名单/待验证/白名单)、组合关键词、用户黑名单、B群配置、监控群列表、群管理设置")
 
 pending_keyword_cmd = {}
-pending_keyword_confirm = {}  # confirm_id -> {uid, field, kw, as_exact, is_regex, label} 关键词已存在时等待用户确认是否移除
+pending_keyword_confirm = {}  # 黑名单关键词已存在时等待用户确认是否移除
+pending_face_confirm = {}  # facetext/facename 关键词已存在时等待用户确认是否移除
+pending_verify_confirm = {}  # 待验证关键词已存在时等待用户确认是否移除
+pending_wl_confirm = {}  # 白名单关键词已存在时等待用户确认是否移除
 pending_settime_cmd = {}  # uid -> {"type": "required_group"|"verify"}
 pending_add_group: dict[int, dict] = {}  # uid -> {timestamp}，/add_group 两段式
 PENDING_ADD_GROUP_TIMEOUT = 120
@@ -2541,7 +2952,7 @@ async def cmd_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     uid = update.effective_user.id
     pending_keyword_cmd.pop(uid, None)
@@ -2582,7 +2993,7 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     req_sec = _get_required_group_msg_delete_after()
     verify_sec = _get_verify_msg_delete_after()
@@ -2637,59 +3048,15 @@ async def cmd_kw_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_kw(update, context, "text", "消息")
 async def cmd_kw_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_kw(update, context, "name", "昵称")
+async def cmd_facetext(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_face(update, context, "facetext", "facetext")
+async def cmd_facename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_face(update, context, "facename", "facename")
 async def cmd_kw_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         _clear_pending_private_verify(update)
         pending_keyword_cmd.pop(update.effective_user.id, None)
     await update.message.reply_text("bio 简介关键词暂未启用")
-
-
-async def cmd_kw_blacklist_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _cmd_kw_blacklist(update, context, "text", "消息")
-async def cmd_kw_blacklist_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _cmd_kw_blacklist(update, context, "name", "昵称")
-
-
-async def _cmd_kw_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
-    """黑名单关键词管理：命中直接删除并将用户加入黑名单。add/remove/list"""
-    if update.effective_chat.type != "private" or not update.effective_user:
-        return
-    _clear_pending_private_verify(update)
-    if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
-        return
-    pending_keyword_cmd.pop(update.effective_user.id, None)
-    args = (context.args or [])
-    if len(args) >= 1 and args[0].lower() == "list":
-        kw = (spam_keywords.get("blacklist") or {}).get(field) or {}
-        ex = kw.get("exact") or []
-        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
-        txt = f"【{label}黑名单】命中直接删除+加黑\nexact: {ex or '无'}\nmatch: {mt or '无'}"
-        await update.message.reply_text(txt)
-        return
-    if len(args) >= 2:
-        op, kw = args[0].lower(), " ".join(args[1:]).strip()
-        is_regex = kw.startswith("/") and kw.endswith("/") and len(kw) > 2
-        if op == "add" and kw:
-            if add_blacklist_keyword(field, kw, is_regex=is_regex):
-                save_spam_keywords()
-                await update.message.reply_text(f"已添加「{kw}」到{label}黑名单（命中直接删除+加黑）")
-            else:
-                await update.message.reply_text("添加失败（可能已存在或正则无效）")
-        elif op == "remove" and kw:
-            if remove_blacklist_keyword(field, kw, is_regex=is_regex):
-                save_spam_keywords()
-                await update.message.reply_text(f"已从{label}黑名单移除「{kw}」")
-            else:
-                await update.message.reply_text("移除失败（可能不存在）")
-        else:
-            await update.message.reply_text(f"用法: /kw_blacklist_{field} add 关键词  或  /kw_blacklist_{field} remove 关键词  或  /kw_blacklist_{field} list")
-    else:
-        await update.message.reply_text(
-            f"【{label}黑名单】命中直接删除并将用户加入黑名单\n"
-            f"add 关键词 — 添加\nremove 关键词 — 移除\nlist — 查看\n"
-            f"例: /kw_blacklist_{field} add 违禁词"
-        )
 
 
 async def cmd_wl_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2699,49 +3066,33 @@ async def cmd_wl_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
-    """白名单管理：add/remove/list。子串=直接输入，精确=/前缀，正则=/正则/"""
+    """白名单管理：两段式多轮，同 add_text/add_name"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
-    # 清除 add_text/add_name 的待输入状态，避免用户发 /wl_text 后输入关键词被误判为黑名单超时
-    pending_keyword_cmd.pop(update.effective_user.id, None)
-    args = (context.args or [])
-    if len(args) >= 1 and args[0].lower() == "list":
+    uid = update.effective_user.id
+    args_text = " ".join(context.args or []).strip()
+    if args_text and args_text.strip().lower() == "list":
         wl = (spam_keywords.get("whitelist") or {}).get(field) or {}
         ex = wl.get("exact") or []
         mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (wl.get("match") or [])]
         txt = f"【{label}白名单】\nexact: {ex or '无'}\nmatch: {mt or '无'}"
         await update.message.reply_text(txt)
         return
-    if len(args) >= 2:
-        op, kw = args[0].lower(), " ".join(args[1:]).strip()
-        as_exact, kw_norm, is_regex = _parse_keyword_input(kw)
-        kw_for_storage = kw if is_regex else kw_norm  # 正则需保留 /.../ 格式
-        if op == "add" and kw:
-            if _add_whitelist_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
-                save_spam_keywords()
-                await update.message.reply_text(f"已添加「{kw}」到{label}白名单")
-            else:
-                await update.message.reply_text("添加失败（可能已存在或正则无效）")
-        elif op == "remove" and kw:
-            if _remove_whitelist_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
-                save_spam_keywords()
-                await update.message.reply_text(f"已从{label}白名单移除「{kw}」")
-            else:
-                await update.message.reply_text("移除失败（可能不存在）")
-        else:
-            await update.message.reply_text(f"用法: /wl_{field} add 关键词  或  /wl_{field} remove 关键词  或  /wl_{field} list")
-    else:
-        await update.message.reply_text(
-            f"【{label}白名单】管理员限制用户时不录入这些\n"
-            f"add 关键词 — 添加（自动从待验证/黑名单移出）\n"
-            f"remove 关键词 — 移除\n"
-            f"list — 查看\n"
-            f"例: /wl_{field} add 测试用户"
-        )
+    pending_keyword_cmd[uid] = {"field": f"wl_{field}", "op": "add", "label": f"{label}白名单", "multi": True, "timestamp": time.time()}
+    if args_text:
+        await _process_add_whitelist_followup(update, context, uid, field, f"{label}白名单", True, args_text)
+        return
+    await update.message.reply_text(
+        f"【{label}白名单】管理员限制用户时不录入这些（多轮，/cancel 结束）\n"
+        "• 直接输入如 测试 → 子串匹配\n"
+        "• /测试用户 → 精确匹配\n"
+        "• 已存在则移除\n"
+        f"• /wl_{field} list — 查看当前关键词"
+    )
 
 
 async def _process_add_keyword_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, field: str, label: str, multi: bool, text: str) -> bool:
@@ -2768,13 +3119,88 @@ async def _process_add_keyword_followup(update: Update, context: ContextTypes.DE
     return True
 
 
+async def _process_add_verify_keyword_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, field: str, label: str, multi: bool, text: str) -> bool:
+    """处理 kw_text/kw_name 的后续关键词输入（待验证），返回是否已处理"""
+    if not text:
+        return False
+    as_exact, kw, is_regex = _parse_keyword_input(text)
+    kw_for_storage = text if is_regex else kw
+    exists = _keyword_exists_in_verify(field, kw_for_storage, as_exact, is_regex)
+    if exists:
+        _cleanup_pending_verify_confirm()
+        confirm_id = f"v{int(time.time()*1000)}_{uid}"[:32]
+        pending_verify_confirm[confirm_id] = {"uid": uid, "field": field, "kw": kw_for_storage, "as_exact": as_exact, "is_regex": is_regex, "label": label, "ts": time.time()}
+        rows = [[InlineKeyboardButton("取消", callback_data=f"verify_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"verify_confirm:{confirm_id}:remove")]]
+        await update.message.reply_text(f"「{kw}」已在{label}待验证中，是否移除？", reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        if add_spam_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            reply = f"已添加「{kw}」到{label}待验证（命中触发人机验证）"
+            if multi:
+                reply += "。继续发送关键词，/cancel 结束"
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text("添加失败（正则无效？）")
+    return True
+
+
+async def _process_add_whitelist_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, field: str, label: str, multi: bool, text: str) -> bool:
+    """处理 wl_name/wl_text 的后续关键词输入（白名单），返回是否已处理"""
+    if not text:
+        return False
+    as_exact, kw, is_regex = _parse_keyword_input(text)
+    kw_for_storage = text if is_regex else kw
+    exists = _keyword_exists_in_whitelist(field, kw_for_storage, as_exact, is_regex)
+    if exists:
+        _cleanup_pending_wl_confirm()
+        confirm_id = f"w{int(time.time()*1000)}_{uid}"[:32]
+        pending_wl_confirm[confirm_id] = {"uid": uid, "field": field, "kw": kw_for_storage, "as_exact": as_exact, "is_regex": is_regex, "label": label, "ts": time.time()}
+        rows = [[InlineKeyboardButton("取消", callback_data=f"wl_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"wl_confirm:{confirm_id}:remove")]]
+        await update.message.reply_text(f"「{kw}」已在{label}白名单中，是否移除？", reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        if _add_whitelist_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            reply = f"已添加「{kw}」到{label}白名单"
+            if multi:
+                reply += "。继续发送关键词，/cancel 结束"
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text("添加失败（正则无效？）")
+    return True
+
+
+async def _process_add_face_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, field: str, label: str, multi: bool, text: str) -> bool:
+    """处理 facetext/facename 的后续关键词输入，返回是否已处理"""
+    if not text:
+        return False
+    as_exact, kw, is_regex = _parse_keyword_input(text)
+    kw_for_storage = text if is_regex else kw
+    exists = _keyword_exists_in_face(field, kw_for_storage, as_exact, is_regex)
+    if exists:
+        _cleanup_pending_face_confirm()
+        confirm_id = f"f{int(time.time()*1000)}_{uid}"[:32]
+        pending_face_confirm[confirm_id] = {"uid": uid, "field": field, "kw": kw_for_storage, "as_exact": as_exact, "is_regex": is_regex, "label": label, "ts": time.time()}
+        rows = [[InlineKeyboardButton("取消", callback_data=f"face_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"face_confirm:{confirm_id}:remove")]]
+        await update.message.reply_text(f"「{kw}」已在{label}中，是否移除？", reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        if add_face_keyword(field, kw_for_storage, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            reply = f"已添加「{kw}」到{label}（女性头像+命中→删除）"
+            if multi:
+                reply += "。继续发送关键词，/cancel 结束"
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text("添加失败（正则无效？）")
+    return True
+
+
 async def cmd_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """两段式多轮：添加消息黑名单关键词。支持 /add_text 关键词 同消息输入。"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     uid = update.effective_user.id
     args_text = " ".join(context.args or []).strip()
@@ -2795,7 +3221,7 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     uid = update.effective_user.id
     args_text = " ".join(context.args or []).strip()
@@ -2848,7 +3274,7 @@ async def cmd_addcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
     uid = update.effective_user.id
     args_text = " ".join(context.args or []).strip()
@@ -2864,37 +3290,65 @@ async def cmd_addcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  小月,开课le"
     )
 
-async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
+async def _cmd_face(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
+    """facetext/facename：女性头像+关键词命中→直接删除。两段式多轮，同 add_text/add_name"""
     if update.effective_chat.type != "private" or not update.effective_user:
         return
     _clear_pending_private_verify(update)
     if not is_admin(update.effective_user.id, ADMIN_IDS):
-        await update.message.reply_text("无权限")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
-    pending_keyword_cmd.pop(update.effective_user.id, None)
-    args = (context.args or [])
-    if len(args) >= 2:
-        op, kw = args[0].lower(), " ".join(args[1:]).strip()
-        if op == "add" and kw:
-            is_regex = kw.startswith("/") and kw.endswith("/") and len(kw) > 2
-            if add_spam_keyword(field, kw, is_regex=is_regex):
-                save_spam_keywords()
-                await update.message.reply_text(f"已添加「{kw}」到{label}关键词")
-            else:
-                await update.message.reply_text("添加失败（可能已存在或正则无效）")
-        elif op == "remove" and kw:
-            is_regex = kw.startswith("/") and kw.endswith("/") and len(kw) > 2
-            if remove_spam_keyword(field, kw, is_regex=is_regex):
-                save_spam_keywords()
-                await update.message.reply_text(f"已从{label}关键词移除「{kw}」")
-            else:
-                await update.message.reply_text("移除失败（可能不存在）")
-        else:
-            await update.message.reply_text(f"用法: /kw_{field} add 关键词  或  /kw_{field} remove 关键词")
-    else:
-        await update.message.reply_text(
-            f"【{label}】关键词管理\nadd 关键词 — 添加\nremove 关键词 — 移除\n例: /kw_{field} add 加微信"
-        )
+    uid = update.effective_user.id
+    args_text = " ".join(context.args or []).strip()
+    if args_text and args_text.strip().lower() == "list":
+        kw = spam_keywords.get(field) or {}
+        ex = kw.get("exact") or []
+        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
+        txt = f"【{label}】女性头像+关键词命中→直接删除\nexact: {ex or '无'}\nmatch: {mt or '无'}"
+        await update.message.reply_text(txt)
+        return
+    pending_keyword_cmd[uid] = {"field": field, "op": "add", "label": label, "multi": True, "timestamp": time.time()}
+    if args_text:
+        await _process_add_face_followup(update, context, uid, field, label, True, args_text)
+        return
+    tip = "消息" if field == "facetext" else "昵称"
+    await update.message.reply_text(
+        f"【{label}】女性头像+{tip}关键词命中→直接删除（多轮，/cancel 结束）\n"
+        "• 直接输入如 加V → 子串匹配\n"
+        "• /加微信 → 精确匹配\n"
+        "• 已存在则移除\n"
+        "• /facetext list 或 /facename list — 查看当前关键词"
+    )
+
+
+async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
+    """kw_text/kw_name：待验证关键词。两段式多轮，同 add_text/add_name"""
+    if update.effective_chat.type != "private" or not update.effective_user:
+        return
+    _clear_pending_private_verify(update)
+    if not is_admin(update.effective_user.id, ADMIN_IDS):
+        await update.message.reply_text("⚠️ 仅管理员可使用")
+        return
+    uid = update.effective_user.id
+    args_text = " ".join(context.args or []).strip()
+    if args_text and args_text.strip().lower() == "list":
+        kw = spam_keywords.get(field) or {}
+        ex = kw.get("exact") or []
+        mt = [x[1] if x[0] == "str" else f"/{x[1].pattern}/" for x in (kw.get("match") or [])]
+        txt = f"【{label}待验证】命中触发人机验证\nexact: {ex or '无'}\nmatch: {mt or '无'}"
+        await update.message.reply_text(txt)
+        return
+    pending_keyword_cmd[uid] = {"field": f"verify_{field}", "op": "add", "label": label, "multi": True, "timestamp": time.time()}
+    if args_text:
+        await _process_add_verify_keyword_followup(update, context, uid, field, label, True, args_text)
+        return
+    await update.message.reply_text(
+        f"【{label}待验证】命中触发人机验证（多轮，/cancel 结束）\n"
+        "• 直接输入如 加V → 子串匹配\n"
+        "• /加微信 → 精确匹配\n"
+        "• 已存在则移除\n"
+        f"• /kw_{field} list — 查看当前关键词"
+    )
 
 
 async def callback_required_group_unrestrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2964,7 +3418,7 @@ async def callback_keyword_confirm(update: Update, context: ContextTypes.DEFAULT
         return
     uid = query.from_user.id if query.from_user else 0
     if not uid or not is_admin(uid, ADMIN_IDS):
-        await query.answer("无权限", show_alert=True)
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
         return
     parts = query.data.split(":", 2)  # kw_confirm:id:action
     if len(parts) < 3:
@@ -2992,13 +3446,121 @@ async def callback_keyword_confirm(update: Update, context: ContextTypes.DEFAULT
             await query.edit_message_text(f"移除「{kw}」失败（可能已不存在）", reply_markup=None)
 
 
+async def callback_face_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 facetext/facename 中关键词已存在时的「取消/移除」按钮"""
+    global pending_face_confirm
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("face_confirm:"):
+        return
+    uid = query.from_user.id if query.from_user else 0
+    if not uid or not is_admin(uid, ADMIN_IDS):
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
+        return
+    parts = query.data.split(":", 2)  # face_confirm:id:action
+    if len(parts) < 3:
+        await query.answer("数据格式错误", show_alert=True)
+        return
+    _, confirm_id, action = parts[0], parts[1], parts[2]
+    info = pending_face_confirm.pop(confirm_id, None)
+    if not info:
+        await query.answer("已超时或已处理", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    field, kw, label = info["field"], info["kw"], info["label"]
+    as_exact, is_regex = info.get("as_exact"), info.get("is_regex", False)
+    await query.answer()
+    if action == "cancel":
+        await query.edit_message_text(f"「{kw}」已取消移除", reply_markup=None)
+    elif action == "remove":
+        if remove_face_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            await query.edit_message_text(f"已从{label}移除「{kw}」", reply_markup=None)
+        else:
+            await query.edit_message_text(f"移除「{kw}」失败（可能已不存在）", reply_markup=None)
+
+
+async def callback_verify_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 kw_text/kw_name 待验证关键词已存在时的「取消/移除」按钮"""
+    global pending_verify_confirm
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("verify_confirm:"):
+        return
+    uid = query.from_user.id if query.from_user else 0
+    if not uid or not is_admin(uid, ADMIN_IDS):
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
+        return
+    parts = query.data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("数据格式错误", show_alert=True)
+        return
+    _, confirm_id, action = parts[0], parts[1], parts[2]
+    info = pending_verify_confirm.pop(confirm_id, None)
+    if not info:
+        await query.answer("已超时或已处理", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    field, kw, label = info["field"], info["kw"], info["label"]
+    as_exact, is_regex = info.get("as_exact"), info.get("is_regex", False)
+    await query.answer()
+    if action == "cancel":
+        await query.edit_message_text(f"「{kw}」已取消移除", reply_markup=None)
+    elif action == "remove":
+        if remove_spam_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            await query.edit_message_text(f"已从{label}待验证移除「{kw}」", reply_markup=None)
+        else:
+            await query.edit_message_text(f"移除「{kw}」失败（可能已不存在）", reply_markup=None)
+
+
+async def callback_wl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 wl_name/wl_text 白名单关键词已存在时的「取消/移除」按钮"""
+    global pending_wl_confirm
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("wl_confirm:"):
+        return
+    uid = query.from_user.id if query.from_user else 0
+    if not uid or not is_admin(uid, ADMIN_IDS):
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
+        return
+    parts = query.data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("数据格式错误", show_alert=True)
+        return
+    _, confirm_id, action = parts[0], parts[1], parts[2]
+    info = pending_wl_confirm.pop(confirm_id, None)
+    if not info:
+        await query.answer("已超时或已处理", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    field, kw, label = info["field"], info["kw"], info["label"]
+    as_exact, is_regex = info.get("as_exact"), info.get("is_regex", False)
+    await query.answer()
+    if action == "cancel":
+        await query.edit_message_text(f"「{kw}」已取消移除", reply_markup=None)
+    elif action == "remove":
+        if _remove_whitelist_keyword(field, kw, is_regex=is_regex, as_exact=as_exact):
+            save_spam_keywords()
+            await query.edit_message_text(f"已从{label}移除「{kw}」", reply_markup=None)
+        else:
+            await query.edit_message_text(f"移除「{kw}」失败（可能已不存在）", reply_markup=None)
+
+
 async def callback_raw_message_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理「查看原始消息」按钮点击，返回完整消息体"""
     query = update.callback_query
     if not query or not query.data or not query.data.startswith("raw_msg:"):
         return
     if query.from_user and not is_admin(query.from_user.id, ADMIN_IDS):
-        await query.answer("无权限", show_alert=True)
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
         return
     try:
         parts = query.data.split(":", 2)
@@ -3031,7 +3593,7 @@ async def callback_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user = query.from_user
     if not user or not is_admin(user.id, ADMIN_IDS):
-        await query.answer("无权限", show_alert=True)
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
         return
     typ = data.split(":", 1)[1]
     if typ == "required_group":
@@ -3148,7 +3710,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if not is_admin(uid, ADMIN_IDS):
-        await update.message.reply_text("⚠️ 仅管理员可查询验证记录")
+        await update.message.reply_text("⚠️ 仅管理员可使用")
         return
 
     # 1. /add_group 的后续输入：等待群标识（120 秒超时）
@@ -3220,7 +3782,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             pass  # 时钟偏差，不视为超时
         elif elapsed > PENDING_KEYWORD_TIMEOUT:
             pending_keyword_cmd.pop(uid, None)
-            await update.message.reply_text("已超时，请重新发送 /add_text、/add_name 或 /addcp")
+            await update.message.reply_text("已超时，请重新发送 /add_text、/add_name、/addcp、/facetext、/facename、/kw_text、/kw_name 或 /wl_name、/wl_text")
             return
         field, label, multi = info.get("field"), info.get("label", ""), info.get("multi", False)
         if not field or not text:
@@ -3230,6 +3792,14 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
             return
         if field == "combined":
             await _process_add_cp_followup(update, context, uid, text)
+        elif field in ("facetext", "facename"):
+            await _process_add_face_followup(update, context, uid, field, label, multi, text)
+        elif field in ("verify_text", "verify_name"):
+            actual_field = field.replace("verify_", "")
+            await _process_add_verify_keyword_followup(update, context, uid, actual_field, label, multi, text)
+        elif field in ("wl_name", "wl_text"):
+            actual_field = field.replace("wl_", "")
+            await _process_add_whitelist_followup(update, context, uid, actual_field, label, multi, text)
         else:
             await _process_add_keyword_followup(update, context, uid, field, label, multi, text)
         if not multi:
@@ -3447,9 +4017,42 @@ def _cleanup_pending_keyword_confirm():
         pending_keyword_confirm.pop(k, None)
 
 
+def _cleanup_pending_face_confirm():
+    """清理超时的 pending_face_confirm 条目"""
+    global pending_face_confirm
+    now = time.time()
+    cutoff = now - PENDING_KEYWORD_CONFIRM_TIMEOUT
+    to_pop = [k for k, v in pending_face_confirm.items() if (v.get("ts") or 0) <= cutoff]
+    for k in to_pop:
+        pending_face_confirm.pop(k, None)
+
+
+def _cleanup_pending_verify_confirm():
+    """清理超时的 pending_verify_confirm 条目"""
+    global pending_verify_confirm
+    now = time.time()
+    cutoff = now - PENDING_KEYWORD_CONFIRM_TIMEOUT
+    to_pop = [k for k, v in pending_verify_confirm.items() if (v.get("ts") or 0) <= cutoff]
+    for k in to_pop:
+        pending_verify_confirm.pop(k, None)
+
+
+def _cleanup_pending_wl_confirm():
+    """清理超时的 pending_wl_confirm 条目"""
+    global pending_wl_confirm
+    now = time.time()
+    cutoff = now - PENDING_KEYWORD_CONFIRM_TIMEOUT
+    to_pop = [k for k, v in pending_wl_confirm.items() if (v.get("ts") or 0) <= cutoff]
+    for k in to_pop:
+        pending_wl_confirm.pop(k, None)
+
+
 async def _job_cleanup_pending_keyword_confirm(context: ContextTypes.DEFAULT_TYPE):
-    """定时清理超时的 pending_keyword_confirm"""
+    """定时清理超时的各类 pending_confirm"""
     _cleanup_pending_keyword_confirm()
+    _cleanup_pending_face_confirm()
+    _cleanup_pending_verify_confirm()
+    _cleanup_pending_wl_confirm()
 
 
 async def _job_cleanup_bgroup_merge(context: ContextTypes.DEFAULT_TYPE):
@@ -3681,28 +4284,34 @@ def _ptb_main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ATTACHMENT, group_message_handler))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("reload", cmd_reload, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("kw_text", cmd_kw_text))
-    app.add_handler(CommandHandler("kw_name", cmd_kw_name))
-    app.add_handler(CommandHandler("kw_bio", cmd_kw_bio))
-    app.add_handler(CommandHandler("kw_blacklist_text", cmd_kw_blacklist_text))
-    app.add_handler(CommandHandler("kw_blacklist_name", cmd_kw_blacklist_name))
-    app.add_handler(CommandHandler("wl_name", cmd_wl_name))
-    app.add_handler(CommandHandler("wl_text", cmd_wl_text))
-    app.add_handler(CommandHandler("add_text", cmd_add_text))
-    app.add_handler(CommandHandler("add_name", cmd_add_name))
-    app.add_handler(CommandHandler("addcp", cmd_addcp))
-    app.add_handler(CommandHandler("add_bio", cmd_add_bio))
-    app.add_handler(CommandHandler("settime", cmd_settime))
-    app.add_handler(CommandHandler("add_group", cmd_add_group))
-    app.add_handler(CommandHandler("search", cmd_search))
+    _admin_private = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("kw_text", cmd_kw_text, _admin_private))
+    app.add_handler(CommandHandler("kw_name", cmd_kw_name, _admin_private))
+    app.add_handler(CommandHandler("kw_bio", cmd_kw_bio, _admin_private))
+    app.add_handler(CommandHandler("facetext", cmd_facetext, _admin_private))
+    app.add_handler(CommandHandler("facename", cmd_facename, _admin_private))
+    app.add_handler(CommandHandler("wl_name", cmd_wl_name, _admin_private))
+    app.add_handler(CommandHandler("wl_text", cmd_wl_text, _admin_private))
+    app.add_handler(CommandHandler("add_text", cmd_add_text, _admin_private))
+    app.add_handler(CommandHandler("add_name", cmd_add_name, _admin_private))
+    app.add_handler(CommandHandler("addcp", cmd_addcp, _admin_private))
+    app.add_handler(CommandHandler("add_bio", cmd_add_bio, _admin_private))
+    app.add_handler(CommandHandler("settime", cmd_settime, _admin_private))
+    app.add_handler(CommandHandler("add_group", cmd_add_group, _admin_private))
+    app.add_handler(CommandHandler("search", cmd_search, _admin_private))
+    app.add_handler(CommandHandler("set", cmd_set, _admin_private))
+    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl:|^set_list$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
     app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))
     app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
     app.add_handler(CallbackQueryHandler(callback_keyword_confirm, pattern="^kw_confirm:"))
+    app.add_handler(CallbackQueryHandler(callback_face_confirm, pattern="^face_confirm:"))
+    app.add_handler(CallbackQueryHandler(callback_verify_confirm, pattern="^verify_confirm:"))
+    app.add_handler(CallbackQueryHandler(callback_wl_confirm, pattern="^wl_confirm:"))
 
     jq = app.job_queue
     if jq:

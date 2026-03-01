@@ -5,3 +5,6 @@ python-dotenv>=1.0.0
 pyahocorasick>=2.0.0
 openpyxl>=3.0.0
 jieba>=0.42.0
+# facetext/facename 头像性别检测（可选，不装则跳过该功能）
+opencv-python>=4.8.0
+numpy>=1.24.0

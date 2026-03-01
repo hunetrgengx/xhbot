@@ -1,0 +1,12 @@
+应用名称
+tg霜刃
+应用描述
+判断是否女性即可
+AppID
+7473443
+API Key
+kKMSDwqTVC7XIj5k2zsjLV4j
+复制
+Secret Key
+9a0d6G650kKvgaqBKhnjnVNBqOoQosXF
+复制

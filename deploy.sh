@@ -55,6 +55,10 @@ chmod 755 "$DEPLOY_DIR/logs" "$DEPLOY_DIR/backup"
 echo "✅ 目录创建完成"
 echo "========================================"
 
+# OpenCV 系统依赖（facetext/facename 头像检测需要）
+echo "🔍 安装 OpenCV 系统依赖（头像检测）..."
+apt-get install -y libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev 2>/dev/null || true
+
 # 检查 Python 环境
 echo "🔍 检查 Python 环境..."
 if ! command -v python3 &> /dev/null; then
@@ -87,7 +91,7 @@ source venv/bin/activate
 # 安装依赖（合并 xhchat + bytecler）
 echo "📚 安装依赖包..."
 pip install --upgrade pip
-pip install telethon>=1.36.0 openai>=1.0.0 python-telegram-bot>=20.0 python-dotenv>=1.0.0 pyahocorasick>=2.0.0 httpx>=0.24.0
+pip install telethon>=1.36.0 openai>=1.0.0 python-telegram-bot>=20.0 python-dotenv>=1.0.0 pyahocorasick>=2.0.0 httpx>=0.24.0 openpyxl>=3.0.0 jieba>=0.42.0 opencv-python>=4.8.0 numpy>=1.24.0
 
 echo "✅ 依赖安装完成"
 echo "========================================"

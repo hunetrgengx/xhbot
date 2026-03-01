@@ -37,6 +37,7 @@ bytecler/verification_records.json
 bytecler/bio_calls.jsonl
 bytecler/spam_keywords.json
 bytecler/bgroup_config.json
+bytecler/group_settings.json
 bytecler/target_groups.json
 bytecler/verified_users.*.json
 bytecler/debug/
