@@ -66,7 +66,7 @@ def _select_delete_bot(chat_id: int, msg_id: int) -> str:
     return "frost" if (h % 2 == 0) else "assistant"
 
 
-async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None) -> bool:
+async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None, hit_type: Optional[str] = None, hit_keyword: Optional[str] = None) -> bool:
     """本项目封装：方案 C 负载均衡；霜刃始终尝试删除（可独立运行），小助理为补充；clear_cache_key 时自动用 _last_message_by_user 清理"""
     cid_int = int(chat_id) if isinstance(chat_id, str) else chat_id
     if DELETE_LOAD_BALANCE:
@@ -85,6 +85,8 @@ async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str,
         bot, chat_id, msg_id, label, retries=retries,
         cache_dict=_last_message_by_user if clear_cache_key else None,
         clear_cache_key=clear_cache_key,
+        hit_type=hit_type,
+        hit_keyword=hit_keyword,
     )
     if not ok and DELETE_LOAD_BALANCE:
         try:
@@ -278,8 +280,15 @@ def _load_combined_pairs():
         with open(COMBINED_PAIRS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         pairs = data.get("pairs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        _combined_pairs = [{"name": str(p.get("name", "")).strip(), "text": str(p.get("text", "")).strip()}
-                          for p in pairs if isinstance(p, dict) and p.get("name") and p.get("text")]
+        _combined_pairs = []
+        for p in pairs:
+            if not isinstance(p, dict) or not p.get("name") or not p.get("text"):
+                continue
+            _combined_pairs.append({
+                "name": str(p.get("name", "")).strip(),
+                "text": str(p.get("text", "")).strip(),
+                "exact": bool(p.get("exact", False)),
+            })
     except Exception as e:
         print(f"[PTB] 加载组合关键词失败: {e}")
         traceback.print_exc()
@@ -296,26 +305,33 @@ def _save_combined_pairs():
 
 
 def check_combined_pairs(first_name: str, last_name: str, msg_text: str) -> Optional[tuple[str, str]]:
-    """检查昵称+消息是否同时匹配某组合对。match 形式（子串）。返回 (name_kw, text_kw) 或 None"""
+    """检查昵称+消息是否同时匹配某组合对。exact=True 时精确匹配，否则子串匹配。返回 (name_kw, text_kw) 或 None"""
     full_name = f"{first_name or ''} {last_name or ''}".strip()
     name_lower = full_name.lower()
     text_lower = (msg_text or "").lower()
     for p in _combined_pairs:
         nk, tk = (p.get("name") or "").strip(), (p.get("text") or "").strip()
-        if nk and tk and nk.lower() in name_lower and tk.lower() in text_lower:
+        if not nk or not tk:
+            continue
+        use_exact = bool(p.get("exact", False))
+        if use_exact:
+            matched = full_name.lower() == nk.lower() and (msg_text or "").strip().lower() == tk.lower()
+        else:
+            matched = nk.lower() in name_lower and tk.lower() in text_lower
+        if matched:
             return (nk, tk)
     return None
 
 
-def add_combined_pair(name_kw: str, text_kw: str) -> bool:
-    """添加组合对。已存在则返回 True 不重复添加"""
+def add_combined_pair(name_kw: str, text_kw: str, exact: bool = False) -> bool:
+    """添加组合对。exact=True 时昵称和消息均精确匹配。已存在则返回 True 不重复添加"""
     nk, tk = (name_kw or "").strip(), (text_kw or "").strip()
     if not nk or not tk:
         return False
     for p in _combined_pairs:
         if (p.get("name") or "").strip() == nk and (p.get("text") or "").strip() == tk:
             return True
-    _combined_pairs.append({"name": nk, "text": tk})
+    _combined_pairs.append({"name": nk, "text": tk, "exact": bool(exact)})
     return True
 
 
@@ -1924,16 +1940,9 @@ def _is_pure_english_or_spaces(s: str) -> bool:
 
 
 def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
-    """管理员（真人）删除并限制/封禁用户时，将昵称加入 name 关键词、被删消息加入 text 关键词。白名单中的不录入；纯英文昵称不录入。"""
+    """管理员（真人）限制/封禁/踢出用户时，将昵称+消息加入组合关键词(addcp)，name 和 text 均用 exact。
+    若 name 或 text 在关键词白名单则跳过；需同时有昵称和消息才加入。"""
     name_trimmed = (full_name or "").strip()
-    skip_name = _is_in_keyword_whitelist("name", name_trimmed) or _is_pure_english_or_spaces(name_trimmed)
-    if name_trimmed and not skip_name:
-        as_exact_name = len(name_trimmed) <= 2
-        if add_spam_keyword("name", name_trimmed, as_exact=as_exact_name):
-            save_spam_keywords()
-            print(f"[PTB] 管理员操作: 已加入 name 关键词 {name_trimmed!r} (exact={as_exact_name})")
-    elif name_trimmed:
-        print(f"[PTB] 管理员操作: 昵称 {name_trimmed!r} 在白名单或为纯英文，跳过")
     key = (chat_id, user_id)
     entry = _last_message_by_user.pop(key, None)
     msg_text = ""
@@ -1942,19 +1951,24 @@ def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
         if time.time() - ts <= LAST_MESSAGE_CACHE_TTL_SECONDS:
             msg_text = (text_val or "").strip()
         else:
-            print(f"[PTB] 管理员操作: 用户 {user_id} 消息缓存已过期(>{LAST_MESSAGE_CACHE_TTL_SECONDS//3600}h)，未加入 text 关键词")
+            print(f"[PTB] 管理员操作: 用户 {user_id} 消息缓存已过期(>{LAST_MESSAGE_CACHE_TTL_SECONDS//3600}h)，未加入组合关键词")
     else:
-        print(f"[PTB] 管理员操作: 用户 {user_id} 无消息缓存(可能仅发过图/贴纸/无文字，或 bot 重启后未收到其新消息)，未加入 text 关键词")
-    if msg_text:
-        _log_deleted_content(user_id, full_name, msg_text, trigger_type="admin_restrict")
-        msg_text = msg_text[:200]  # 截断避免过长
-        if not _is_in_keyword_whitelist("text", msg_text):
-            as_exact_text = len(msg_text) <= 2
-            if add_spam_keyword("text", msg_text, as_exact=as_exact_text):
-                save_spam_keywords()
-                print(f"[PTB] 管理员操作: 已加入 text 关键词 {msg_text[:50]!r}... (exact={as_exact_text})")
-        else:
-            print(f"[PTB] 管理员操作: 消息 {msg_text[:50]!r}... 在白名单中，跳过")
+        print(f"[PTB] 管理员操作: 用户 {user_id} 无消息缓存(可能仅发过图/贴纸/无文字，或 bot 重启后未收到其新消息)，未加入组合关键词")
+    if not name_trimmed or not msg_text:
+        if name_trimmed or msg_text:
+            print(f"[PTB] 管理员操作: 需同时有昵称和消息才加入组合关键词，跳过")
+        return
+    if _is_in_keyword_whitelist("name", name_trimmed):
+        print(f"[PTB] 管理员操作: 昵称 {name_trimmed!r} 在白名单中，跳过")
+        return
+    if _is_in_keyword_whitelist("text", msg_text):
+        print(f"[PTB] 管理员操作: 消息 {msg_text[:50]!r}... 在白名单中，跳过")
+        return
+    msg_text = msg_text[:200]
+    _log_deleted_content(user_id, full_name, msg_text, trigger_type="admin_restrict")
+    if add_combined_pair(name_trimmed, msg_text, exact=True):
+        _save_combined_pairs()
+        print(f"[PTB] 管理员操作: 已加入组合关键词 (exact) name={name_trimmed!r} text={msg_text[:50]!r}...")
 
 
 async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2108,12 +2122,13 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             gender = await _detect_avatar_gender(context.bot, uid)
             if gender == "female":
                 trigger = "facetext" if hit_ft else "facename"
+                kw = hit_ft or hit_fn
                 print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} facetext/facename 女性头像+关键词 直接删除 trigger={trigger}")
                 full_name = f"{first_name} {last_name}".strip() or "用户"
                 msg_preview = (text or "")[:200]
                 if msg_preview.strip():
                     _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type=trigger)
-                await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, trigger, retries=2, clear_cache_key=(chat_id, uid))
+                await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, trigger, retries=2, clear_cache_key=(chat_id, uid), hit_type=trigger, hit_keyword=kw)
                 return
 
     # 黑名单关键词：命中直接删除，并将用户加入黑名单
@@ -2128,7 +2143,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="blacklist_text")
-        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_text", retries=2, clear_cache_key=(chat_id, uid))
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_text", retries=2, clear_cache_key=(chat_id, uid), hit_type="blacklist_text", hit_keyword=hit_bl_text)
         return
     if hit_bl_name:
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 黑名单关键词(name) 直接删除+加黑 hit={hit_bl_name}")
@@ -2139,7 +2154,32 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="blacklist_name")
-        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_name", retries=2, clear_cache_key=(chat_id, uid))
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_name", retries=2, clear_cache_key=(chat_id, uid), hit_type="blacklist_name", hit_keyword=hit_bl_name)
+        return
+
+    # 广告链接：含链接且文本≤10字 → 直接删除+加黑
+    if _is_ad_message(msg):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 广告链接 直接删除+加黑")
+        add_to_blacklist(uid)
+        save_verified_users()
+        save_verification_blacklist()
+        full_name = f"{first_name} {last_name}".strip() or "用户"
+        msg_preview = (text or "")[:200]
+        if msg_preview.strip():
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="ad")
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "ad", retries=2, clear_cache_key=(chat_id, uid), hit_type="ad")
+        return
+    # 引用非本群消息：回复转发/外部引用 → 直接删除+加黑
+    if _is_reply_to_other_chat(msg, int(chat_id)):
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 引用非本群消息 直接删除+加黑")
+        add_to_blacklist(uid)
+        save_verified_users()
+        save_verification_blacklist()
+        full_name = f"{first_name} {last_name}".strip() or "用户"
+        msg_preview = (text or "")[:200]
+        if msg_preview.strip():
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="reply_other_chat")
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "reply_other_chat", retries=2, clear_cache_key=(chat_id, uid), hit_type="reply_other_chat")
         return
 
     hit_cp = check_combined_pairs(first_name, last_name, text or "")
@@ -2150,7 +2190,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="combined_pair")
-        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid))
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid), hit_type="combined_pair", hit_keyword=f"name:{nk}|text:{tk}")
         return
 
     # 开关开启时：未加入 B 群判断放到组合关键词与白名单之间
@@ -2193,7 +2233,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 else:
                     left = VERIFY_FAIL_THRESHOLD - cnt
                     print(f"[PTB] 群消息: chat_id={chat_id} 验证码错误 msg_id={msg.message_id} [验证码消息不单独建记录]")
-                    await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "verify_wrong_code", retries=2, clear_cache_key=(chat_id, uid))
+                    await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "verify_wrong_code", retries=2, clear_cache_key=(chat_id, uid), hit_type="verify_other")
                     vmsg = await msg.reply_text(f"验证失败，再失败 {left} 次将被限制发言")
                     asyncio.create_task(_delete_after(context.bot, int(chat_id), vmsg.message_id, _get_verify_msg_delete_after(), user_msg_id=msg.message_id, user_cache_key=(chat_id, uid)))
             return
@@ -2213,22 +2253,11 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                                   "⚠️ 检测到有疑似广告风险，请先完成人机验证。", "sticker")
         return
 
-    if _is_ad_message(msg):
-        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(ad)")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到疑似广告链接，请先完成人机验证。", "ad")
-        return
     if ENABLE_EMOJI_CHECK and (_contains_emoji(text) or _contains_emoji(f"{first_name} {last_name}".strip())):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(emoji)")
         await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
                                   "⚠️ 检测到您的消息或昵称中含有表情符号，请先完成人机验证。", "emoji")
         return
-    if _is_reply_to_other_chat(msg, int(chat_id)):
-        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(reply_other_chat)")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到引用非本群消息，请先完成人机验证。", "reply_other_chat")
-        return
-
     hit_text = check_spam_text(text)
     hit_name = check_spam_name(first_name, last_name)
     if hit_text:
@@ -2292,7 +2321,7 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
     if should_count:
         _required_group_warn_count[key] = new_ts
-    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, "required_group_trigger", retries=2, clear_cache_key=(chat_id, user_id))
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, "required_group_trigger", retries=2, clear_cache_key=(chat_id, user_id), hit_type="bgroup")
     full_name = f"{first_name} {last_name}".strip() or "用户"
     deleted_text = (msg.text or msg.caption or "").strip()
     if deleted_text:
@@ -2327,7 +2356,7 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
 
         # 删除旧的合并消息（若存在）
         if prev_msg_id is not None:
-            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "bgroup_merge_replace", retries=1)
+            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "bgroup_merge_replace", retries=1, hit_type="bgroup")
 
         # 构建合并文案（用户名>7字时脱敏展示）
         lines = [f"【{_mask_display_name(name)}】• 警告({c}/{VERIFY_FAIL_THRESHOLD})" for (_, name, _, c) in users_in_window]
@@ -2351,7 +2380,7 @@ async def _delete_verify_merge_after(bot, chat_id: int, msg_id: int, chat_id_str
     global _verify_merge_state
     try:
         await asyncio.sleep(_get_verify_msg_delete_after())
-        ok = await _delete_message_with_retry(bot, chat_id, msg_id, "verify_merge")
+        ok = await _delete_message_with_retry(bot, chat_id, msg_id, "verify_merge", hit_type="verify_other")
         if ok:
             state = _verify_merge_state.get(chat_id_str)
             if state and state.get("msg_id") == msg_id:
@@ -2371,7 +2400,9 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     full_name = f"{first_name} {last_name}".strip() or "用户"
     if msg_preview.strip():
         _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview, trigger_type=f"verify:{trigger_reason}" if trigger_reason else "verify:unknown", verification_passed="pending")
-    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2, clear_cache_key=(chat_id, user_id))
+    _hit_type = "verify_text" if trigger_reason == "spam_text" else ("verify_name" if trigger_reason == "spam_name" else "verify_other")
+    _hit_kw = hit_keyword if trigger_reason in ("spam_text", "spam_name") and hit_keyword else None
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2, clear_cache_key=(chat_id, user_id), hit_type=_hit_type, hit_keyword=_hit_kw)
     add_verification_record(
         chat_id, msg_id, user_id,
         full_name, getattr(msg.from_user, "username", None) or "",
@@ -2391,7 +2422,7 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
         users_in_window.append((user_id, full_name, code, msg_id, now))
 
         if prev_msg_id is not None:
-            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "verify_merge_replace", retries=1)
+            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "verify_merge_replace", retries=1, hit_type="verify_other")
 
         lines = [f"【{_mask_display_name(name)}】" for (_, name, _, _, _) in users_in_window]
         header = " ".join(lines) + "\n\n⚠️ 检测到疑似广告风险，请先完成人机验证。\n\n"
@@ -2431,7 +2462,7 @@ async def _delete_bgroup_merge_after(bot, chat_id: int, msg_id: int, chat_id_str
     global _bgroup_merge_state
     try:
         await asyncio.sleep(_get_required_group_msg_delete_after())
-        ok = await _delete_message_with_retry(bot, chat_id, msg_id, "bgroup_merge")
+        ok = await _delete_message_with_retry(bot, chat_id, msg_id, "bgroup_merge", hit_type="bgroup")
         if ok:
             state = _bgroup_merge_state.get(chat_id_str)
             if state and state.get("msg_id") == msg_id:

@@ -182,6 +182,8 @@ async def delete_message_with_retry(
     clear_cache_key: Optional[Tuple[str, int]] = None,
     on_success: Optional[Callable[[], None]] = None,
     log_prefix: str = "PTB",
+    hit_type: Optional[str] = None,
+    hit_keyword: Optional[str] = None,
 ) -> bool:
     """带重试的删除。成功时若提供 cache_dict+clear_cache_key 或 on_success 则执行清理。
     失败时入待重试队列。clear_cache_key 的 [1] 为 user_id（0 表示 bot 消息）。"""
@@ -196,15 +198,12 @@ async def delete_message_with_retry(
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
             _delete_stats["immediate_success"] += 1
             result = "success"
-            _emit_event(
-                "delete_attempt",
-                chat_id=cid_str,
-                msg_id=msg_id,
-                label=label,
-                attempt_no=attempt_no,
-                phase="immediate",
-                result=result,
-            )
+            evt_kw = {"chat_id": cid_str, "msg_id": msg_id, "label": label, "attempt_no": attempt_no, "phase": "immediate", "result": result}
+            if hit_type is not None:
+                evt_kw["hit_type"] = hit_type
+            if hit_keyword is not None and hit_keyword != "":
+                evt_kw["hit_keyword"] = hit_keyword
+            _emit_event("delete_attempt", **evt_kw)
             _clear_attempt_no(cid_str, msg_id)
             if cache_dict is not None and clear_cache_key is not None:
                 cache_dict.pop(clear_cache_key, None)
@@ -216,17 +215,12 @@ async def delete_message_with_retry(
             error_msg = str(e)[:200]
             not_found = "not found" in error_msg.lower()
             result = "not_found" if not_found else "fail"
-            _emit_event(
-                "delete_attempt",
-                chat_id=cid_str,
-                msg_id=msg_id,
-                label=label,
-                attempt_no=attempt_no,
-                phase="immediate",
-                result=result,
-                error_type=error_type,
-                error_msg=error_msg,
-            )
+            evt_kw = {"chat_id": cid_str, "msg_id": msg_id, "label": label, "attempt_no": attempt_no, "phase": "immediate", "result": result, "error_type": error_type, "error_msg": error_msg}
+            if hit_type is not None:
+                evt_kw["hit_type"] = hit_type
+            if hit_keyword is not None and hit_keyword != "":
+                evt_kw["hit_keyword"] = hit_keyword
+            _emit_event("delete_attempt", **evt_kw)
             if not_found:
                 _clear_attempt_no(cid_str, msg_id)
                 return False
