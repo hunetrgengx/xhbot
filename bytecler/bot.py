@@ -2109,12 +2109,24 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
         return
 
+    # 白名单用户：在 B 群（开关关）之后优先放行，跳过后续关键词检查
+    if uid in verified_users:
+        add_verification_record(
+            chat_id, msg.message_id, uid,
+            f"{first_name} {last_name}".strip(), getattr(user, "username", None) or "",
+            "normal", (text or "")[:200], initial_status="verified_pass",
+            raw_message_body=_serialize_message_body(msg),
+        )
+        save_verification_records()
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} verified_pass")
+        return
+
     if await _is_frost_trigger(msg, text or "", context.bot):
         print(f"[PTB] 收到霜刃唤醒 chat={chat_id} uid={uid} msg_id={msg.message_id} text={text[:50]!r} [霜刃唤醒不建记录]")
         await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text or "", first_name, last_name)
         return
 
-    # facetext/facename：女性头像+关键词命中→直接删除（放在霜刃唤醒和黑名单之间，每次均识别头像）
+    # facetext/facename：女性头像+关键词命中→加黑+直接删除（放在霜刃唤醒和黑名单之间，每次均识别头像）
     if _FACE_GENDER_AVAILABLE and (_has_face_keywords("facetext") or _has_face_keywords("facename")):
         hit_ft = check_facetext(text)
         hit_fn = check_facename(first_name, last_name)
@@ -2123,7 +2135,10 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             if gender == "female":
                 trigger = "facetext" if hit_ft else "facename"
                 kw = hit_ft or hit_fn
-                print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} facetext/facename 女性头像+关键词 直接删除 trigger={trigger}")
+                print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} facetext/facename 女性头像+关键词 加黑+直接删除 trigger={trigger}")
+                add_to_blacklist(uid)
+                save_verified_users()
+                save_verification_blacklist()
                 full_name = f"{first_name} {last_name}".strip() or "用户"
                 msg_preview = (text or "")[:200]
                 if msg_preview.strip():
@@ -2197,17 +2212,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if get_bgroup_check_late(chat_id) and get_bgroup_ids_for_chat(chat_id) and not is_bot and not (await _is_user_in_required_group(context.bot, uid, chat_id, skip_cache=(uid in verified_users))):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(not_in_required_group,延后)")
         await _start_required_group_verification(context.bot, msg, chat_id, uid, first_name, last_name)
-        return
-
-    if uid in verified_users:
-        add_verification_record(
-            chat_id, msg.message_id, uid,
-            f"{first_name} {last_name}".strip(), getattr(user, "username", None) or "",
-            "normal", (text or "")[:200], initial_status="verified_pass",
-            raw_message_body=_serialize_message_body(msg),
-        )
-        save_verification_records()
-        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} verified_pass")
         return
 
     key = (chat_id, uid)
