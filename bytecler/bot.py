@@ -1410,6 +1410,19 @@ def set_bgroup_check_late(chat_id: str, late: bool) -> None:
     _save_group_settings()
 
 
+def get_addcp_enabled(chat_id: str) -> bool:
+    """组合关键词（addcp）是否启用。默认 True=开启"""
+    cid = str(chat_id)
+    return _group_settings.get(cid, {}).get("addcp_enabled", True)
+
+
+def set_addcp_enabled(chat_id: str, enabled: bool) -> None:
+    """设置组合关键词是否启用"""
+    cid = str(chat_id)
+    _group_settings.setdefault(cid, {})["addcp_enabled"] = enabled
+    _save_group_settings()
+
+
 _load_group_settings()
 
 
@@ -2197,7 +2210,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "reply_other_chat", retries=2, clear_cache_key=(chat_id, uid), hit_type="reply_other_chat")
         return
 
-    hit_cp = check_combined_pairs(first_name, last_name, text or "")
+    hit_cp = check_combined_pairs(first_name, last_name, text or "") if get_addcp_enabled(chat_id) else None
     if hit_cp:
         nk, tk = hit_cp
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 组合关键词 直接删除 hit=({nk!r},{tk!r})")
@@ -2402,6 +2415,15 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     msg_preview = (msg.text or msg.caption or "")[:200]
     raw_body = _serialize_message_body(msg)
     full_name = f"{first_name} {last_name}".strip() or "用户"
+    # 待验证关键词（spam_text/spam_name）触发时，将 full_name + text 以 exact 存入组合关键词
+    if trigger_reason in ("spam_text", "spam_name"):
+        msg_text = (msg.text or msg.caption or "").strip()
+        if full_name and msg_text:
+            msg_text = msg_text[:200]
+            if not _is_in_keyword_whitelist("name", full_name) and not _is_in_keyword_whitelist("text", msg_text):
+                if add_combined_pair(full_name, msg_text, exact=True):
+                    _save_combined_pairs()
+                    print(f"[PTB] 待验证触发: 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
     if msg_preview.strip():
         _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview, trigger_type=f"verify:{trigger_reason}" if trigger_reason else "verify:unknown", verification_passed="pending")
     _hit_type = "verify_text" if trigger_reason == "spam_text" else ("verify_name" if trigger_reason == "spam_name" else "verify_other")
@@ -2896,7 +2918,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("⚠️ 仅管理员可使用", show_alert=True)
         return
     await query.answer()
-    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and query.data != "set_list":
+    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and not query.data.startswith("set_tgl_addcp:") and query.data != "set_list":
         return
     if query.data == "set_list":
         groups = sorted(TARGET_GROUP_IDS)
@@ -2920,17 +2942,51 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             late = get_bgroup_check_late(gid)
             set_bgroup_check_late(gid, not late)
             new_late = get_bgroup_check_late(gid)
-            status = "开启" if new_late else "关闭"
+            addcp_en = get_addcp_enabled(gid)
             try:
                 title, _ = await _get_group_display_info(context.bot, gid)
             except Exception:
                 title = gid
-            toggle_btn = InlineKeyboardButton(
+            btn_late = InlineKeyboardButton(
                 f"B群检查延后: {'开启' if new_late else '关闭'} ← 点击切换",
                 callback_data=f"set_tgl:{gid}",
             )
-            kb = InlineKeyboardMarkup([[toggle_btn], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
-            await query.edit_message_text(f"群：{_escape_html(title)}\n\nB群检查延后：{status}\n（开启时，未加入B群判断放到组合关键词与白名单之间）", parse_mode="HTML", reply_markup=kb)
+            btn_addcp = InlineKeyboardButton(
+                f"组合关键词: {'开启' if addcp_en else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_addcp:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            await query.edit_message_text(
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if new_late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        return
+    if query.data.startswith("set_tgl_addcp:"):
+        gid = query.data[13:].strip()
+        if gid and gid in TARGET_GROUP_IDS:
+            addcp_en = get_addcp_enabled(gid)
+            set_addcp_enabled(gid, not addcp_en)
+            new_addcp = get_addcp_enabled(gid)
+            late = get_bgroup_check_late(gid)
+            try:
+                title, _ = await _get_group_display_info(context.bot, gid)
+            except Exception:
+                title = gid
+            btn_late = InlineKeyboardButton(
+                f"B群检查延后: {'开启' if late else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl:{gid}",
+            )
+            btn_addcp = InlineKeyboardButton(
+                f"组合关键词: {'开启' if new_addcp else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_addcp:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            await query.edit_message_text(
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if new_addcp else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
         return
     if query.data.startswith("set_grp:"):
         gid = query.data[8:].strip()
@@ -2938,17 +2994,22 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text("群不存在或已移除")
             return
         late = get_bgroup_check_late(gid)
+        addcp_en = get_addcp_enabled(gid)
         try:
             title, _ = await _get_group_display_info(context.bot, gid)
         except Exception:
             title = gid
-        toggle_btn = InlineKeyboardButton(
+        btn_late = InlineKeyboardButton(
             f"B群检查延后: {'开启' if late else '关闭'} ← 点击切换",
             callback_data=f"set_tgl:{gid}",
         )
-        kb = InlineKeyboardMarkup([[toggle_btn], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+        btn_addcp = InlineKeyboardButton(
+            f"组合关键词: {'开启' if addcp_en else '关闭'} ← 点击切换",
+            callback_data=f"set_tgl_addcp:{gid}",
+        )
+        kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
         await query.edit_message_text(
-            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）",
+            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -4337,7 +4398,7 @@ def _ptb_main():
     app.add_handler(CommandHandler("add_group", cmd_add_group, _admin_private))
     app.add_handler(CommandHandler("search", cmd_search, _admin_private))
     app.add_handler(CommandHandler("set", cmd_set, _admin_private))
-    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl:|^set_list$"))
+    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl:|^set_tgl_addcp:|^set_list$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
