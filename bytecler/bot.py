@@ -67,7 +67,7 @@ def _select_delete_bot(chat_id: int, msg_id: int) -> str:
 
 
 async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None, hit_type: Optional[str] = None, hit_keyword: Optional[str] = None) -> bool:
-    """本项目封装：方案 C 负载均衡；选中 assistant 时由小助理删除（霜刃不删），选中 frost 时由霜刃删除；小助理失败时霜刃兜底"""
+    """本项目封装：方案 C 负载均衡；霜刃始终尝试删除（可独立运行），小助理为补充；clear_cache_key 时自动用 _last_message_by_user 清理"""
     cid_int = int(chat_id) if isinstance(chat_id, str) else chat_id
     if DELETE_LOAD_BALANCE:
         choice = _select_delete_bot(cid_int, msg_id)
@@ -77,13 +77,10 @@ async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str,
                 if str(_xhbot) not in sys.path:
                     sys.path.insert(0, str(_xhbot))
                 from handoff import put_delete_handoff
-                if put_delete_handoff(cid_int, msg_id):
-                    if clear_cache_key and _last_message_by_user is not None:
-                        _last_message_by_user.pop(clear_cache_key, None)
-                    return True  # 已转交小助理，霜刃不删；小助理失败时会 put_delete_handoff_frost 由霜刃兜底
+                put_delete_handoff(cid_int, msg_id)
             except Exception:
                 pass
-            # handoff 失败则 fallback 到霜刃删除
+            # 不 return：霜刃继续尝试，保证无小助理或小助理权限不足时可独立运行
     ok = await _delete_message_with_retry_raw(
         bot, chat_id, msg_id, label, retries=retries,
         cache_dict=_last_message_by_user if clear_cache_key else None,
