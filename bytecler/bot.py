@@ -67,9 +67,11 @@ def _select_delete_bot(chat_id: int, msg_id: int) -> str:
 
 
 async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None, hit_type: Optional[str] = None, hit_keyword: Optional[str] = None) -> bool:
-    """本项目封装：方案 C 负载均衡；霜刃始终尝试删除（可独立运行），小助理为补充；clear_cache_key 时自动用 _last_message_by_user 清理"""
+    """本项目封装：方案 C 负载均衡；霜刃始终尝试删除（可独立运行），小助理为补充；clear_cache_key 时自动用 _last_message_by_user 清理。
+    霜刃消息（clear_cache_key 为空）不 handoff，因 Telegram 不允许小助理删除霜刃发的消息。"""
     cid_int = int(chat_id) if isinstance(chat_id, str) else chat_id
-    if DELETE_LOAD_BALANCE:
+    is_bot_msg = clear_cache_key is None  # 霜刃发的消息，小助理无法删除
+    if DELETE_LOAD_BALANCE and not is_bot_msg:
         choice = _select_delete_bot(cid_int, msg_id)
         if choice == "assistant":
             try:
@@ -88,7 +90,7 @@ async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str,
         hit_type=hit_type,
         hit_keyword=hit_keyword,
     )
-    if not ok and DELETE_LOAD_BALANCE:
+    if not ok and DELETE_LOAD_BALANCE and not is_bot_msg:
         try:
             _xhbot = _BASE.parent
             if str(_xhbot) not in sys.path:
@@ -4174,12 +4176,9 @@ async def _job_cleanup_bgroup_merge(context: ContextTypes.DEFAULT_TYPE):
             to_clean.append((chat_id_str, state.get("msg_id")))
     for chat_id_str, msg_id in to_clean:
         if msg_id is not None:
-            try:
-                await bot.delete_message(chat_id=int(chat_id_str), message_id=msg_id)
+            ok = await _delete_message_with_retry(bot, int(chat_id_str), msg_id, "bgroup_merge", retries=2, hit_type="bgroup")
+            if ok:
                 print(f"[PTB] B群合并兜底删除: chat_id={chat_id_str} msg_id={msg_id}")
-            except Exception as e:
-                if "not found" not in str(e).lower():
-                    print(f"[PTB] B群合并兜底删除失败 chat_id={chat_id_str} msg_id={msg_id}: {e}")
         if _bgroup_merge_state.get(chat_id_str, {}).get("msg_id") == msg_id:
             _bgroup_merge_state.pop(chat_id_str, None)
 
@@ -4197,13 +4196,9 @@ async def _job_cleanup_verify_merge(context: ContextTypes.DEFAULT_TYPE):
             to_clean.append((chat_id_str, state.get("msg_id")))
     for chat_id_str, msg_id in to_clean:
         if msg_id is not None:
-            try:
-                await bot.delete_message(chat_id=int(chat_id_str), message_id=msg_id)
+            ok = await _delete_message_with_retry(bot, int(chat_id_str), msg_id, "verify_merge", retries=2, hit_type="verify_other")
+            if ok:
                 print(f"[PTB] 人机验证合并兜底删除: chat_id={chat_id_str} msg_id={msg_id}")
-            except Exception as e:
-                if "not found" not in str(e).lower():
-                    print(f"[PTB] 人机验证合并兜底删除失败 chat_id={chat_id_str} msg_id={msg_id}: {e}")
-                    traceback.print_exc()
         if _verify_merge_state.get(chat_id_str, {}).get("msg_id") == msg_id:
             _verify_merge_state.pop(chat_id_str, None)
 
