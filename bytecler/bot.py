@@ -286,10 +286,16 @@ def _load_combined_pairs():
         for p in pairs:
             if not isinstance(p, dict) or not p.get("name") or not p.get("text"):
                 continue
+            cnt = p.get("count")
+            if cnt is not None and isinstance(cnt, (int, float)):
+                cnt = max(0, int(cnt))
+            else:
+                cnt = 0  # 旧数据迁移：无 count 默认 0
             _combined_pairs.append({
                 "name": str(p.get("name", "")).strip(),
                 "text": str(p.get("text", "")).strip(),
                 "exact": bool(p.get("exact", False)),
+                "count": cnt,
             })
     except Exception as e:
         print(f"[PTB] 加载组合关键词失败: {e}")
@@ -325,16 +331,42 @@ def check_combined_pairs(first_name: str, last_name: str, msg_text: str) -> Opti
     return None
 
 
-def add_combined_pair(name_kw: str, text_kw: str, exact: bool = False) -> bool:
-    """添加组合对。exact=True 时昵称和消息均精确匹配。已存在则返回 True 不重复添加"""
+def add_combined_pair(name_kw: str, text_kw: str, exact: bool = False, count: int = 1) -> bool:
+    """添加组合对。exact=True 时昵称和消息均精确匹配。已存在则返回 True 不重复添加。count 为新建时的计数值。"""
     nk, tk = (name_kw or "").strip(), (text_kw or "").strip()
     if not nk or not tk:
         return False
     for p in _combined_pairs:
         if (p.get("name") or "").strip() == nk and (p.get("text") or "").strip() == tk:
             return True
-    _combined_pairs.append({"name": nk, "text": tk, "exact": bool(exact)})
+    _combined_pairs.append({"name": nk, "text": tk, "exact": bool(exact), "count": max(0, count)})
     return True
+
+
+def _increment_combined_pair_count(nk: str, tk: str) -> int:
+    """找到 (nk, tk) 对应条目，count+1，保存，返回新的 count。未找到返回 0。"""
+    for p in _combined_pairs:
+        if (p.get("name") or "").strip() == nk and (p.get("text") or "").strip() == tk:
+            cur = int(p.get("count", 0))
+            p["count"] = cur + 1
+            _save_combined_pairs()
+            return p["count"]
+    return 0
+
+
+def set_combined_pair_count(nk: str, tk: str, count: int) -> bool:
+    """设置 (nk, tk) 对应条目的 count。存在则更新，不存在返回 False。"""
+    for p in _combined_pairs:
+        if (p.get("name") or "").strip() == nk and (p.get("text") or "").strip() == tk:
+            p["count"] = max(0, count)
+            _save_combined_pairs()
+            return True
+    return False
+
+
+def _combined_pair_exists(nk: str, tk: str) -> bool:
+    """检查 (nk, tk) 是否已存在于组合关键词中。"""
+    return any((p.get("name") or "").strip() == nk and (p.get("text") or "").strip() == tk for p in _combined_pairs)
 
 
 def remove_combined_pair(name_kw: str, text_kw: str) -> bool:
@@ -1425,6 +1457,19 @@ def set_addcp_enabled(chat_id: str, enabled: bool) -> None:
     _save_group_settings()
 
 
+def get_cp_restrict_enabled(chat_id: str) -> bool:
+    """CP命中限制用户：开时 count≥6 执行限制，关时仅计数。默认 False（关）"""
+    cid = str(chat_id)
+    return bool(_group_settings.get(cid, {}).get("cp_restrict_enabled", False))
+
+
+def set_cp_restrict_enabled(chat_id: str, enabled: bool) -> None:
+    """设置 CP命中限制用户 开关"""
+    cid = str(chat_id)
+    _group_settings.setdefault(cid, {})["cp_restrict_enabled"] = enabled
+    _save_group_settings()
+
+
 _load_group_settings()
 
 
@@ -1613,7 +1658,7 @@ _REQUIRED_GROUP_INFO_CACHE_TTL = 86400
 # 用户是否在 B 群缓存，(user_id, b_group_id) -> (is_in, ts)
 _user_in_required_group_cache: dict[tuple[int, str], tuple[bool, float]] = {}
 _USER_IN_GROUP_CACHE_TTL = 86400  # 「在」时缓存 1 天
-_USER_IN_GROUP_CACHE_TTL_NOT_IN = 10  # 「不在」时仅缓存 10 秒
+_USER_IN_GROUP_CACHE_TTL_NOT_IN = 2  # 「不在」时仅缓存 2 秒
 
 
 async def _is_user_in_required_group(bot, user_id: int, chat_id: str, skip_cache: bool = False) -> bool:
@@ -1835,10 +1880,11 @@ def _log_delete_failure(chat_id: int, msg_id: int, label: str, user_id: int = 0)
         print(f"[PTB] 记录删除失败日志异常: {e}")
 
 
-def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, trigger_type: str = "", verification_passed: Optional[str] = None):
+def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, trigger_type: str = "", verification_passed: Optional[str] = None, cpcount: Optional[int] = None, cp_restricted: Optional[bool] = None):
     """记录被删除的文案到 bio_calls.jsonl：time, user_id, full_name, deleted_content, trigger_type, verification_passed
-    trigger_type: bgroup | blacklist_text | blacklist_name | verify:ad | verify:emoji | verify:sticker | verify:spam_text | verify:spam_name | verify:blacklist | verify:reply_other_chat | admin_restrict
-    verification_passed: 仅人机验证时有效，pending=待验证 | true=通过 | false=未通过"""
+    trigger_type: bgroup | blacklist_text | blacklist_name | combined_pair | ...
+    verification_passed: 仅人机验证时有效，pending=待验证 | true=通过 | false=未通过
+    cpcount, cp_restricted: 仅 combined_pair 类型时有效"""
     content = (deleted_content or "").strip()
     if not content:
         return
@@ -1852,6 +1898,10 @@ def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, tri
         }
         if verification_passed is not None:
             rec["verification_passed"] = verification_passed
+        if cpcount is not None:
+            rec["cpcount"] = cpcount
+        if cp_restricted is not None:
+            rec["cp_restricted"] = cp_restricted
         with open(DELETED_CONTENT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -1981,7 +2031,7 @@ def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
         return
     msg_text = msg_text[:200]
     _log_deleted_content(user_id, full_name, msg_text, trigger_type="admin_restrict")
-    if add_combined_pair(name_trimmed, msg_text, exact=True):
+    if not _combined_pair_exists(name_trimmed, msg_text) and add_combined_pair(name_trimmed, msg_text, exact=True, count=1):
         _save_combined_pairs()
         print(f"[PTB] 管理员操作: 已加入组合关键词 (exact) name={name_trimmed!r} text={msg_text[:50]!r}...")
 
@@ -2129,6 +2179,10 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await _maybe_ai_trigger(context.bot, msg, chat_id, uid, text or "", first_name, last_name)
         return
 
+    # 管理员豁免：霜刃唤醒之后、白名单之前
+    if uid and is_admin(uid, ADMIN_IDS):
+        return
+
     # 白名单用户：在霜刃唤醒之后、facetext/facename 之前放行，跳过后续关键词检查
     if uid in verified_users:
         add_verification_record(
@@ -2139,6 +2193,23 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         save_verification_records()
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} verified_pass")
+        return
+
+    # 组合关键词：白名单之后、facetext/facename 之前
+    hit_cp = check_combined_pairs(first_name, last_name, text or "") if get_addcp_enabled(chat_id) else None
+    if hit_cp:
+        nk, tk = hit_cp
+        new_count = _increment_combined_pair_count(nk, tk)
+        cp_restrict_enabled = get_cp_restrict_enabled(chat_id)
+        do_restrict = new_count >= 6 and cp_restrict_enabled
+        if do_restrict:
+            await _restrict_cp_user(context.bot, chat_id, uid)
+        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 组合关键词 直接删除 hit=({nk!r},{tk!r}) count={new_count} restrict={do_restrict}")
+        full_name = f"{first_name} {last_name}".strip() or "用户"
+        msg_preview = (text or "")[:200]
+        if msg_preview.strip():
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="combined_pair", cpcount=new_count, cp_restricted=do_restrict)
+        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid), hit_type="combined_pair", hit_keyword=f"name:{nk}|text:{tk}")
         return
 
     # facetext/facename：女性头像+关键词命中→加黑+直接删除（放在霜刃唤醒和黑名单之间，每次均识别头像）
@@ -2210,17 +2281,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="reply_other_chat")
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "reply_other_chat", retries=2, clear_cache_key=(chat_id, uid), hit_type="reply_other_chat")
-        return
-
-    hit_cp = check_combined_pairs(first_name, last_name, text or "") if get_addcp_enabled(chat_id) else None
-    if hit_cp:
-        nk, tk = hit_cp
-        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 组合关键词 直接删除 hit=({nk!r},{tk!r})")
-        full_name = f"{first_name} {last_name}".strip() or "用户"
-        msg_preview = (text or "")[:200]
-        if msg_preview.strip():
-            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="combined_pair")
-        await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid), hit_type="combined_pair", hit_keyword=f"name:{nk}|text:{tk}")
         return
 
     # 开关开启时：未加入 B 群判断放到组合关键词与白名单之间
@@ -2351,7 +2411,7 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     if (hit_spam_text or hit_spam_name) and full_name and deleted_text:
         msg_text = deleted_text[:200]
         if not _is_in_keyword_whitelist("name", full_name) and not _is_in_keyword_whitelist("text", msg_text):
-            if add_combined_pair(full_name, msg_text, exact=True):
+            if not _combined_pair_exists(full_name, msg_text) and add_combined_pair(full_name, msg_text, exact=True, count=1):
                 _save_combined_pairs()
                 print(f"[PTB] B群删除+待验证命中: 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
     add_verification_record(
@@ -2432,7 +2492,7 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
         if full_name and msg_text:
             msg_text = msg_text[:200]
             if not _is_in_keyword_whitelist("name", full_name) and not _is_in_keyword_whitelist("text", msg_text):
-                if add_combined_pair(full_name, msg_text, exact=True):
+                if not _combined_pair_exists(full_name, msg_text) and add_combined_pair(full_name, msg_text, exact=True, count=1):
                     _save_combined_pairs()
                     print(f"[PTB] 待验证触发: 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
     if msg_preview.strip():
@@ -2627,6 +2687,20 @@ async def _apply_verification_pass(bot, chat_id: str, user_id: int, msg_id: int 
     except Exception as e:
         print(f"[PTB] 自助验证解除限制失败 chat={chat_id} uid={user_id}: {e}")
     return "验证通过，已将您加入白名单，您可以正常发言不触发风控"
+
+
+async def _restrict_cp_user(bot, chat_id: str, user_id: int):
+    """CP命中≥6次且开关开启时：永久限制发言+媒体（不拉黑、不通知）。"""
+    until = datetime.now(timezone.utc) + timedelta(days=400)  # 永久：366+ 天视为永久
+    try:
+        await bot.restrict_chat_member(
+            chat_id=int(chat_id), user_id=user_id,
+            until_date=until,
+            permissions={"can_send_messages": False, "can_send_media_messages": False},
+        )
+    except Exception as e:
+        print(f"[PTB] CP限制用户失败: {e}")
+        traceback.print_exc()
 
 
 async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, msg_id: int = None, restrict_hours: float | None = None):
@@ -2854,21 +2928,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin:
         await update.message.reply_text(
             "Bytecler 指令（仅私聊有效）\n\n"
-            "• /add_text、/add_name — 多轮添加黑名单关键词（命中直接删除+加黑，已存在则移除）\n"
-            "• /addcp — 多轮添加组合关键词（昵称+消息同时匹配时直接删除，格式：昵称,消息）\n"
-            "• /add_group — 添加霜刃可用群（支持 @群、https://t.me/xxx、-100xxxxxxxxxx）\n"
-            "• /cancel — 取消当前操作\n"
-            "• /help — 本帮助\n"
-            "• /reload — 重载配置\n"
+            "【基础】\n"
             "• /start — 启动\n"
-            "• /settime — 配置关联群验证/人机验证消息自动删除时间\n"
-            "• 群内 /setlimit — 配置本群 B 群/频道（需加入才能发言），仅拥有「可添加管理员」权限的管理员可配置；/clearlimit 删除\n"
-            "• /kw_text、/kw_name add/remove — 待验证关键词（命中触发人机验证）\n"
-            "• /facetext、/facename — 女性头像+消息/昵称关键词（多轮添加，命中直接删除，需 tgface）\n"
-            "• /wl_name、/wl_text — 白名单（管理员限制用户时不录入这些昵称/消息）\n"
-            "• /search — 管理员查询验证记录（发送后输入群消息链接）\n"
-            "• /set — 管理员群管理（B 群检查延后开关）\n\n"
-            "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
+            "• /help — 本帮助\n"
+            "• /cancel — 取消当前操作\n\n"
+            "【群管理】\n"
+            "• /set — 群设置（B 群检查延后、组合关键词、CP 命中限制用户）\n"
+            "• /add_group — 添加霜刃可用群（@群、https://t.me/xxx、-100xxxxxxxxxx）\n"
+            "• 群内 /setlimit — 配置本群 B 群/频道（需加入才能发言）；/clearlimit 删除\n\n"
+            "【关键词】\n"
+            "• /add_text、/add_name — 黑名单（命中删除+加黑）\n"
+            "• /addcp — 组合关键词（昵称+消息同时命中删除，格式：昵称,消息 或 /昵称,/消息 精确匹配）\n"
+            "• /kw_text、/kw_name — 待验证（命中触发人机验证）\n"
+            "• /wl_name、/wl_text — 白名单（限制用户时不录入）\n"
+            "• /facetext、/facename — 女性头像+关键词（命中删除，需 tgface）\n\n"
+            "【系统】\n"
+            "• /settime — 验证消息自动删除时间\n"
+            "• /reload — 重载配置\n"
+            "• /search — 查询验证记录（发送后输入群消息链接）\n\n"
+            "💡 群内无法正常发言或被限制？点击 /start 进行自助验证后即可"
         )
     else:
         await update.message.reply_text(
@@ -2876,7 +2954,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /start — 启动\n"
             "• /help — 本帮助\n"
             "• /cancel — 取消当前操作\n\n"
-            "💡 群内「霜刃你好」无反应？请在 @BotFather 关闭 Group Privacy，或使用 @机器人 唤醒"
+            "💡 群内无法正常发言或被限制？点击 /start 进行自助验证后即可"
         )
 
 def _clear_pending_private_verify(update: Update):
@@ -2929,7 +3007,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("⚠️ 仅管理员可使用", show_alert=True)
         return
     await query.answer()
-    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and not query.data.startswith("set_tgl_addcp:") and query.data != "set_list":
+    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and not query.data.startswith("set_tgl_addcp:") and not query.data.startswith("set_tgl_cp_restrict:") and query.data != "set_list":
         return
     if query.data == "set_list":
         groups = sorted(TARGET_GROUP_IDS)
@@ -2955,6 +3033,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             set_addcp_enabled(gid, not addcp_en)
             new_addcp = get_addcp_enabled(gid)
             late = get_bgroup_check_late(gid)
+            cp_restrict = get_cp_restrict_enabled(gid)
             try:
                 title, _ = await _get_group_display_info(context.bot, gid)
             except Exception:
@@ -2967,9 +3046,44 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"组合关键词: {'开启' if new_addcp else '关闭'} ← 点击切换",
                 callback_data=f"set_tgl_addcp:{gid}",
             )
-            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            btn_cp_restrict = InlineKeyboardButton(
+                f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
             await query.edit_message_text(
-                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if new_addcp else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）",
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if new_addcp else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        return
+    if query.data.startswith("set_tgl_cp_restrict:"):
+        gid = query.data[19:].strip()
+        if gid and gid in TARGET_GROUP_IDS:
+            cp_restrict = get_cp_restrict_enabled(gid)
+            set_cp_restrict_enabled(gid, not cp_restrict)
+            new_cp_restrict = get_cp_restrict_enabled(gid)
+            late = get_bgroup_check_late(gid)
+            addcp_en = get_addcp_enabled(gid)
+            try:
+                title, _ = await _get_group_display_info(context.bot, gid)
+            except Exception:
+                title = gid
+            btn_late = InlineKeyboardButton(
+                f"B群检查延后: {'开启' if late else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl:{gid}",
+            )
+            btn_addcp = InlineKeyboardButton(
+                f"组合关键词: {'开启' if addcp_en else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_addcp:{gid}",
+            )
+            btn_cp_restrict = InlineKeyboardButton(
+                f"CP命中限制用户: {'开启' if new_cp_restrict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            await query.edit_message_text(
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if new_cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -2981,6 +3095,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             set_bgroup_check_late(gid, not late)
             new_late = get_bgroup_check_late(gid)
             addcp_en = get_addcp_enabled(gid)
+            cp_restrict = get_cp_restrict_enabled(gid)
             try:
                 title, _ = await _get_group_display_info(context.bot, gid)
             except Exception:
@@ -2993,9 +3108,13 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"组合关键词: {'开启' if addcp_en else '关闭'} ← 点击切换",
                 callback_data=f"set_tgl_addcp:{gid}",
             )
-            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            btn_cp_restrict = InlineKeyboardButton(
+                f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
             await query.edit_message_text(
-                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if new_late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）",
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if new_late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -3007,6 +3126,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         late = get_bgroup_check_late(gid)
         addcp_en = get_addcp_enabled(gid)
+        cp_restrict = get_cp_restrict_enabled(gid)
         try:
             title, _ = await _get_group_display_info(context.bot, gid)
         except Exception:
@@ -3019,9 +3139,13 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"组合关键词: {'开启' if addcp_en else '关闭'} ← 点击切换",
             callback_data=f"set_tgl_addcp:{gid}",
         )
-        kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+        btn_cp_restrict = InlineKeyboardButton(
+            f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
+            callback_data=f"set_tgl_cp_restrict:{gid}",
+        )
+        kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
         await query.edit_message_text(
-            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）",
+            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -3046,6 +3170,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 pending_keyword_cmd = {}
 pending_keyword_confirm = {}  # 黑名单关键词已存在时等待用户确认是否移除
+pending_addcp_confirm = {}  # 组合关键词已存在时等待用户确认是否移除
 pending_face_confirm = {}  # facetext/facename 关键词已存在时等待用户确认是否移除
 pending_verify_confirm = {}  # 待验证关键词已存在时等待用户确认是否移除
 pending_wl_confirm = {}  # 白名单关键词已存在时等待用户确认是否移除
@@ -3139,6 +3264,11 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         to_pop = [k for k, v in pending_keyword_confirm.items() if v.get("uid") == uid]
         for k in to_pop:
             pending_keyword_confirm.pop(k, None)
+        await update.message.reply_text("已取消")
+    elif any(v.get("uid") == uid for v in pending_addcp_confirm.values()):
+        to_pop = [k for k, v in pending_addcp_confirm.items() if v.get("uid") == uid]
+        for k in to_pop:
+            pending_addcp_confirm.pop(k, None)
         await update.message.reply_text("已取消")
     elif uid in pending_settime_cmd:
         pending_settime_cmd.pop(uid, None)
@@ -3350,29 +3480,80 @@ async def cmd_add_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("bio 简介关键词暂未启用")
 
 
+def _cleanup_pending_addcp_confirm():
+    """清理超时的 pending_addcp_confirm 条目"""
+    global pending_addcp_confirm
+    now = time.time()
+    cutoff = now - PENDING_KEYWORD_CONFIRM_TIMEOUT
+    to_pop = [k for k, v in pending_addcp_confirm.items() if (v.get("ts") or 0) <= cutoff]
+    for k in to_pop:
+        pending_addcp_confirm.pop(k, None)
+
+
+def _parse_addcp_input(name_raw: str, text_raw: str) -> tuple[str, str, bool]:
+    """解析 addcp 的昵称和消息部分。若任一以 / 开头则 exact=True。返回 (name_for_storage, text_for_storage, exact)。"""
+    n = (name_raw or "").strip()
+    t = (text_raw or "").strip()
+    name_storage = n.lstrip("/").strip() if n.startswith("/") else n
+    text_storage = t.lstrip("/").strip() if t.startswith("/") else t
+    exact = n.startswith("/") or t.startswith("/")
+    return name_storage, text_storage, exact
+
+
 async def _process_add_cp_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, text: str) -> bool:
-    """处理 /addcp 的后续输入。格式：昵称关键词,消息关键词，支持多行。"""
+    """处理 /addcp 的后续输入。格式：昵称,消息 或 昵称,消息,N（N 为 count）。昵称或消息以 / 开头则精确匹配。支持多行。"""
     if not text:
         return False
     added = 0
+    set_count = 0
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         if "," not in line:
-            await update.message.reply_text(f"格式错误：需用逗号分隔，如 小月,开课了\n收到：{line[:50]}")
+            await update.message.reply_text(f"格式错误：需用逗号分隔，如 小月,开课了 或 /小月,/开课了\n收到：{line[:50]}")
             continue
-        parts = line.split(",", 1)
-        name_kw = (parts[0] or "").strip()
-        text_kw = (parts[1] or "").strip()
+        parts = line.split(",", 2)
+        name_raw = (parts[0] or "").strip()
+        text_raw = (parts[1] or "").strip()
+        if not name_raw or not text_raw:
+            await update.message.reply_text(f"格式错误：昵称和消息关键词均不能为空\n收到：{line[:50]}")
+            continue
+        name_kw, text_kw, exact = _parse_addcp_input(name_raw, text_raw)
         if not name_kw or not text_kw:
             await update.message.reply_text(f"格式错误：昵称和消息关键词均不能为空\n收到：{line[:50]}")
             continue
-        if add_combined_pair(name_kw, text_kw):
+        if len(parts) == 3:
+            try:
+                N = int((parts[2] or "").strip())
+            except ValueError:
+                await update.message.reply_text(f"格式错误：第三参数应为整数 N（如 小月,开课了,5）\n收到：{line[:50]}")
+                continue
+            if _combined_pair_exists(name_kw, text_kw):
+                set_combined_pair_count(name_kw, text_kw, N)
+                set_count += 1
+            else:
+                add_combined_pair(name_kw, text_kw, exact=exact, count=N)
+                _save_combined_pairs()
+                added += 1
+        else:
+            if _combined_pair_exists(name_kw, text_kw):
+                _cleanup_pending_addcp_confirm()
+                confirm_id = f"c{int(time.time()*1000)}_{uid}"[:32]
+                pending_addcp_confirm[confirm_id] = {"uid": uid, "name_kw": name_kw, "text_kw": text_kw, "ts": time.time()}
+                rows = [[InlineKeyboardButton("取消", callback_data=f"addcp_confirm:{confirm_id}:cancel"), InlineKeyboardButton("移除", callback_data=f"addcp_confirm:{confirm_id}:remove")]]
+                await update.message.reply_text(f"「{name_kw},{text_kw}」已在组合关键词中，是否移除？", reply_markup=InlineKeyboardMarkup(rows))
+                return True
+            add_combined_pair(name_kw, text_kw, exact=exact, count=1)
             _save_combined_pairs()
             added += 1
+    msgs = []
     if added > 0:
-        await update.message.reply_text(f"已添加 {added} 条组合关键词。继续发送（格式：昵称,消息），/cancel 结束")
+        msgs.append(f"已添加 {added} 条组合关键词")
+    if set_count > 0:
+        msgs.append(f"已设置 {set_count} 条 count")
+    if msgs:
+        await update.message.reply_text("。".join(msgs) + "。继续发送（格式：昵称,消息 或 昵称,消息,N），/cancel 结束")
     return True
 
 
@@ -3391,11 +3572,13 @@ async def cmd_addcp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _process_add_cp_followup(update, context, uid, args_text)
         return
     await update.message.reply_text(
-        "【组合关键词】昵称+消息同时匹配(match)时直接删除（多轮，/cancel 结束）\n"
-        "• 格式：昵称关键词,消息关键词\n"
+        "【组合关键词】昵称+消息同时匹配时直接删除（多轮，/cancel 结束）\n"
+        "• 格式：昵称,消息 或 昵称,消息,N（N 为 count）\n"
+        "• 直接输入如 小月,开课了 → 子串匹配；/小月,/开课了 → 精确匹配\n"
+        "• 2 参数已存在则提示是否移除；3 参数已存在则仅改 count\n"
         "• 支持多行，如：\n"
         "  小月,开课了\n"
-        "  小月,开课le"
+        "  /小月,/开课了,5"
     )
 
 async def _cmd_face(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, label: str):
@@ -3626,6 +3809,41 @@ async def callback_verify_confirm(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(f"移除「{kw}」失败（可能已不存在）", reply_markup=None)
 
 
+async def callback_addcp_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 addcp 中组合关键词已存在时的「取消/移除」按钮"""
+    global pending_addcp_confirm
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("addcp_confirm:"):
+        return
+    uid = query.from_user.id if query.from_user else 0
+    if not uid or not is_admin(uid, ADMIN_IDS):
+        await query.answer("⚠️ 仅管理员可使用", show_alert=True)
+        return
+    parts = query.data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("数据格式错误", show_alert=True)
+        return
+    _, confirm_id, action = parts[0], parts[1], parts[2]
+    info = pending_addcp_confirm.pop(confirm_id, None)
+    if not info:
+        await query.answer("已超时或已处理", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    name_kw, text_kw = info["name_kw"], info["text_kw"]
+    await query.answer()
+    if action == "cancel":
+        await query.edit_message_text(f"「{name_kw},{text_kw}」已取消移除", reply_markup=None)
+    elif action == "remove":
+        if remove_combined_pair(name_kw, text_kw):
+            _save_combined_pairs()
+            await query.edit_message_text(f"已从组合关键词移除「{name_kw},{text_kw}」", reply_markup=None)
+        else:
+            await query.edit_message_text(f"移除「{name_kw},{text_kw}」失败（可能已不存在）", reply_markup=None)
+
+
 async def callback_wl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 wl_name/wl_text 白名单关键词已存在时的「取消/移除」按钮"""
     global pending_wl_confirm
@@ -3818,8 +4036,7 @@ async def private_message_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if not is_admin(uid, ADMIN_IDS):
-        await update.message.reply_text("⚠️ 仅管理员可使用")
-        return
+        return  # 非管理员私聊非 /start、/help 时不做任何回复
 
     # 1. /add_group 的后续输入：等待群标识（120 秒超时）
     if uid in pending_add_group:
@@ -4158,6 +4375,7 @@ def _cleanup_pending_wl_confirm():
 async def _job_cleanup_pending_keyword_confirm(context: ContextTypes.DEFAULT_TYPE):
     """定时清理超时的各类 pending_confirm"""
     _cleanup_pending_keyword_confirm()
+    _cleanup_pending_addcp_confirm()
     _cleanup_pending_face_confirm()
     _cleanup_pending_verify_confirm()
     _cleanup_pending_wl_confirm()
@@ -4403,13 +4621,14 @@ def _ptb_main():
     app.add_handler(CommandHandler("add_group", cmd_add_group, _admin_private))
     app.add_handler(CommandHandler("search", cmd_search, _admin_private))
     app.add_handler(CommandHandler("set", cmd_set, _admin_private))
-    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl_addcp:|^set_tgl:|^set_list$"))
+    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl_addcp:|^set_tgl_cp_restrict:|^set_tgl:|^set_list$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
     app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))
     app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
     app.add_handler(CallbackQueryHandler(callback_keyword_confirm, pattern="^kw_confirm:"))
+    app.add_handler(CallbackQueryHandler(callback_addcp_confirm, pattern="^addcp_confirm:"))
     app.add_handler(CallbackQueryHandler(callback_face_confirm, pattern="^face_confirm:"))
     app.add_handler(CallbackQueryHandler(callback_verify_confirm, pattern="^verify_confirm:"))
     app.add_handler(CallbackQueryHandler(callback_wl_confirm, pattern="^wl_confirm:"))
