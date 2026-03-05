@@ -3027,7 +3027,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     # 组合关键词开关（必须在 set_tgl 之前检查，避免 set_tgl_addcp 被 set_tgl 误匹配）
     if query.data.startswith("set_tgl_addcp:"):
-        gid = query.data[13:].strip()
+        gid = query.data[len("set_tgl_addcp:"):].strip()
         if gid and gid in TARGET_GROUP_IDS:
             addcp_en = get_addcp_enabled(gid)
             set_addcp_enabled(gid, not addcp_en)
@@ -3058,7 +3058,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         return
     if query.data.startswith("set_tgl_cp_restrict:"):
-        gid = query.data[19:].strip()
+        gid = query.data[len("set_tgl_cp_restrict:"):].strip()
         if gid and gid in TARGET_GROUP_IDS:
             cp_restrict = get_cp_restrict_enabled(gid)
             set_cp_restrict_enabled(gid, not cp_restrict)
