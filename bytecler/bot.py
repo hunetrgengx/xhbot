@@ -1145,7 +1145,7 @@ def _log_verification_outcome(chat_id: str, msg_id: int, verification_passed: st
     user_id = rec.get("user_id", 0)
     full_name = rec.get("full_name") or "用户"
     trigger_type = f"verify:{reason}" if reason else "verify:unknown"
-    _log_deleted_content(user_id, full_name, content, trigger_type=trigger_type, verification_passed=verification_passed)
+    _log_deleted_content(user_id, full_name, content, chat_id=chat_id, trigger_type=trigger_type, verification_passed=verification_passed)
 
 
 def save_verification_blacklist():
@@ -1880,8 +1880,9 @@ def _log_delete_failure(chat_id: int, msg_id: int, label: str, user_id: int = 0)
         print(f"[PTB] 记录删除失败日志异常: {e}")
 
 
-def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, trigger_type: str = "", verification_passed: Optional[str] = None, cpcount: Optional[int] = None, cp_restricted: Optional[bool] = None):
-    """记录被删除的文案到 bio_calls.jsonl：time, user_id, full_name, deleted_content, trigger_type, verification_passed
+def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, chat_id: str = "", trigger_type: str = "", verification_passed: Optional[str] = None, cpcount: Optional[int] = None, cp_restricted: Optional[bool] = None):
+    """记录被删除的文案到 bio_calls.jsonl：time, user_id, full_name, deleted_content, chat_id, trigger_type, ...
+    chat_id: 群 ID，群消息删除时必填
     trigger_type: bgroup | blacklist_text | blacklist_name | combined_pair | ...
     verification_passed: 仅人机验证时有效，pending=待验证 | true=通过 | false=未通过
     cpcount, cp_restricted: 仅 combined_pair 类型时有效"""
@@ -1896,6 +1897,8 @@ def _log_deleted_content(user_id: int, full_name: str, deleted_content: str, tri
             "deleted_content": content[:500],
             "trigger_type": trigger_type or "",
         }
+        if chat_id:
+            rec["chat_id"] = str(chat_id)
         if verification_passed is not None:
             rec["verification_passed"] = verification_passed
         if cpcount is not None:
@@ -2030,7 +2033,7 @@ def _add_keywords_from_admin_action(chat_id: str, user_id: int, full_name: str):
         print(f"[PTB] 管理员操作: 消息 {msg_text[:50]!r}... 在白名单中，跳过")
         return
     msg_text = msg_text[:200]
-    _log_deleted_content(user_id, full_name, msg_text, trigger_type="admin_restrict")
+    _log_deleted_content(user_id, full_name, msg_text, chat_id=chat_id, trigger_type="admin_restrict")
     if not _combined_pair_exists(name_trimmed, msg_text) and add_combined_pair(name_trimmed, msg_text, exact=True, count=1):
         _save_combined_pairs()
         print(f"[PTB] 管理员操作: 已加入组合关键词 (exact) name={name_trimmed!r} text={msg_text[:50]!r}...")
@@ -2208,7 +2211,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         full_name = f"{first_name} {last_name}".strip() or "用户"
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
-            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="combined_pair", cpcount=new_count, cp_restricted=do_restrict)
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="combined_pair", cpcount=new_count, cp_restricted=do_restrict)
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "combined_pair", retries=2, clear_cache_key=(chat_id, uid), hit_type="combined_pair", hit_keyword=f"name:{nk}|text:{tk}")
         return
 
@@ -2228,7 +2231,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 full_name = f"{first_name} {last_name}".strip() or "用户"
                 msg_preview = (text or "")[:200]
                 if msg_preview.strip():
-                    _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type=trigger)
+                    _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type=trigger)
                 await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, trigger, retries=2, clear_cache_key=(chat_id, uid), hit_type=trigger, hit_keyword=kw)
                 return
 
@@ -2243,7 +2246,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         full_name = f"{first_name} {last_name}".strip() or "用户"
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
-            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="blacklist_text")
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="blacklist_text")
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_text", retries=2, clear_cache_key=(chat_id, uid), hit_type="blacklist_text", hit_keyword=hit_bl_text)
         return
     if hit_bl_name:
@@ -2254,7 +2257,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         full_name = f"{first_name} {last_name}".strip() or "用户"
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
-            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="blacklist_name")
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="blacklist_name")
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_name", retries=2, clear_cache_key=(chat_id, uid), hit_type="blacklist_name", hit_keyword=hit_bl_name)
         return
 
@@ -2267,7 +2270,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         full_name = f"{first_name} {last_name}".strip() or "用户"
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
-            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="ad")
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="ad")
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "ad", retries=2, clear_cache_key=(chat_id, uid), hit_type="ad")
         return
     # 引用非本群消息：回复转发/外部引用 → 直接删除+加黑
@@ -2279,7 +2282,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         full_name = f"{first_name} {last_name}".strip() or "用户"
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
-            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, trigger_type="reply_other_chat")
+            _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="reply_other_chat")
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "reply_other_chat", retries=2, clear_cache_key=(chat_id, uid), hit_type="reply_other_chat")
         return
 
@@ -2404,7 +2407,7 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     full_name = f"{first_name} {last_name}".strip() or "用户"
     deleted_text = (msg.text or msg.caption or "").strip()
     if deleted_text:
-        _schedule_sync_background(_log_deleted_content, user_id, full_name, deleted_text)
+        _schedule_sync_background(_log_deleted_content, user_id, full_name, deleted_text, chat_id=chat_id)
     # B 群删除后：若消息命中待验证 spam_text/spam_name，则将昵称+消息以 exact 加入组合关键词
     hit_spam_text = check_spam_text(deleted_text)
     hit_spam_name = check_spam_name(first_name, last_name)
@@ -2496,7 +2499,7 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
                     _save_combined_pairs()
                     print(f"[PTB] 待验证触发: 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
     if msg_preview.strip():
-        _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview, trigger_type=f"verify:{trigger_reason}" if trigger_reason else "verify:unknown", verification_passed="pending")
+        _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview, chat_id=chat_id, trigger_type=f"verify:{trigger_reason}" if trigger_reason else "verify:unknown", verification_passed="pending")
     _hit_type = "verify_text" if trigger_reason == "spam_text" else ("verify_name" if trigger_reason == "spam_name" else "verify_other")
     _hit_kw = hit_keyword if trigger_reason in ("spam_text", "spam_name") and hit_keyword else None
     await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2, clear_cache_key=(chat_id, user_id), hit_type=_hit_type, hit_keyword=_hit_kw)
