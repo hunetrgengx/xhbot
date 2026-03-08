@@ -1810,6 +1810,29 @@ def _contains_emoji(s: str) -> bool:
     return bool(s and _EMOJI_PATTERN.search(s))
 
 
+def _get_pure_media_type(msg) -> str | None:
+    """纯媒体消息（无 text/caption）时返回类型：sticker/photo/video/document/audio/animation/voice/video_note，否则返回 None"""
+    if (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip():
+        return None
+    if getattr(msg, "sticker", None):
+        return "sticker"
+    if getattr(msg, "photo", None):
+        return "photo"
+    if getattr(msg, "video", None):
+        return "video"
+    if getattr(msg, "document", None):
+        return "document"
+    if getattr(msg, "audio", None):
+        return "audio"
+    if getattr(msg, "animation", None):
+        return "animation"
+    if getattr(msg, "voice", None):
+        return "voice"
+    if getattr(msg, "video_note", None):
+        return "video_note"
+    return None
+
+
 def _is_reply_to_other_chat(msg, current_chat_id: int) -> bool:
     reply = getattr(msg, "reply_to_message", None)
     if not reply:
@@ -2247,6 +2270,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="blacklist_text")
+        if full_name and (text or "").strip():
+            msg_t = text or ""
+            if _combined_pair_exists(full_name, msg_t):
+                _increment_combined_pair_count(full_name, msg_t)
+            elif add_combined_pair(full_name, msg_t, exact=True, count=1):
+                _save_combined_pairs()
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_text", retries=2, clear_cache_key=(chat_id, uid), hit_type="blacklist_text", hit_keyword=hit_bl_text)
         return
     if hit_bl_name:
@@ -2258,6 +2287,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="blacklist_name")
+        if full_name and (text or "").strip():
+            msg_t = text or ""
+            if _combined_pair_exists(full_name, msg_t):
+                _increment_combined_pair_count(full_name, msg_t)
+            elif add_combined_pair(full_name, msg_t, exact=True, count=1):
+                _save_combined_pairs()
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "blacklist_name", retries=2, clear_cache_key=(chat_id, uid), hit_type="blacklist_name", hit_keyword=hit_bl_name)
         return
 
@@ -2329,11 +2364,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
         pending_verification.pop(key, None)
 
-    if ENABLE_STICKER_CHECK and getattr(msg, "sticker", None):
-        print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(sticker)")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到有疑似广告风险，请先完成人机验证。", "sticker")
-        return
+    # 非白名单用户：发纯贴纸/图片/媒体（无文字）时触发验证并删除
+    if ENABLE_STICKER_CHECK:
+        media_type = _get_pure_media_type(msg)
+        if media_type:
+            print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证({media_type})")
+            await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                      "⚠️ 检测到有疑似广告风险，请先完成人机验证。", media_type)
+            return
 
     if ENABLE_EMOJI_CHECK and (_contains_emoji(text) or _contains_emoji(f"{first_name} {last_name}".strip())):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(emoji)")
@@ -2408,13 +2446,15 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     deleted_text = (msg.text or msg.caption or "").strip()
     if deleted_text:
         _schedule_sync_background(_log_deleted_content, user_id, full_name, deleted_text, chat_id=chat_id)
-    # B 群删除后：若消息命中待验证 spam_text/spam_name，则将昵称+消息以 exact 加入组合关键词
+    # B 群删除后：若消息命中待验证 spam_text/spam_name，则将昵称+消息以 exact 加入组合关键词（已存在则 count+1）
     hit_spam_text = check_spam_text(deleted_text)
     hit_spam_name = check_spam_name(first_name, last_name)
     if (hit_spam_text or hit_spam_name) and full_name and deleted_text:
         msg_text = deleted_text[:200]
         if not _is_in_keyword_whitelist("name", full_name) and not _is_in_keyword_whitelist("text", msg_text):
-            if not _combined_pair_exists(full_name, msg_text) and add_combined_pair(full_name, msg_text, exact=True, count=1):
+            if _combined_pair_exists(full_name, msg_text):
+                _increment_combined_pair_count(full_name, msg_text)
+            elif add_combined_pair(full_name, msg_text, exact=True, count=1):
                 _save_combined_pairs()
                 print(f"[PTB] B群删除+待验证命中: 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
     add_verification_record(
@@ -2489,13 +2529,15 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
     msg_preview = (msg.text or msg.caption or "")[:200]
     raw_body = _serialize_message_body(msg)
     full_name = f"{first_name} {last_name}".strip() or "用户"
-    # 待验证关键词（spam_text/spam_name）触发时，将 full_name + text 以 exact 存入组合关键词
+    # 待验证关键词（spam_text/spam_name）触发时，将 full_name + text 以 exact 存入组合关键词（已存在则 count+1）
     if trigger_reason in ("spam_text", "spam_name"):
         msg_text = (msg.text or msg.caption or "").strip()
         if full_name and msg_text:
             msg_text = msg_text[:200]
             if not _is_in_keyword_whitelist("name", full_name) and not _is_in_keyword_whitelist("text", msg_text):
-                if not _combined_pair_exists(full_name, msg_text) and add_combined_pair(full_name, msg_text, exact=True, count=1):
+                if _combined_pair_exists(full_name, msg_text):
+                    _increment_combined_pair_count(full_name, msg_text)
+                elif add_combined_pair(full_name, msg_text, exact=True, count=1):
                     _save_combined_pairs()
                     print(f"[PTB] 待验证触发: 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
     if msg_preview.strip():
