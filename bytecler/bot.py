@@ -1470,6 +1470,19 @@ def set_cp_restrict_enabled(chat_id: str, enabled: bool) -> None:
     _save_group_settings()
 
 
+def get_cp_strict_restrict_enabled(chat_id: str) -> bool:
+    """强力限制：开时 count>1 即限制，关时 count>5 才限制。默认 False（关）"""
+    cid = str(chat_id)
+    return bool(_group_settings.get(cid, {}).get("cp_strict_restrict_enabled", False))
+
+
+def set_cp_strict_restrict_enabled(chat_id: str, enabled: bool) -> None:
+    """设置强力限制开关"""
+    cid = str(chat_id)
+    _group_settings.setdefault(cid, {})["cp_strict_restrict_enabled"] = enabled
+    _save_group_settings()
+
+
 _load_group_settings()
 
 
@@ -2227,7 +2240,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         nk, tk = hit_cp
         new_count = _increment_combined_pair_count(nk, tk)
         cp_restrict_enabled = get_cp_restrict_enabled(chat_id)
-        do_restrict = new_count >= 6 and cp_restrict_enabled
+        cp_threshold = 2 if get_cp_strict_restrict_enabled(chat_id) else 6  # 强力限制: count>1; 否则 count>5
+        do_restrict = new_count >= cp_threshold and cp_restrict_enabled
         if do_restrict:
             await _restrict_cp_user(context.bot, chat_id, uid)
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 组合关键词 直接删除 hit=({nk!r},{tk!r}) count={new_count} restrict={do_restrict}")
@@ -3053,7 +3067,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("⚠️ 仅管理员可使用", show_alert=True)
         return
     await query.answer()
-    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and not query.data.startswith("set_tgl_addcp:") and not query.data.startswith("set_tgl_cp_restrict:") and query.data != "set_list":
+    if not query.data.startswith("set_grp:") and not query.data.startswith("set_tgl:") and not query.data.startswith("set_tgl_addcp:") and not query.data.startswith("set_tgl_cp_restrict:") and not query.data.startswith("set_tgl_cp_strict_restrict:") and query.data != "set_list":
         return
     if query.data == "set_list":
         groups = sorted(TARGET_GROUP_IDS)
@@ -3080,6 +3094,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             new_addcp = get_addcp_enabled(gid)
             late = get_bgroup_check_late(gid)
             cp_restrict = get_cp_restrict_enabled(gid)
+            cp_strict = get_cp_strict_restrict_enabled(gid)
             try:
                 title, _ = await _get_group_display_info(context.bot, gid)
             except Exception:
@@ -3096,9 +3111,13 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
                 callback_data=f"set_tgl_cp_restrict:{gid}",
             )
-            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            btn_cp_strict = InlineKeyboardButton(
+                f"强力限制: {'开启' if cp_strict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_strict_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [btn_cp_strict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
             await query.edit_message_text(
-                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if new_addcp else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if new_addcp else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）\n\n强力限制：{'开启' if cp_strict else '关闭'}\n（开启时，count>1 即限制；关闭时 count>5 才限制，默认关闭）",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -3111,6 +3130,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             new_cp_restrict = get_cp_restrict_enabled(gid)
             late = get_bgroup_check_late(gid)
             addcp_en = get_addcp_enabled(gid)
+            cp_strict = get_cp_strict_restrict_enabled(gid)
             try:
                 title, _ = await _get_group_display_info(context.bot, gid)
             except Exception:
@@ -3127,9 +3147,49 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"CP命中限制用户: {'开启' if new_cp_restrict else '关闭'} ← 点击切换",
                 callback_data=f"set_tgl_cp_restrict:{gid}",
             )
-            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            btn_cp_strict = InlineKeyboardButton(
+                f"强力限制: {'开启' if cp_strict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_strict_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [btn_cp_strict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
             await query.edit_message_text(
-                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if new_cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if new_cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）\n\n强力限制：{'开启' if cp_strict else '关闭'}\n（开启时，count>1 即限制；关闭时 count>5 才限制，默认关闭）",
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+        return
+    if query.data.startswith("set_tgl_cp_strict_restrict:"):
+        gid = query.data[len("set_tgl_cp_strict_restrict:"):].strip()
+        if gid and gid in TARGET_GROUP_IDS:
+            cp_strict = get_cp_strict_restrict_enabled(gid)
+            set_cp_strict_restrict_enabled(gid, not cp_strict)
+            new_cp_strict = get_cp_strict_restrict_enabled(gid)
+            late = get_bgroup_check_late(gid)
+            addcp_en = get_addcp_enabled(gid)
+            cp_restrict = get_cp_restrict_enabled(gid)
+            try:
+                title, _ = await _get_group_display_info(context.bot, gid)
+            except Exception:
+                title = gid
+            btn_late = InlineKeyboardButton(
+                f"B群检查延后: {'开启' if late else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl:{gid}",
+            )
+            btn_addcp = InlineKeyboardButton(
+                f"组合关键词: {'开启' if addcp_en else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_addcp:{gid}",
+            )
+            btn_cp_restrict = InlineKeyboardButton(
+                f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_restrict:{gid}",
+            )
+            btn_cp_strict = InlineKeyboardButton(
+                f"强力限制: {'开启' if new_cp_strict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_strict_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [btn_cp_strict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            await query.edit_message_text(
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）\n\n强力限制：{'开启' if new_cp_strict else '关闭'}\n（开启时，count>1 即限制；关闭时 count>5 才限制，默认关闭）",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -3142,6 +3202,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             new_late = get_bgroup_check_late(gid)
             addcp_en = get_addcp_enabled(gid)
             cp_restrict = get_cp_restrict_enabled(gid)
+            cp_strict = get_cp_strict_restrict_enabled(gid)
             try:
                 title, _ = await _get_group_display_info(context.bot, gid)
             except Exception:
@@ -3158,9 +3219,13 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
                 callback_data=f"set_tgl_cp_restrict:{gid}",
             )
-            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+            btn_cp_strict = InlineKeyboardButton(
+                f"强力限制: {'开启' if cp_strict else '关闭'} ← 点击切换",
+                callback_data=f"set_tgl_cp_strict_restrict:{gid}",
+            )
+            kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [btn_cp_strict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
             await query.edit_message_text(
-                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if new_late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
+                f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if new_late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）\n\n强力限制：{'开启' if cp_strict else '关闭'}\n（开启时，count>1 即限制；关闭时 count>5 才限制，默认关闭）",
                 parse_mode="HTML",
                 reply_markup=kb,
             )
@@ -3173,6 +3238,7 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         late = get_bgroup_check_late(gid)
         addcp_en = get_addcp_enabled(gid)
         cp_restrict = get_cp_restrict_enabled(gid)
+        cp_strict = get_cp_strict_restrict_enabled(gid)
         try:
             title, _ = await _get_group_display_info(context.bot, gid)
         except Exception:
@@ -3189,9 +3255,13 @@ async def callback_set_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"CP命中限制用户: {'开启' if cp_restrict else '关闭'} ← 点击切换",
             callback_data=f"set_tgl_cp_restrict:{gid}",
         )
-        kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
+        btn_cp_strict = InlineKeyboardButton(
+            f"强力限制: {'开启' if cp_strict else '关闭'} ← 点击切换",
+            callback_data=f"set_tgl_cp_strict_restrict:{gid}",
+        )
+        kb = InlineKeyboardMarkup([[btn_late], [btn_addcp], [btn_cp_restrict], [btn_cp_strict], [InlineKeyboardButton("← 返回列表", callback_data="set_list")]])
         await query.edit_message_text(
-            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）",
+            f"群：{_escape_html(title)}\n\nB群检查延后：{'开启' if late else '关闭'}\n（开启时，未加入B群判断放到组合关键词与白名单之间）\n\n组合关键词：{'开启' if addcp_en else '关闭'}\n（开启时，昵称+消息同时命中组合关键词则直接删除）\n\nCP命中限制用户：{'开启' if cp_restrict else '关闭'}\n（开启时，count≥6 则永久限制发言+媒体）\n\n强力限制：{'开启' if cp_strict else '关闭'}\n（开启时，count>1 即限制；关闭时 count>5 才限制，默认关闭）",
             parse_mode="HTML",
             reply_markup=kb,
         )
@@ -4879,7 +4949,7 @@ def _ptb_main():
     app.add_handler(CommandHandler("search", cmd_search, _admin_private))
     app.add_handler(CommandHandler("set", cmd_set, _admin_private))
     app.add_handler(CommandHandler("limit", cmd_limit, _admin_private))
-    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl_addcp:|^set_tgl_cp_restrict:|^set_tgl:|^set_list$"))
+    app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl_addcp:|^set_tgl_cp_restrict:|^set_tgl_cp_strict_restrict:|^set_tgl:|^set_list$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
     app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
