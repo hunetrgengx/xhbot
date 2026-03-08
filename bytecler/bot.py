@@ -176,14 +176,20 @@ def _mask_display_name(name: str) -> str:
     return name if len(name) <= 7 else name[:2] + "***" + name[-2:]
 
 
-def _apply_trigger_cooldown_window(timestamps: list, now: float) -> tuple[bool, list, int]:
-    """冷却间隔+时间窗口。返回 (本次是否计入, 更新后的时间戳列表, 当前窗口内次数)"""
-    cutoff = now - TRIGGER_WINDOW_SECONDS
-    ts_list = [t for t in (timestamps or []) if t > cutoff]
+def _apply_trigger_cooldown_window(timestamps: list, now: float, cooldown_sec: float | None = None, window_sec: float | None = None) -> tuple[bool, list, int]:
+    """冷却间隔+时间窗口。返回 (本次是否计入, 更新后的时间戳列表, 当前窗口内次数)。
+    cooldown_sec/window_sec 为 None 时用全局常量。window_sec<=0 表示无窗口。"""
+    cooldown = cooldown_sec if cooldown_sec is not None else TRIGGER_COOLDOWN_SECONDS
+    window = window_sec if window_sec is not None else TRIGGER_WINDOW_SECONDS
+    if window is None or window <= 0:
+        ts_list = list(timestamps or [])
+    else:
+        cutoff = now - window
+        ts_list = [t for t in (timestamps or []) if t > cutoff]
     last_ts = ts_list[-1] if ts_list else 0
-    if last_ts and (now - last_ts) < TRIGGER_COOLDOWN_SECONDS:
+    if last_ts and (now - last_ts) < cooldown:
         return False, ts_list, len(ts_list)  # 冷却中，不计入
-    ts_list.append(now)
+    ts_list = ts_list + [now]
     return True, ts_list, len(ts_list)
 
 
@@ -2424,10 +2430,16 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def _cleanup_required_group_warn_count():
-    """清理 _required_group_warn_count 中已过期的 key（窗口外的不再计入）"""
+    """清理 _required_group_warn_count 中已过期的 key（窗口外的不再计入）。延后模式群无窗口，不清理。"""
     now = time.time()
     cutoff = now - TRIGGER_WINDOW_SECONDS
-    expired = [k for k, ts_list in _required_group_warn_count.items() if not ts_list or max(ts_list) <= cutoff]
+    expired = []
+    for k, ts_list in _required_group_warn_count.items():
+        chat_id = k[0] if isinstance(k, (list, tuple)) and len(k) >= 1 else ""
+        if get_bgroup_check_late(str(chat_id)):
+            continue  # 延后模式无窗口，不清理
+        if not ts_list or max(ts_list) <= cutoff:
+            expired.append(k)
     for k in expired:
         _required_group_warn_count.pop(k, None)
 
@@ -2452,7 +2464,11 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     _cleanup_required_group_warn_count()
     key = (chat_id, user_id)
     ts_list = _required_group_warn_count.get(key, [])
-    should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
+    # 延后模式：5秒冷却、无窗口
+    if get_bgroup_check_late(chat_id):
+        should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time(), cooldown_sec=5, window_sec=0)
+    else:
+        should_count, new_ts, cnt = _apply_trigger_cooldown_window(ts_list, time.time())
     if should_count:
         _required_group_warn_count[key] = new_ts
     await _delete_message_with_retry(bot, int(chat_id), msg.message_id, "required_group_trigger", retries=2, clear_cache_key=(chat_id, user_id), hit_type="bgroup")
@@ -2484,7 +2500,9 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         add_to_blacklist(user_id)
         save_verified_users()
         save_verification_blacklist()
-        await _restrict_and_notify(bot, chat_id, user_id, full_name, msg.message_id, restrict_hours=REQUIRED_GROUP_RESTRICT_HOURS)
+        # 延后模式：永久限制；非延后：24小时
+        restrict_hours = 0 if get_bgroup_check_late(chat_id) else REQUIRED_GROUP_RESTRICT_HOURS
+        await _restrict_and_notify(bot, chat_id, user_id, full_name, msg.message_id, restrict_hours=restrict_hours)
         return
 
     async with _get_bgroup_merge_lock(chat_id):
