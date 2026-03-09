@@ -2808,9 +2808,20 @@ async def _restrict_and_notify(bot, chat_id: str, user_id: int, full_name: str, 
         if k[1] == user_id:
             pending_verification.pop(k, None)
     try:
+        bot_username = ""
+        try:
+            me = await bot.get_me()
+            bot_username = me.username or ""
+        except Exception:
+            pass
+        reply_markup = None
+        if bot_username:
+            deep_link = f"https://t.me/{bot_username}?start=verify_{chat_id}"
+            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("自助解禁", url=deep_link)]])
         m = await bot.send_message(
             chat_id=int(chat_id),
-            text=f"【{_mask_display_name(full_name)}】\n\n验证失败，如有需要，请联系 {UNBAN_BOT_USERNAME} 进行解封",
+            text=f"【{_mask_display_name(full_name)}】\n\n验证失败，如有需要请点击下方按钮自助解禁",
+            reply_markup=reply_markup,
         )
         asyncio.create_task(_delete_after(bot, int(chat_id), m.message_id, VERIFY_MSG_DELETE_AFTER))
     except Exception:
