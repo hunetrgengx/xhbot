@@ -57,6 +57,7 @@ from message_delete import (
     get_stats as get_delete_stats,
     get_pending_queue_len,
     get_persist_queue_len,
+    emit_event,
 )
 
 
@@ -66,7 +67,7 @@ def _select_delete_bot(chat_id: int, msg_id: int) -> str:
     return "frost" if (h % 2 == 0) else "assistant"
 
 
-async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None, hit_type: Optional[str] = None, hit_keyword: Optional[str] = None) -> bool:
+async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str, retries: int = 3, clear_cache_key: Optional[Tuple[str, int]] = None, hit_type: Optional[str] = None, hit_keyword: Optional[str] = None, strict_restrict: bool = False) -> bool:
     """本项目封装：方案 C 负载均衡；霜刃始终尝试删除（可独立运行），小助理为补充；clear_cache_key 时自动用 _last_message_by_user 清理。
     霜刃消息（clear_cache_key 为空）不 handoff，因 Telegram 不允许小助理删除霜刃发的消息。"""
     cid_int = int(chat_id) if isinstance(chat_id, str) else chat_id
@@ -89,6 +90,7 @@ async def _delete_message_with_retry(bot, chat_id: int, msg_id: int, label: str,
         clear_cache_key=clear_cache_key,
         hit_type=hit_type,
         hit_keyword=hit_keyword,
+        strict_restrict=strict_restrict,
     )
     if not ok and DELETE_LOAD_BALANCE and not is_bot_msg:
         try:
@@ -2389,31 +2391,46 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         media_type = _get_pure_media_type(msg)
         if media_type:
             print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证({media_type})")
-            await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                      "⚠️ 检测到有疑似广告风险，请先完成人机验证。", media_type)
+            if get_cp_strict_restrict_enabled(chat_id):
+                await _start_verification_strict(context.bot, msg, chat_id, uid, first_name, last_name, media_type)
+            else:
+                await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                          "⚠️ 检测到有疑似广告风险，请先完成人机验证。", media_type)
             return
 
     if ENABLE_EMOJI_CHECK and (_contains_emoji(text) or _contains_emoji(f"{first_name} {last_name}".strip())):
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(emoji)")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到您的消息或昵称中含有表情符号，请先完成人机验证。", "emoji")
+        if get_cp_strict_restrict_enabled(chat_id):
+            await _start_verification_strict(context.bot, msg, chat_id, uid, first_name, last_name, "emoji")
+        else:
+            await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                      "⚠️ 检测到您的消息或昵称中含有表情符号，请先完成人机验证。", "emoji")
         return
     hit_text = check_spam_text(text)
     hit_name = check_spam_name(first_name, last_name)
     if hit_text:
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(spam_text hit={hit_text})")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到您的消息中含有疑似广告词，请先完成人机验证。", "spam_text", hit_keyword=hit_text)
+        if get_cp_strict_restrict_enabled(chat_id):
+            await _start_verification_strict(context.bot, msg, chat_id, uid, first_name, last_name, "spam_text", hit_keyword=hit_text)
+        else:
+            await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                      "⚠️ 检测到您的消息中含有疑似广告词，请先完成人机验证。", "spam_text", hit_keyword=hit_text)
         return
     if hit_name:
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(spam_name hit={hit_name})")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到您昵称中含有疑似广告词，请先完成人机验证。", "spam_name", hit_keyword=hit_name)
+        if get_cp_strict_restrict_enabled(chat_id):
+            await _start_verification_strict(context.bot, msg, chat_id, uid, first_name, last_name, "spam_name", hit_keyword=hit_name)
+        else:
+            await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                      "⚠️ 检测到您昵称中含有疑似广告词，请先完成人机验证。", "spam_name", hit_keyword=hit_name)
         return
     if uid in verification_blacklist:
         print(f"[PTB] 群消息已记录: chat_id={chat_id} msg_id={msg.message_id} 触发验证(blacklist)")
-        await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
-                                  "⚠️ 检测到您的账号疑似广告账号，请先完成人机验证。", "blacklist")
+        if get_cp_strict_restrict_enabled(chat_id):
+            await _start_verification_strict(context.bot, msg, chat_id, uid, first_name, last_name, "blacklist")
+        else:
+            await _start_verification(context.bot, msg, chat_id, uid, first_name, last_name,
+                                      "⚠️ 检测到您的账号疑似广告账号，请先完成人机验证。", "blacklist")
         return
 
     add_verified_user(uid, user.username, f"{first_name} {last_name}".strip())
@@ -2496,7 +2513,9 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
     _schedule_sync_background(save_verification_records)
     if not should_count:
         return  # 冷却期内：已删消息，不发重复警告
-    if cnt >= VERIFY_FAIL_THRESHOLD:
+    # 强力限制开启：B 群 2 次即限制；否则 5 次
+    bgroup_threshold = 2 if get_cp_strict_restrict_enabled(chat_id) else VERIFY_FAIL_THRESHOLD
+    if cnt >= bgroup_threshold:
         add_to_blacklist(user_id)
         save_verified_users()
         save_verification_blacklist()
@@ -2521,8 +2540,8 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         if prev_msg_id is not None:
             await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "bgroup_merge_replace", retries=1, hit_type="bgroup")
 
-        # 构建合并文案（用户名>7字时脱敏展示）
-        lines = [f"【{_mask_display_name(name)}】• 警告({c}/{VERIFY_FAIL_THRESHOLD})" for (_, name, _, c) in users_in_window]
+        # 构建合并文案（强力限制开启时 c/2，否则 c/5）
+        lines = [f"【{_mask_display_name(name)}】• 警告({c}/{bgroup_threshold})" for (_, name, _, c) in users_in_window]
         req_sec = _get_required_group_msg_delete_after()
         body = "\n".join(lines) + f"\n\n请以上用户先关注如下频道或加入群组后才能发言。\n\n本消息将于{req_sec}s后删除"
         rows = []
@@ -2551,6 +2570,70 @@ async def _delete_verify_merge_after(bot, chat_id: int, msg_id: int, chat_id_str
     except Exception as e:
         print(f"[PTB] 人机验证合并删除异常 chat_id={chat_id_str} msg_id={msg_id}: {type(e).__name__}: {e}")
         traceback.print_exc()
+
+
+async def _start_verification_strict(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, trigger_reason: str = "", hit_keyword: str = ""):
+    """强力限制开启时：删除消息+立即永久限制+发合并消息（新文案+自助验证按钮），无验证码。"""
+    global _verify_merge_state
+    msg_id = msg.message_id
+    msg_preview = (msg.text or msg.caption or "")[:200]
+    raw_body = _serialize_message_body(msg)
+    full_name = f"{first_name} {last_name}".strip() or "用户"
+    if trigger_reason in ("spam_text", "spam_name"):
+        msg_text = (msg.text or msg.caption or "").strip()
+        if full_name and msg_text:
+            msg_text = msg_text[:200]
+            if not _is_in_keyword_whitelist("name", full_name) and not _is_in_keyword_whitelist("text", msg_text):
+                if _combined_pair_exists(full_name, msg_text):
+                    _increment_combined_pair_count(full_name, msg_text)
+                elif add_combined_pair(full_name, msg_text, exact=True, count=1):
+                    _save_combined_pairs()
+                    print(f"[PTB] 待验证触发(强力限制): 已加入组合关键词(exact) name={full_name!r} text={msg_text[:50]!r}...")
+    if msg_preview.strip():
+        _schedule_sync_background(_log_deleted_content, user_id, full_name, msg_preview, chat_id=chat_id, trigger_type=f"verify:{trigger_reason}" if trigger_reason else "verify:unknown", verification_passed="pending")
+    _hit_type = "verify_text" if trigger_reason == "spam_text" else ("verify_name" if trigger_reason == "spam_name" else "verify_other")
+    _hit_kw = hit_keyword if trigger_reason in ("spam_text", "spam_name") and hit_keyword else None
+    await _delete_message_with_retry(bot, int(chat_id), msg.message_id, f"trigger_{trigger_reason}", retries=2, clear_cache_key=(chat_id, user_id), hit_type=_hit_type, hit_keyword=_hit_kw, strict_restrict=True)
+    add_verification_record(
+        chat_id, msg_id, user_id,
+        full_name, getattr(msg.from_user, "username", None) or "",
+        trigger_reason, msg_preview, hit_keyword=hit_keyword, raw_message_body=raw_body,
+    )
+    _schedule_sync_background(save_verification_records)
+    await _restrict_cp_user(bot, chat_id, user_id)
+
+    async with _get_verify_merge_lock(chat_id):
+        now = time.time()
+        cutoff = now - VERIFY_MERGE_WINDOW_SEC
+        state = _verify_merge_state.get(chat_id) or {}
+        prev_users: list = state.get("users") or []
+        prev_msg_id = state.get("msg_id")
+        is_strict = state.get("strict", False)
+        if prev_users and not is_strict:
+            prev_users = []
+            prev_msg_id = None
+        users_in_window = [(u, n, t) for (u, n, t) in prev_users if t > cutoff] if is_strict else []
+        users_in_window = [(u, n, t) for (u, n, t) in users_in_window if u != user_id]
+        users_in_window.append((user_id, full_name, now))
+
+        if prev_msg_id is not None:
+            await _delete_message_with_retry(bot, int(chat_id), prev_msg_id, "verify_merge_replace", retries=1, hit_type="verify_other")
+
+        names_part = " ".join([f"【{_mask_display_name(n)}】" for (_, n, _) in users_in_window])
+        body = f"{names_part}\n\n⚠️ 检测到新入群或触发风控，请点击自助验证按钮，验证通过后即可解除限制\n💡　当您发现无法正常发言或被限制时，也可点击自助验证按钮解除限制"
+        try:
+            me = await bot.get_me()
+            bot_username = me.username or ""
+        except Exception:
+            bot_username = ""
+        buttons = []
+        if bot_username:
+            deep_link = f"https://t.me/{bot_username}?start=verify_{chat_id}"
+            buttons.append([InlineKeyboardButton("自助验证", url=deep_link)])
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
+        _verify_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": now, "strict": True}
+    _safe_create_task(_delete_verify_merge_after(bot, int(chat_id), vmsg.message_id, chat_id), "verify_merge")
 
 
 async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: str, last_name: str, intro: str, trigger_reason: str = "", hit_keyword: str = ""):
@@ -2591,6 +2674,8 @@ async def _start_verification(bot, msg, chat_id: str, user_id: int, first_name: 
         state = _verify_merge_state.get(chat_id) or {}
         prev_users: list = state.get("users") or []
         prev_msg_id = state.get("msg_id")
+        if state.get("strict"):
+            prev_users, prev_msg_id = [], None
         users_in_window = [(uid, name, c, mid, t) for (uid, name, c, mid, t) in prev_users if t > cutoff]
         users_in_window = [(uid, name, c, mid, t) for (uid, name, c, mid, t) in users_in_window if uid != user_id]
         users_in_window.append((user_id, full_name, code, msg_id, now))
@@ -2763,6 +2848,7 @@ async def _apply_verification_pass(bot, chat_id: str, user_id: int, msg_id: int 
         )
     except Exception as e:
         print(f"[PTB] 自助验证解除限制失败 chat={chat_id} uid={user_id}: {e}")
+    emit_event("self_verify_pass", chat_id=chat_id, user_id=user_id)
     return "验证通过，已将您加入白名单，您可以正常发言不触发风控"
 
 
@@ -2933,6 +3019,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[PTB] 自助验证 get_chat 失败 chat_id={chat_id}: {e}")
                 chat = None
             if chat and getattr(chat, "type", "") in ("group", "supergroup"):
+                emit_event("self_verify_start", chat_id=chat_id, user_id=target_uid, source="deep_link")
                 title, link = await _get_group_display_info(context.bot, chat_id)
                 group_display = f'<a href="{link}">{_escape_html(title)}</a>'
                 if target_uid in verified_users:
@@ -3900,6 +3987,7 @@ async def callback_required_group_unrestrict(update: Update, context: ContextTyp
         return
     # 每次点击都实时检查，不读缓存（用户可能刚加入 B 群）
     if not await _is_user_in_required_group(context.bot, clicker_id, chat_id_str, skip_cache=True):
+        emit_event("self_unrestrict_click", chat_id=chat_id_str, user_id=clicker_id, result="fail_not_in_bgroup")
         await query.answer("请先加入指定群组后再点击", show_alert=True)
         return
     try:
@@ -3922,12 +4010,14 @@ async def callback_required_group_unrestrict(update: Update, context: ContextTyp
     except Exception as e:
         err_msg = str(e).lower() if e else ""
         print(f"[PTB] 自助解禁失败 chat={chat_id_str} uid={clicker_id}: {e}")
+        emit_event("self_unrestrict_click", chat_id=chat_id_str, user_id=clicker_id, result="fail_restrict")
         if "rights" in err_msg or "permission" in err_msg or "admin" in err_msg:
             tip = "解禁失败，请确认机器人在该群有禁言权限"
         else:
             tip = f"解禁失败：{str(e)[:80]}"
         await query.answer(tip, show_alert=True)
         return
+    emit_event("self_unrestrict_click", chat_id=chat_id_str, user_id=clicker_id, result="success")
     add_verified_user(clicker_id, None, None)
     verification_blacklist.discard(clicker_id)
     save_verified_users()

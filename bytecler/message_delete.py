@@ -49,6 +49,11 @@ def _ts_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def emit_event(evt: str, **kwargs: Any) -> None:
+    """写入埋点事件到 delete_events.jsonl（公开接口，供 bot 等调用）"""
+    _emit_event(evt, **kwargs)
+
+
 def _emit_event(evt: str, **kwargs: Any) -> None:
     """写入埋点事件到 delete_events.jsonl，支持按大小轮转"""
     if not DELETE_EVENTS_ENABLED:
@@ -184,6 +189,7 @@ async def delete_message_with_retry(
     log_prefix: str = "PTB",
     hit_type: Optional[str] = None,
     hit_keyword: Optional[str] = None,
+    strict_restrict: bool = False,
 ) -> bool:
     """带重试的删除。成功时若提供 cache_dict+clear_cache_key 或 on_success 则执行清理。
     失败时入待重试队列。clear_cache_key 的 [1] 为 user_id（0 表示 bot 消息）。"""
@@ -203,6 +209,8 @@ async def delete_message_with_retry(
                 evt_kw["hit_type"] = hit_type
             if hit_keyword is not None and hit_keyword != "":
                 evt_kw["hit_keyword"] = hit_keyword
+            if strict_restrict:
+                evt_kw["strict_restrict"] = True
             _emit_event("delete_attempt", **evt_kw)
             _clear_attempt_no(cid_str, msg_id)
             if cache_dict is not None and clear_cache_key is not None:
@@ -220,6 +228,8 @@ async def delete_message_with_retry(
                 evt_kw["hit_type"] = hit_type
             if hit_keyword is not None and hit_keyword != "":
                 evt_kw["hit_keyword"] = hit_keyword
+            if strict_restrict:
+                evt_kw["strict_restrict"] = True
             _emit_event("delete_attempt", **evt_kw)
             if not_found:
                 _clear_attempt_no(cid_str, msg_id)
