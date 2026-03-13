@@ -168,10 +168,12 @@ async def _add_pending_retry(bot: Any, chat_id: str, msg_id: int, user_id: int, 
     for item in expired:
         _emit_event("queue_expire", chat_id=item[0], msg_id=item[1], user_id=item[2], reason="expire", queue_len=len(_pending_delete_retry))
         _persist_append(item[0], item[1], item[2], item[3])
+        _clear_attempt_no(item[0], item[1])
     while len(_pending_delete_retry) >= PENDING_DELETE_RETRY_MAX:
         evicted = _pending_delete_retry.pop(0)
         _emit_event("queue_evict", chat_id=evicted[0], msg_id=evicted[1], user_id=evicted[2], reason="evict", queue_len=len(_pending_delete_retry))
         _persist_append(evicted[0], evicted[1], evicted[2], evicted[3])
+        _clear_attempt_no(evicted[0], evicted[1])
         print(f"[{log_prefix}] 待删队列已满，溢出到持久化 chat_id={evicted[0]} msg_id={evicted[1]}")
     _emit_event("queue_enqueue", chat_id=chat_id, msg_id=msg_id, user_id=user_id, queue_len=len(_pending_delete_retry) + 1)
     _pending_delete_retry.append((chat_id, msg_id, user_id, now))

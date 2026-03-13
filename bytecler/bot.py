@@ -2277,6 +2277,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 msg_preview = (text or "")[:200]
                 if msg_preview.strip():
                     _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type=trigger)
+                if full_name and (text or "").strip():
+                    msg_t = text or ""
+                    if _combined_pair_exists(full_name, msg_t):
+                        _increment_combined_pair_count(full_name, msg_t)
+                    elif add_combined_pair(full_name, msg_t, exact=True, count=1):
+                        _save_combined_pairs()
                 await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, trigger, retries=2, clear_cache_key=(chat_id, uid), hit_type=trigger, hit_keyword=kw)
                 return
 
@@ -2328,6 +2334,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="ad")
+        if full_name and (text or "").strip():
+            msg_t = text or ""
+            if _combined_pair_exists(full_name, msg_t):
+                _increment_combined_pair_count(full_name, msg_t)
+            elif add_combined_pair(full_name, msg_t, exact=True, count=1):
+                _save_combined_pairs()
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "ad", retries=2, clear_cache_key=(chat_id, uid), hit_type="ad")
         return
     # 引用非本群消息：回复转发/外部引用 → 直接删除+加黑
@@ -2340,6 +2352,12 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         msg_preview = (text or "")[:200]
         if msg_preview.strip():
             _schedule_sync_background(_log_deleted_content, uid, full_name, msg_preview, chat_id=chat_id, trigger_type="reply_other_chat")
+        if full_name and (text or "").strip():
+            msg_t = text or ""
+            if _combined_pair_exists(full_name, msg_t):
+                _increment_combined_pair_count(full_name, msg_t)
+            elif add_combined_pair(full_name, msg_t, exact=True, count=1):
+                _save_combined_pairs()
         await _delete_message_with_retry(context.bot, int(chat_id), msg.message_id, "reply_other_chat", retries=2, clear_cache_key=(chat_id, uid), hit_type="reply_other_chat")
         return
 
@@ -2548,9 +2566,18 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         for title, link in await _get_required_group_buttons(bot, chat_id):
             if link:
                 rows.append([InlineKeyboardButton(title, url=link)])
-        cb_data = f"reqgrp_unr:{chat_id}:0"
-        if len(cb_data) <= 64:
-            rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
+        if get_cp_strict_restrict_enabled(chat_id):
+            try:
+                me = await bot.get_me()
+                bot_username = me.username or ""
+            except Exception:
+                bot_username = ""
+            if bot_username:
+                rows.append([InlineKeyboardButton("自助解禁", url=f"https://t.me/{bot_username}?start=verify_{chat_id}")])
+        else:
+            cb_data = f"reqgrp_unr:{chat_id}:0"
+            if len(cb_data) <= 64:
+                rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
         reply_markup = InlineKeyboardMarkup(rows) if rows else None
         vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
         _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": time.time()}
@@ -3030,6 +3057,34 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
                 key = (chat_id, target_uid)
+                if key not in pending_verification and get_bgroup_ids_for_chat(chat_id):
+                    in_bgroup = await _is_user_in_required_group(context.bot, target_uid, chat_id, skip_cache=True)
+                    if in_bgroup:
+                        try:
+                            perms = ChatPermissions.all_permissions()
+                        except (AttributeError, TypeError):
+                            perms = {"can_send_messages": True, "can_send_media_messages": True, "can_send_other_messages": True, "can_send_polls": True, "can_add_web_page_previews": True}
+                        try:
+                            await context.bot.restrict_chat_member(chat_id=int(chat_id), user_id=target_uid, permissions=perms)
+                            emit_event("self_unrestrict_click", chat_id=chat_id, user_id=target_uid, result="success")
+                            add_verified_user(target_uid, None, None)
+                            verification_blacklist.discard(target_uid)
+                            save_verified_users()
+                            save_verification_blacklist()
+                            _required_group_warn_count.pop((chat_id, target_uid), None)
+                            for b_id in get_bgroup_ids_for_chat(chat_id):
+                                _user_in_required_group_cache.pop((target_uid, b_id), None)
+                            await update.message.reply_text(f"✅ 已解禁\n\n您已加入指定群组，限制已解除。\n所在群：{group_display}", parse_mode="HTML")
+                        except Exception as e:
+                            emit_event("self_unrestrict_click", chat_id=chat_id, user_id=target_uid, result="fail_restrict")
+                            await update.message.reply_text("解禁失败，请确认机器人在该群有禁言权限，或联系管理员。")
+                        return
+                    emit_event("self_unrestrict_click", chat_id=chat_id, user_id=target_uid, result="fail_not_in_bgroup")
+                    b_buttons = await _get_required_group_buttons(context.bot, chat_id)
+                    b_lines = [f"• <a href=\"{ln}\">{_escape_html(tt)}</a>" for tt, ln in b_buttons if ln]
+                    b_tip = "\n".join(b_lines) if b_lines else "请先加入指定群组"
+                    await update.message.reply_text(f"请先加入以下群组或频道后再试：\n\n{b_tip}\n\n所在群：{group_display}", parse_mode="HTML")
+                    return
                 now = time.time()
                 if key in pending_verification:
                     pb = pending_verification[key]
@@ -3482,6 +3537,10 @@ async def _run_batch_limit(bot, chat_id: str, user_ids: list[int], admin_user_id
                 chat_id=int(chat_id), user_id=uid,
                 until_date=until, permissions=perms,
             )
+            add_to_blacklist(uid)
+            _add_keywords_from_admin_action(chat_id, uid, full_name)
+            save_verified_users()
+            save_verification_blacklist()
             batch.append((full_name, uid, "✓ 已限制"))
         except Exception as e:
             err = str(e).lower() if e else ""
@@ -5115,15 +5174,5 @@ def main():
 
 
 if __name__ == "__main__":
-    import signal
-    _orig_signal = signal.signal
-    def _our_signal(signum, handler):
-        if signum == signal.SIGINT:
-            return _orig_signal(signum, lambda s, f: os._exit(0))
-        return _orig_signal(signum, handler)
-    signal.signal = _our_signal
-    signal.signal(signal.SIGINT, lambda s, f: None)
-    try:
-        main()
-    except KeyboardInterrupt:
-        os._exit(0)
+    # 不覆盖信号，由 PTB run_polling 注册 SIGINT/SIGTERM 实现优雅退出
+    main()
