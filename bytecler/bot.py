@@ -2566,18 +2566,13 @@ async def _start_required_group_verification(bot, msg, chat_id: str, user_id: in
         for title, link in await _get_required_group_buttons(bot, chat_id):
             if link:
                 rows.append([InlineKeyboardButton(title, url=link)])
-        if get_cp_strict_restrict_enabled(chat_id):
-            try:
-                me = await bot.get_me()
-                bot_username = me.username or ""
-            except Exception:
-                bot_username = ""
-            if bot_username:
-                rows.append([InlineKeyboardButton("自助解禁", url=f"https://t.me/{bot_username}?start=verify_{chat_id}")])
-        else:
-            cb_data = f"reqgrp_unr:{chat_id}:0"
-            if len(cb_data) <= 64:
-                rows.append([InlineKeyboardButton("自助解禁", callback_data=cb_data)])
+        try:
+            me = await bot.get_me()
+            bot_username = me.username or ""
+        except Exception:
+            bot_username = ""
+        if bot_username:
+            rows.append([InlineKeyboardButton("自助解禁", url=f"https://t.me/{bot_username}?start=verify_{chat_id}")])
         reply_markup = InlineKeyboardMarkup(rows) if rows else None
         vmsg = await bot.send_message(chat_id=int(chat_id), text=body, reply_markup=reply_markup)
         _bgroup_merge_state[chat_id] = {"users": users_in_window, "msg_id": vmsg.message_id, "ts": time.time()}
@@ -4026,68 +4021,6 @@ async def _cmd_kw(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str
     )
 
 
-async def callback_required_group_unrestrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """自助解禁：点击者若在 B 群，则解除点击者本人的限制"""
-    query = update.callback_query
-    if not query or not query.data or not query.data.startswith("reqgrp_unr:"):
-        return
-    clicker_id = query.from_user.id if query.from_user else 0
-    if not clicker_id:
-        await query.answer("无法识别点击者", show_alert=True)
-        return
-    try:
-        parts = query.data.split(":", 2)
-        if len(parts) != 3:
-            await query.answer("数据格式错误", show_alert=True)
-            return
-        _, chat_id_str, _ = parts
-    except (ValueError, IndexError):
-        await query.answer("解析失败", show_alert=True)
-        return
-    # 每次点击都实时检查，不读缓存（用户可能刚加入 B 群）
-    if not await _is_user_in_required_group(context.bot, clicker_id, chat_id_str, skip_cache=True):
-        emit_event("self_unrestrict_click", chat_id=chat_id_str, user_id=clicker_id, result="fail_not_in_bgroup")
-        await query.answer("请先加入指定群组后再点击", show_alert=True)
-        return
-    try:
-        # 解除点击者本人的限制
-        try:
-            perms = ChatPermissions.all_permissions()
-        except (AttributeError, TypeError):
-            perms = {
-                "can_send_messages": True,
-                "can_send_media_messages": True,
-                "can_send_other_messages": True,
-                "can_send_polls": True,
-                "can_add_web_page_previews": True,
-            }
-        await context.bot.restrict_chat_member(
-            chat_id=int(chat_id_str),
-            user_id=clicker_id,
-            permissions=perms,
-        )
-    except Exception as e:
-        err_msg = str(e).lower() if e else ""
-        print(f"[PTB] 自助解禁失败 chat={chat_id_str} uid={clicker_id}: {e}")
-        emit_event("self_unrestrict_click", chat_id=chat_id_str, user_id=clicker_id, result="fail_restrict")
-        if "rights" in err_msg or "permission" in err_msg or "admin" in err_msg:
-            tip = "解禁失败，请确认机器人在该群有禁言权限"
-        else:
-            tip = f"解禁失败：{str(e)[:80]}"
-        await query.answer(tip, show_alert=True)
-        return
-    emit_event("self_unrestrict_click", chat_id=chat_id_str, user_id=clicker_id, result="success")
-    add_verified_user(clicker_id, None, None)
-    verification_blacklist.discard(clicker_id)
-    save_verified_users()
-    save_verification_blacklist()
-    key = (chat_id_str, clicker_id)
-    _required_group_warn_count.pop(key, None)
-    for b_id in get_bgroup_ids_for_chat(chat_id_str):
-        _user_in_required_group_cache.pop((clicker_id, b_id), None)
-    await query.answer("已解禁", show_alert=True)
-
-
 async def callback_limit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /limit 确认步骤的「取消/开始执行」按钮"""
     global pending_limit_confirm
@@ -5130,7 +5063,6 @@ def _ptb_main():
     app.add_handler(CallbackQueryHandler(callback_set_group, pattern="^set_grp:|^set_tgl_addcp:|^set_tgl_cp_restrict:|^set_tgl_cp_strict_restrict:|^set_tgl:|^set_list$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, private_message_handler))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.TEXT, private_nontext_handler))
-    app.add_handler(CallbackQueryHandler(callback_required_group_unrestrict, pattern="^reqgrp_unr:"))
     app.add_handler(CallbackQueryHandler(callback_settime, pattern="^settime:"))
     app.add_handler(CallbackQueryHandler(callback_raw_message_button, pattern="^raw_msg:"))
     app.add_handler(CallbackQueryHandler(callback_limit_confirm, pattern="^limit_confirm:"))
