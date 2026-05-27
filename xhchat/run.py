@@ -1,4 +1,4 @@
-"""启动入口2"""
+"""启动入口12"""
 from bot.main import main
 
 if __name__ == "__main__":
