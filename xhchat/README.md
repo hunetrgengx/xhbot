@@ -90,7 +90,7 @@ Kimi 的 `custom_prompt` 等固定内容每次请求都会重复发送。开启 
 ```env
 AI_PROVIDER=kimi
 OPENAI_API_KEY=你的Kimi_API_Key
-# 可选模型：moonshot-v1-8k | moonshot-v1-128k | moonshot-v1-1m | kimi-k2
+# 可选模型：moonshot-v1-8k | moonshot-v1-128k | moonshot-v1-1m | kimi-k2.6 | kimi-k2.5
 MODEL_NAME=moonshot-v1-128k
 ```
 
