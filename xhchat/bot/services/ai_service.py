@@ -33,13 +33,27 @@ SYSTEM_PROMPT_BASE = """你是一个友好的 AI 助手，在 Telegram 群聊中
 WEB_SEARCH_TOOLS = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
 
 
+def _model_request_options(model: str, default_temperature: float) -> dict:
+    """Kimi K2.6/K2.5 仅允许固定 temperature；默认关闭 thinking 以用 instant 模式 0.6。"""
+    if model.startswith("kimi-k2"):
+        return {
+            "temperature": 0.6,
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+    return {"temperature": default_temperature}
+
+
 def _web_search_impl(arguments: dict) -> dict:
     return arguments
 
 
 def _chat_with_tools(client: OpenAI, messages: list[dict], model: str):
     response = client.chat.completions.create(
-        model=model, messages=messages, temperature=0.6, max_tokens=4096, tools=WEB_SEARCH_TOOLS
+        model=model,
+        messages=messages,
+        max_tokens=4096,
+        tools=WEB_SEARCH_TOOLS,
+        **_model_request_options(model, 0.6),
     )
     return response.choices[0]
 
@@ -160,6 +174,9 @@ def chat_completion(
         return ""
     else:
         response = client.chat.completions.create(
-            model=model, messages=full_messages, max_tokens=1024, temperature=0.7
+            model=model,
+            messages=full_messages,
+            max_tokens=1024,
+            **_model_request_options(model, 0.7),
         )
         return (response.choices[0].message.content or "").strip()
