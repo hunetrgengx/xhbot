@@ -185,7 +185,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             err_msg = "哦吼，我没听清，请再说一遍"
         # 401 通常是 API Key 问题，给出排查建议
         elif "404" in err_msg or "not found" in err_msg.lower():
-            err_msg = "模型未找到，请确认已执行 ollama pull <模型名> 并检查模型名称是否正确。"
+            from bot.services.group_config import get_ai_config
+            provider = get_ai_config(chat_id).get("ai_provider", AI_PROVIDER)
+            if provider == "ollama":
+                err_msg = "模型未找到，请确认已执行 ollama pull <模型名> 并检查模型名称是否正确。"
+            else:
+                err_msg = (
+                    "模型未找到或已下线，请用 /set_model 切换到可用模型（如 kimi-k2 / kimi）。"
+                    "详情见 https://platform.moonshot.cn/docs"
+                )
         elif "400" in err_msg or "bad request" in err_msg.lower():
             if "content_filter" in err_msg.lower():
                 err_msg = "内容被安全策略拒绝，请换种方式提问。"

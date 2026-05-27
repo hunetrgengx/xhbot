@@ -129,9 +129,9 @@ def chat_completion(
 
     client = _get_client(base_url, api_key)
 
-    # Kimi 且联网搜索时用 kimi-k2
-    if use_web_search:
-        model = "kimi-k2-turbo-preview"
+    # Kimi 且联网搜索时用 K2.6（支持工具调用）
+    if use_web_search and cfg["ai_provider"] == "kimi":
+        model = "kimi-k2.6"
 
     full_messages = [{"role": "system", "content": _build_full_system_prompt(custom_prompt, user_full_name)}] + messages
 

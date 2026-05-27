@@ -24,7 +24,7 @@ PRESET_MODELS = {
     },
     "kimi-k2": {
         "ai_provider": "kimi",
-        "model_name": "kimi-k2-turbo-preview",
+        "model_name": "kimi-k2.6",
         "base_url": "https://api.moonshot.cn/v1",
         "api_key": None,
     },
@@ -151,7 +151,7 @@ def get_preset_list() -> list[tuple[str, str]]:
     """返回 [(方案id, 显示名), ...]"""
     names = {
         "kimi": "Kimi 128K",
-        "kimi-k2": "Kimi K2（联网）",
+        "kimi-k2": "Kimi K2.6（联网）",
         "ollama-qwen": "Ollama Qwen2.5",
         "ollama-qwen3-vl": "Ollama Qwen3-VL 8B",
         "ollama-gemma3": "Ollama Gemma3 4B",
