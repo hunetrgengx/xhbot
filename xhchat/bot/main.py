@@ -32,6 +32,7 @@ from bot.handlers.admin import (
 )
 from bot.handlers.xh import cmd_xhadd, cmd_xhdel, cmd_xhset
 from bot.handlers.warn import cmd_warn
+from bot.handlers.jiancha import cmd_jiancha
 from bot.handlers.warm import track_admin_activity
 from bot.services.warm_scheduler import run_warm_scheduler
 from config.settings import ALLOWED_CHAT_IDS
@@ -74,6 +75,7 @@ def main():
     app.add_handler(CommandHandler("getsticker", cmd_getsticker))
     app.add_handler(CommandHandler("tz", cmd_tiezhi))
     app.add_handler(CommandHandler("warn", cmd_warn))
+    app.add_handler(CommandHandler("jiancha", cmd_jiancha, filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(callback_set_model, pattern="^model:"))
     app.add_handler(CallbackQueryHandler(callback_web_search, pattern="^web_search:"))
     # 暖群：group -1 先执行，监听管理员发言

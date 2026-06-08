@@ -75,6 +75,26 @@ WARM_STICKER_IDS = [s.strip() for s in (os.getenv("WARM_STICKER_IDS", "") or "")
 RANDOM_WATER_MIN_MINUTES = int(os.getenv("RANDOM_WATER_MIN_MINUTES", "30"))
 RANDOM_WATER_MAX_MINUTES = int(os.getenv("RANDOM_WATER_MAX_MINUTES", "60"))
 
+# npwiki 门店库（/jiancha 读取门店 link/channel_id；与 npwiki deploy 的 facebot.db 路径一致）
+NPWIKI_DB_PATH = os.getenv("NPWIKI_DB_PATH", "/tgbot/npwiki/npwkdb/facebot.db")
+
+
+def _parse_super_admin_ids(s: str) -> frozenset[int]:
+    ids: list[int] = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            continue
+    return frozenset(ids)
+
+
+# npwiki 超管 Telegram user_id（与 npwiki .env 中 SUPER_ADMIN_IDS 一致；亦会查库 admin.is_super=1）
+NPWIKI_SUPER_ADMIN_IDS = _parse_super_admin_ids(os.getenv("SUPER_ADMIN_IDS", ""))
+
 # 数据库
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/bot.db")
 
